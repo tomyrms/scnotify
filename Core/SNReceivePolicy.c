@@ -23,7 +23,7 @@ SNReceiveKind sn_receive_kind(const char *symbol) {
     const char *const prefixes[]={"MESSAGING_CONTENT_TYPE_","CONTENT_TYPE_","CONTENTTYPE_",NULL};
     for(unsigned i=0;prefixes[i];i++)if(!strncmp(s,prefixes[i],strlen(prefixes[i]))){s+=strlen(prefixes[i]);break;}
     const char *const snaps[]={"SNAP","RECEIVED_SNAP","SNAP_RECEIVED",NULL};
-    const char *const chats[]={"CHAT","TEXT","CHAT_MESSAGE","RECEIVED_CHAT","RECEIVED_CHAT_MESSAGE","MESSAGE_RECEIVED","EXTERNAL_MEDIA","NOTE","AUDIO_NOTE","VOICE_NOTE","STICKER","SHARE","LOCATION",NULL};
+    const char *const chats[]={"CHAT","TEXT","CHAT_MESSAGE","RECEIVED_CHAT","RECEIVED_CHAT_MESSAGE","MESSAGE_RECEIVED","EXTERNAL_MEDIA","NOTE","AUDIO_NOTE","AUDIO_MESSAGE","VOICE_NOTE","VOICE_MESSAGE","VOICE_NOTE_MESSAGE","STICKER","SHARE","LOCATION",NULL};
     const char *const controls[]={"READ","READ_RECEIPT","DELIVERED","DELIVERY_RECEIPT","SNAP_OPENED","SNAP_STATE","TYPING","PRESENCE","CALLER_PUSH","SAVE","UNSAVE","ERASE","DELETE","DELETED","REPLAY","SCREENSHOT","SCREEN_RECORD","RELEASE","EDIT",NULL};
     if(one_of(s,snaps))return SN_RX_SNAP;
     if(one_of(s,chats))return SN_RX_MESSAGE;

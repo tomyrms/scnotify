@@ -1,6 +1,5 @@
 #import "SNReceive.h"
 #import "SNRuntime.h"
-#import "SNContent.h"
 #import <CoreFoundation/CoreFoundation.h>
 #include <math.h>
 #include <string.h>
@@ -11,10 +10,33 @@ static id rxFirst(id object, NSArray<NSString *> *keys) {
     for (NSString *key in keys) { id value=SNRead(object,key); if(value && value!=NSNull.null)return value; }
     return nil;
 }
+static id rxPresentValue(id object, NSString *key) {
+    NSString *hasKey=[@"has" stringByAppendingString:[key stringByReplacingCharactersInRange:NSMakeRange(0,1) withString:[[key substringToIndex:1] uppercaseString]]];
+    id has=SNRead(object,hasKey);
+    if([has isKindOfClass:NSNumber.class]&&![has boolValue])return nil;
+    id value=SNRead(object,key);return value==NSNull.null?nil:value;
+}
+static NSNumber *rxFlag(id object, NSString *key) {
+    id value=rxPresentValue(object,key);return [value isKindOfClass:NSNumber.class]?value:nil;
+}
 static BOOL rxTrue(id object, NSArray<NSString *> *keys) {
     /* OR all flags: false in one alias must not hide true in another. */
-    for(NSString *key in keys){id value=SNRead(object,key);if([value isKindOfClass:NSNumber.class]&&[value boolValue])return YES;}
+    for(NSString *key in keys)if([rxFlag(object,key) boolValue])return YES;
     return NO;
+}
+static NSNumber *rxTimestamp(id object,id metadata,BOOL *invalid) {
+    /* Proto default zero values must not hide a populated fallback field.
+       Read the same timestamp aliases on both the model and its metadata. */
+    NSArray *fields=@[@"creationTimestamp",@"creationTimestampMs",@"messageCreationTimestamp",@"createdAt",@"createdAtMs",@"sentAt",@"serverTimestamp",@"serverTimestampMs",@"timestamp"];
+    for(id source in @[metadata?:NSNull.null,object?:NSNull.null])for(NSString *field in fields) {
+        id value=rxPresentValue(source,field);double seconds;
+        if([value isKindOfClass:NSDate.class])seconds=[value timeIntervalSince1970];
+        else if([value isKindOfClass:NSNumber.class])seconds=sn_receive_seconds([value doubleValue]);
+        else continue;
+        if(isfinite(seconds)&&seconds>0)return @(seconds);
+        *invalid=YES;
+    }
+    return nil;
 }
 NSString *SNMessageIdentifier(id value) {
     if([value isKindOfClass:NSUUID.class])return [[value UUIDString] lowercaseString];
@@ -72,7 +94,7 @@ static SNReceiveKind nativeKind(id object,id content,NSString **via) {
     if(rxTrue(object,@[@"isStatusMessage",@"isSystemConversationRetentionMessage",@"isScreenRecording",@"isErasedSnapStatusMessage",@"isStickerReaction",@"isErased"])){
         *via=@"host-control-predicate";return SN_RX_CONTROL;
     }
-    BOOL chat=rxTrue(object,@[@"isTextMessage",@"isChatMediaMessage",@"isVoiceNote",@"isStickerMessage",@"isContentShareMessage",@"isStoryReplyMessage",@"isSingleImageChatMedia",@"isSingleImageOrVideoChatMedia",@"isBitmojiSticker",@"isBloopMessage",@"isSpotlightStoryShareMessage",@"isSpotlightCommentShareMessage",@"isBitmojiUserShare"]);
+    BOOL chat=rxTrue(object,@[@"isTextMessage",@"isChatMediaMessage",@"isVoiceNote",@"isVoiceNoteMessage",@"isAudioNote",@"isStickerMessage",@"isContentShareMessage",@"isStoryReplyMessage"]);
     BOOL snap=rxTrue(object,@[@"isSnapMessage",@"isSnap",@"isTinySnapMessage"]);
     if(chat&&snap){*via=@"conflicting-native-predicates";return SN_RX_NONE;}
     if(chat||snap){*via=@"host-message-predicate";return snap?SN_RX_SNAP:SN_RX_MESSAGE;}
@@ -161,6 +183,17 @@ static SNReceiveKind kindForField(id object, NSString *field, BOOL *present) {
     }else if(!symbol){id name=rxFirst(value,@[@"name",@"enumName",@"stringValue"]);if([name isKindOfClass:NSString.class])symbol=name;}
     return sn_receive_kind(symbol.UTF8String);
 }
+static BOOL rxVoiceMessage(id object,id content) {
+    if(nativeMessage(object)&&rxTrue(object,@[@"isVoiceNote",@"isVoiceNoteMessage",@"isAudioNote"]))return YES;
+    for(id source in @[object?:NSNull.null,content?:NSNull.null])for(NSString *field in @[@"messageType",@"contentType"]) {
+        id value=rxPresentValue(source,field);
+        NSString *symbol=[value isKindOfClass:NSString.class]?value:([value isKindOfClass:NSNumber.class]?enumName(source,field,value):nil);
+        NSString *name=symbol.uppercaseString;
+        for(NSString *prefix in @[@"MESSAGING_CONTENT_TYPE_",@"CONTENT_TYPE_",@"CONTENTTYPE_"])if([name hasPrefix:prefix]){name=[name substringFromIndex:prefix.length];break;}
+        if([@[@"NOTE",@"AUDIO_NOTE",@"VOICE_NOTE",@"VOICE_MESSAGE",@"VOICE_NOTE_MESSAGE",@"AUDIO_MESSAGE"] containsObject:name?:@""])return YES;
+    }
+    return NO;
+}
 static void reject(NSMutableDictionary *counts,NSString *reason) {counts[reason]=@([counts[reason] unsignedIntegerValue]+1);}
 static NSDictionary *shape(id object) {
     NSMutableDictionary *fields=[NSMutableDictionary dictionary];
@@ -197,7 +230,7 @@ static void collect(id obj,NSString *inheritedConversation,NSString *hint,NSMuta
     if(!*budget||depth>8){reject(rejected,@"traversal-limit");return;}
     --*budget;if([path containsObject:obj]){reject(rejected,@"cycle");return;}
     if([obj isKindOfClass:NSString.class]||[obj isKindOfClass:NSNumber.class]||[obj isKindOfClass:NSData.class])return;
-    if(out.count>=256){reject(rejected,@"batch-limit");return;}
+    if(out.count>=512){reject(rejected,@"batch-limit");return;}
     [path addObject:obj];
     @try {
         if([obj isKindOfClass:NSArray.class]||[obj isKindOfClass:NSSet.class]) {
@@ -266,26 +299,18 @@ static void collect(id obj,NSString *inheritedConversation,NSString *hint,NSMuta
                 NSString *key=[@[conversation,sender,eid] componentsJoinedByString:@"|"];
                 if(![eventKeys containsObject:key]) {
                     NSMutableDictionary *event=[@{@"kind":type,@"uid":sender,@"conversation":conversation,@"event":eid,@"kindSource":kindSource} mutableCopy];
-                    if(kind==SN_RX_MESSAGE)event[@"subtype"]=SNContentSubtype(obj,content);
                     NSDictionary *u=SNUserRecord(senderObject,sender);
                     NSString *name=u[@"name"] ?: SNName(rxFirst(obj,@[@"senderDisplayName",@"senderUsername"]));if(name)event[@"name"]=name;
-                    id ts=rxFirst(metadata,@[@"creationTimestamp",@"creationTimestampMs",@"messageCreationTimestamp",@"createdAt",@"createdAtMs",@"serverTimestamp",@"serverTimestampMs",@"timestamp"])
-                        ?: rxFirst(obj,@[@"creationTimestamp",@"creationTimestampMs",@"messageCreationTimestamp",@"createdAt",@"createdAtMs",@"sentAt",@"serverTimestamp",@"timestamp"]);
-                    if([ts isKindOfClass:NSDate.class])event[@"timestamp"]=@([ts timeIntervalSince1970]);
-                    else if([ts isKindOfClass:NSNumber.class]){
-                        double seconds=sn_receive_seconds([ts doubleValue]);
-                        if(!isfinite(seconds)){reject(rejected,@"invalid-time");return;}event[@"timestamp"]=@(seconds);
-                    }
-                    id outgoing=SNRead(obj,@"isOutgoing") ?: SNRead(metadata,@"isOutgoing");
-                    id hasOutgoing=SNRead(obj,@"hasIsOutgoing") ?: SNRead(metadata,@"hasIsOutgoing");
-                    if([hasOutgoing isKindOfClass:NSNumber.class]&&![hasOutgoing boolValue])outgoing=nil;
-                    if(rxTrue(obj,@[@"isIncoming"])||rxTrue(metadata,@[@"isIncoming"])||([outgoing isKindOfClass:NSNumber.class]&&![outgoing boolValue]))event[@"incoming"]=@YES;
-                    id isSender=SNRead(obj,@"isSender") ?: SNRead(metadata,@"isSender");
-                    id hasSender=SNRead(obj,@"hasIsSender") ?: SNRead(metadata,@"hasIsSender");
-                    if([hasSender isKindOfClass:NSNumber.class]&&![hasSender boolValue])isSender=nil;
-                    if([isSender isKindOfClass:NSNumber.class]){
+                    BOOL invalidTime=NO;NSNumber *ts=rxTimestamp(obj,metadata,&invalidTime);
+                    if(ts)event[@"timestamp"]=ts;
+                    else if(invalidTime){reject(rejected,@"invalid-time");return;}
+                    if(kind==SN_RX_MESSAGE&&rxVoiceMessage(obj,content))event[@"subtype"]=@"voice";
+                    /* Inspect each source independently: an absent/default
+                       root flag cannot mask actual metadata direction. */
+                    for(id source in @[obj,metadata?:NSNull.null]) {
+                        NSNumber *outgoing=rxFlag(source,@"isOutgoing"),*isSender=rxFlag(source,@"isSender");
                         if([isSender boolValue]){reject(rejected,@"outgoing");return;}
-                        event[@"incoming"]=@YES;
+                        if([rxFlag(source,@"isIncoming") boolValue]||(outgoing&&![outgoing boolValue])||(isSender&&![isSender boolValue]))event[@"incoming"]=@YES;
                     }
                     /* A decoded type can still fail the snapshot date or
                        direction gate. Keep only field/selector metadata for
@@ -308,7 +333,7 @@ static void collect(id obj,NSString *inheritedConversation,NSString *hint,NSMuta
 NSDictionary *SNDecodeReceived(NSArray *arguments,NSString *conversation,NSString *hint) {
     NSMutableArray *events=[NSMutableArray array],*shapes=[NSMutableArray array];NSMutableDictionary *rejected=[NSMutableDictionary dictionary];
     NSHashTable *path=[NSHashTable hashTableWithOptions:NSPointerFunctionsObjectPointerPersonality|NSPointerFunctionsStrongMemory];
-    NSMutableSet *keys=[NSMutableSet set];NSMutableDictionary *identities=[NSMutableDictionary dictionary];unsigned budget=1024;
+    NSMutableSet *keys=[NSMutableSet set];NSMutableDictionary *identities=[NSMutableDictionary dictionary];unsigned budget=4096;
     if(conversation)identities[conversation]=[NSMutableSet set];
     @try {for(id arg in arguments){if(!budget)break;collect(arg,conversation,hint,events,rejected,shapes,path,keys,identities,0,&budget);}}
     @catch(__unused NSException *e){reject(rejected,@"object-exception");}
@@ -330,23 +355,6 @@ NSDictionary *SNDecodeReceiveCallback(NSString *className,NSString *selector,NSA
     SNReceiveKind kind=sn_receive_hint(selector.UTF8String);
     NSDictionary *batch=SNDecodeReceived(payloads,cid,kind==SN_RX_SNAP?@"snap":kind==SN_RX_MESSAGE?@"message":nil);
     return batch;
-}
-void SNEnumerateReceiveBatches(NSString *className,NSString *selector,NSArray *arguments,void (^visit)(NSDictionary *)) {
-    if(!visit)return;
-    NSUInteger index=NSNotFound;
-    if([className isEqual:@"SCArroyoConversationDataUpdateAnnouncer"]&&[selector isEqual:@"onConversationUpdated:conversation:updatedMessages:removedMessages:"]&&arguments.count==4)index=2;
-    else if([selector isEqual:@"didReceiveMessages:"]||[selector isEqual:@"onMessagesReceived:"]||[selector isEqual:@"onNewMessages:"])index=0;
-    else if([selector isEqual:@"conversation:didReceiveMessages:"]||[selector isEqual:@"conversationId:didReceiveMessages:"])index=1;
-    id list=index<arguments.count?arguments[index]:nil;
-    if([list isKindOfClass:NSSet.class])list=[list allObjects];
-    if(![list isKindOfClass:NSArray.class]||[list count]<=128){visit(SNDecodeReceiveCallback(className,selector,arguments));return;}
-    for(NSUInteger offset=0;offset<[list count];offset+=128){
-        @autoreleasepool {
-            NSMutableArray *args=[arguments mutableCopy];
-            args[index]=[list subarrayWithRange:NSMakeRange(offset,MIN((NSUInteger)128,[list count]-offset))];
-            visit(SNDecodeReceiveCallback(className,selector,args));
-        }
-    }
 }
 NSArray<NSDictionary *> *SNReceivedRecords(id obj,NSString *hint) {
     return SNDecodeReceived(obj?@[obj]:@[],nil,hint)[@"events"];
@@ -376,43 +384,55 @@ NSArray<NSDictionary *> *SNReceivedRecords(id obj,NSString *hint) {
         NSMutableDictionary *state=self.conversations[cid];BOOL initial=!state;
         if(!state){
             if(self.conversations.count>=128){NSString *oldest=nil;double time=INFINITY;for(NSString *key in self.conversations){double t=[self.conversations[key][@"last"] doubleValue];if(t<time){time=t;oldest=key;}}if(oldest)[self.conversations removeObjectForKey:oldest];}
-            state=[@{@"seen":[NSMutableOrderedSet orderedSet],@"start":@(wall),@"last":@(wall)} mutableCopy];self.conversations[cid]=state;
+            state=[@{@"seen":[NSMutableDictionary dictionary],@"start":@(wall),@"last":@(wall)} mutableCopy];self.conversations[cid]=state;
         }
-        NSMutableOrderedSet *seen=state[@"seen"];
+        NSMutableDictionary *seen=state[@"seen"];
         NSMutableDictionary *waiting=state[@"waiting"];
         if(!waiting){waiting=[NSMutableDictionary dictionary];state[@"waiting"]=waiting;}
+        /* An ID can stay date-eligible for at most 300 + 60 seconds after
+           observation. Expire it after that horizon, without refreshing it
+           on replays, so the 2048-ID bound cannot disable a chat forever. */
+        for(NSString *key in [seen allKeys])if(wall-[seen[key] doubleValue]>361){[seen removeObjectForKey:key];[waiting removeObjectForKey:key];}
         NSMutableSet *decodedIDs=[NSMutableSet set];
         for(NSDictionary *e in groups[cid]) {
             NSString *key=e[@"event"];if(!key)continue;[decodedIDs addObject:key];
-            BOOL known=[seen containsObject:key];
-            if(!known&&seen.count>=8192){NSString *old=seen.firstObject;[seen removeObjectAtIndex:0];[waiting removeObjectForKey:old];}
-            NSNumber *firstSeen=waiting[key];
+            BOOL known=seen[key]!=nil;NSNumber *minimum=waiting[key];
+            if(known&&!minimum)continue;
+            if(!known&&seen.count>=2048)continue;
             NSNumber *ts=e[@"timestamp"];
             BOOL fresh=ts&&sn_receive_time_valid(ts.doubleValue,wall);
-            BOOL firstLive=initial&&self.monitoringStart>0&&[e[@"incoming"] boolValue]&&fresh&&ts.doubleValue>=self.monitoringStart;
-            BOOL newlyDecoded=known&&firstSeen&&fresh&&ts.doubleValue>=firstSeen.doubleValue-1;
-            if(!known)[seen addObject:key];
-            if((!known&&(!initial||firstLive))||newlyDecoded) {
-                double start=firstLive?self.monitoringStart:[state[@"start"] doubleValue]-1;
-                if(fresh&&ts.doubleValue>=start){
-                    if([e[@"directionSource"] isEqualToString:@"unknown"]){if(waiting.count<256)waiting[key]=@(fmin(wall,ts.doubleValue));continue;}
-                    if(!e[@"incoming"]||[e[@"incoming"] boolValue])[out addObject:e];
-                }
+            /* Already stale records need no cache slot: their immutable
+               creation time remains outside the notification time window. */
+            if(!known&&(!ts||fresh))seen[key]=@(wall);
+            BOOL unresolved=[e[@"directionSource"] isEqualToString:@"unknown"];
+            if(!minimum) {
+                if(initial) {
+                    if(self.monitoringStart<=0||(!unresolved&&![e[@"incoming"] boolValue]))continue;
+                    minimum=@(self.monitoringStart);
+                }else minimum=@([state[@"start"] doubleValue]-1);
             }
-            /* A first live batch with unresolved direction is retained until
-               a later observation supplies evidence, not treated as history. */
-            if(initial&&self.monitoringStart>0&&fresh&&ts.doubleValue>=self.monitoringStart&&[e[@"directionSource"] isEqualToString:@"unknown"]){
-                if(waiting.count<256)waiting[key]=@(fmin(wall,ts.doubleValue));continue;
+            /* Message metadata is populated asynchronously on some hosts.
+               Keep its identity pending until the timestamp arrives, but
+               still require creation after the initial live/baseline gate. */
+            if(!ts) {
+                if(!known&&!initial)minimum=@(fmax(minimum.doubleValue,wall-1));
+                if(waiting.count<2048||waiting[key])waiting[key]=minimum;
+                continue;
+            }
+            if(fresh&&ts.doubleValue>=minimum.doubleValue) {
+                if(unresolved){if(waiting.count<2048||waiting[key])waiting[key]=minimum;continue;}
+                if(!e[@"incoming"]||[e[@"incoming"] boolValue])[out addObject:e];
             }
             [waiting removeObjectForKey:key];
         }
         /* Remember first sighting only for unknown records appearing AFTER a
            baseline; delayed decoding of old baseline history stays silent. */
         for(NSString *eid in identities[cid]){
-            if(![seen containsObject:eid]&&!initial&&![decodedIDs containsObject:eid]&&waiting.count<256)waiting[eid]=@(wall);
-            if(![seen containsObject:eid]){if(seen.count>=8192){NSString *old=seen.firstObject;[seen removeObjectAtIndex:0];[waiting removeObjectForKey:old];}[seen addObject:eid];}
+            if([decodedIDs containsObject:eid]||seen[eid]||seen.count>=2048)continue;
+            seen[eid]=@(wall);
+            if(!initial&&waiting.count<2048)waiting[eid]=@(fmax([state[@"start"] doubleValue]-1,wall-1));
         }
-        for(NSString *eid in [waiting allKeys])if(wall-[waiting[eid] doubleValue]>300)[waiting removeObjectForKey:eid];
+        for(NSString *eid in [waiting allKeys])if(wall-[seen[eid] doubleValue]>300)[waiting removeObjectForKey:eid];
         state[@"last"]=@(wall);
     }
     return [out copy];

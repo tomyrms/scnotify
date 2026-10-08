@@ -90,6 +90,12 @@ int main(void) {
         CHECK(events(@{@"message":m,@"messages":@[m]}).count==1);
         m=message(C,@1,@"CHAT");m[@"outgoing"]=@YES;m[@"isOutgoing"]=@NO;CHECK(reason(m,@"outgoing"));
         m=message(C,@1,@"CHAT");m[@"metadata"]=@{@"isFromMe":@YES};CHECK(events(m).count==0);
+        m=message(C,@1,@"CHAT");m[@"isSender"]=@NO;m[@"metadata"]=@{@"isSender":@YES};CHECK(reason(m,@"outgoing"));
+        m=message(C,@1,@"CHAT");m[@"isSender"]=@YES;m[@"hasIsSender"]=@NO;m[@"metadata"]=@{@"isIncoming":@YES};CHECK(events(m).count==1);
+        CHECK([events(m)[0][@"incoming"] boolValue]);
+        m=message(C,@1,@"CHAT");m[@"isOutgoing"]=@YES;m[@"hasIsOutgoing"]=@NO;m[@"metadata"]=@{@"isOutgoing":@NO};CHECK(events(m).count==1);
+        CHECK([events(m)[0][@"incoming"] boolValue]);
+        m=message(C,@1,@"CHAT");m[@"isIncoming"]=@YES;m[@"hasIsIncoming"]=@NO;CHECK(events(m)[0][@"incoming"]==nil);
         m=message(C,@1,@"CHAT");CHECK(events(@{@"fromHistory":@YES,@"messages":@[m]}).count==0);
         m[@"metadata"]=@{@"isHistorical":@YES};CHECK(reason(m,@"history"));
         for(NSString *control in @[@"TYPING",@"READ_RECEIPT",@"DELIVERY_RECEIPT",@"CALLER_PUSH",@"STATUS_READ",@"DELETE",@"SCREENSHOT"]) {
@@ -117,6 +123,12 @@ int main(void) {
         }
         m=message(C,@1,@"CHAT");m[@"metadata"]=@{@"timestamp":@(NAN)};CHECK(reason(m,@"invalid-time"));
         m=message(C,@1,@"CHAT");m[@"metadata"]=@{@"timestamp":[NSDate dateWithTimeIntervalSince1970:1800000000]};CHECK(events(m).count==1);
+        m=message(C,@1,@"CHAT");m[@"metadata"]=@{@"creationTimestamp":@0,@"serverTimestampMs":@1800000000000LL};
+        CHECK([events(m)[0][@"timestamp"] doubleValue]==1800000000);
+        m[@"metadata"]=@{@"creationTimestamp":@1700000000,@"hasCreationTimestamp":@NO,@"timestamp":@1800000000};
+        CHECK([events(m)[0][@"timestamp"] doubleValue]==1800000000);
+        for(NSString *field in @[@"createdAtMs",@"serverTimestampMs"]){m=message(C,@1,@"CHAT");m[@"metadata"]=@{};m[field]=@1800000000000LL;CHECK([events(m)[0][@"timestamp"] doubleValue]==1800000000);}
+        for(NSString *type in @[@"VOICE_NOTE",@"VOICE_MESSAGE",@"VOICE_NOTE_MESSAGE",@"AUDIO_MESSAGE",@"AUDIO_NOTE",@"CONTENT_TYPE_AUDIO_NOTE"]){m=message(C,@1,type);CHECK([events(m)[0][@"subtype"] isEqual:@"voice"]);CHECK([events(m)[0][@"kind"] isEqual:@"message"]);}
         m=message(C,@1,@"CHAT");m[@"senderDisplayName"]=@"José 日本語";CHECK([events(m)[0][@"name"] isEqual:@"José 日本語"]);
         /* The duplicate-cycle guard is the behaviour under test here. */
 #pragma clang diagnostic push
@@ -124,7 +136,8 @@ int main(void) {
         NSMutableDictionary *cycle=[NSMutableDictionary dictionary];cycle[@"message"]=cycle;CHECK(reason(cycle,@"cycle"));[cycle removeAllObjects];
 #pragma clang diagnostic pop
         id deep=message(C,@1,@"CHAT");for(unsigned i=0;i<12;i++)deep=@{@"message":deep};CHECK(reason(deep,@"traversal-limit"));
-        NSMutableArray *many=[NSMutableArray array];for(unsigned i=1;i<=300;i++)[many addObject:message(C,@(i),@"CHAT")];CHECK(events(many).count<=256);
+        NSMutableArray *many=[NSMutableArray array];for(unsigned i=1;i<=300;i++)[many addObject:message(C,@(i),@"CHAT")];CHECK(events(many).count==300);
+        for(unsigned i=301;i<=600;i++)[many addObject:message(C,@(i),@"CHAT")];CHECK(events(many).count==512);CHECK(reason(many,@"batch-limit"));
         m=message(C,@1,@983);m[@"body"]=@"DO_NOT_EXPORT_PRIVATE_MESSAGE";
         NSData *diagnostic=[NSJSONSerialization dataWithJSONObject:batch(m)[@"shapes"] options:0 error:NULL];NSString *text=[[NSString alloc] initWithData:diagnostic encoding:NSUTF8StringEncoding];
         CHECK([text rangeOfString:@"DO_NOT_EXPORT_PRIVATE_MESSAGE"].location==NSNotFound);CHECK([text rangeOfString:U].location==NSNotFound);
@@ -145,6 +158,28 @@ int main(void) {
         CHECK([tracker newEventsInBatch:batch(message(D,@1,@"SNAP")) wallTime:1800000002].count==0);
         CHECK([tracker newEventsInBatch:batch(message(D,@2,@"SNAP")) wallTime:1800000003].count==0); /* predates D baseline */
         CHECK([tracker newEventsInBatch:batch(m) wallTime:NAN].count==0);
+        /* Long sessions must not permanently stop after the bounded ID cache
+           fills. Old messages remain ineligible after their cache expires. */
+        tracker=[SNReceiveTracker new];
+        CHECK([tracker newEventsInBatch:batch(@{@"conversationId":C,@"messages":@[]}) wallTime:1800000000].count==0);
+        NSMutableArray *burst=[NSMutableArray array];
+        for(unsigned i=1;i<=2048;i++)[burst addObject:@{@"conversation":C,@"event":[NSString stringWithFormat:@"%u",i],@"timestamp":@1800000000,@"incoming":@YES}];
+        CHECK([tracker newEventsInSnapshot:burst wallTime:1800000000].count==2048);
+        NSDictionary *after=@{@"conversation":C,@"event":@"2049",@"timestamp":@1800000362,@"incoming":@YES};
+        CHECK([tracker newEventsInSnapshot:@[after] wallTime:1800000362].count==1);
+        CHECK([tracker newEventsInSnapshot:burst wallTime:1800000362].count==0);
+        CHECK([tracker newEventsInSnapshot:@[after] wallTime:1800000363].count==0);
+        /* A full decoded burst may still be waiting on metadata: the pending
+           bound must not silently discard the tail of an accepted batch. */
+        tracker=[[SNReceiveTracker alloc] initWithMonitoringStart:1800000000];
+        NSMutableArray *incomplete=[NSMutableArray array],*completed=[NSMutableArray array];
+        for(unsigned i=1;i<=300;i++) {
+            NSDictionary *pending=@{@"conversation":C,@"event":[NSString stringWithFormat:@"%u",i],@"incoming":@YES};
+            [incomplete addObject:pending];NSMutableDictionary *ready=[pending mutableCopy];ready[@"timestamp"]=@1800000001;[completed addObject:ready];
+        }
+        CHECK([tracker newEventsInSnapshot:incomplete wallTime:1800000002].count==0);
+        CHECK([tracker newEventsInSnapshot:completed wallTime:1800000003].count==300);
+        CHECK([tracker newEventsInSnapshot:completed wallTime:1800000004].count==0);
         __block NSUInteger hits=0;SEL sel=@selector(onMessagesReceived:conversation:metadata:completion:);
         CHECK(SNInstallHook(RXHook.class,sel,^(id self,NSArray *args,__unused id result){hits++;CHECK([(RXHook *)self calls]==1);CHECK(args.count==4);CHECK([args[1] isEqual:C]);CHECK(args[3]==NSNull.null);}));
         RXHook *hook=[RXHook new];[hook onMessagesReceived:@[@1] conversation:C metadata:@{} completion:nil];CHECK(hits==1);CHECK(hook.calls==1);

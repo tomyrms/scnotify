@@ -15,7 +15,7 @@
 	<key>PeekingNotifications</key>
 	<true/>
 	<key>NotifyInForeground</key>
-	<false/>
+	<true/>
 	<key>ExperimentalKeepAlive</key>
 	<true/>
 	<key>DiagnosticsIncludeIdentifiers</key>
@@ -36,15 +36,5 @@
 	<array/>
 	<key>NativeNotificationBridge</key>
 	<true/>
-	<key>VoiceNotifications</key>
-	<true/>
-	<key>MediaNotifications</key>
-	<true/>
-	<key>StickerNotifications</key>
-	<true/>
-	<key>ShareNotifications</key>
-	<true/>
-	<key>NotificationSpacingSeconds</key>
-	<real>0.4</real>
 </dict>
 </plist>

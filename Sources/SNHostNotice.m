@@ -17,28 +17,38 @@ static NSString *noticeText(id value, NSUInteger limit) {
 static NSString *firstText(id object, NSArray *keys, NSUInteger limit) {
     for(NSString *key in keys){NSString *text=noticeText(SNRead(object,key),limit);if(text)return text;}return nil;
 }
-NSDictionary *SNHostNotice(id payload) {
-    if(!payload)return nil;
-    NSHashTable *seen=[NSHashTable hashTableWithOptions:NSPointerFunctionsObjectPointerPersonality];
-    id object=payload;
-    for(unsigned depth=0;object&&depth<4;depth++) {
-        if([seen containsObject:object])return nil;[seen addObject:object];
-        for(NSString *key in @[@"isHistorical",@"fromHistory",@"isOutgoing",@"isFromMe",@"scnotify"]){
-            id value=SNRead(object,key);if([value isKindOfClass:NSNumber.class]&&[value boolValue])return nil;
-        }
-        NSString *title=firstText(object,@[@"title",@"notificationTitle"],256);
-        NSString *body=firstText(object,@[@"body",@"notificationBody",@"messageText",@"text",@"message"],4096);
-        if(title.length&&body.length) {
-            NSMutableDictionary *notice=[@{@"title":title,@"body":body} mutableCopy];
-            NSString *identity=SNMessageIdentifier(SNRead(object,@"notificationId")) ?: SNMessageIdentifier(SNRead(object,@"notificationIdentifier"));
-            if(identity)notice[@"id"]=identity;
-            return [notice copy];
-        }
-        id next=SNRead(object,@"notificationContent") ?: SNRead(object,@"content") ?: SNRead(object,@"notification");
-        if(!next||[next isKindOfClass:NSString.class]||[next isKindOfClass:NSData.class])return nil;
-        object=next;
+static NSDictionary *noticeAtDepth(id object, NSString *inheritedIdentity, NSHashTable *seen,
+                                  unsigned depth, unsigned *budget) {
+    if(!object||object==NSNull.null||depth>=4||!*budget||[seen containsObject:object])return nil;
+    --*budget;[seen addObject:object];
+    for(NSString *key in @[@"isHistorical",@"fromHistory",@"isOutgoing",@"isFromMe",@"scnotify"]){
+        id value=SNRead(object,key);if([value isKindOfClass:NSNumber.class]&&[value boolValue])return nil;
+    }
+    /* Our local-notification marker lives in UNNotificationContent.userInfo. */
+    id ownMarker=SNRead(SNRead(object,@"userInfo"),@"scnotify");
+    if([ownMarker isKindOfClass:NSNumber.class]&&[ownMarker boolValue])return nil;
+    NSString *identity=SNMessageIdentifier(SNRead(object,@"notificationId")) ?:
+        SNMessageIdentifier(SNRead(object,@"notificationIdentifier")) ?: inheritedIdentity;
+    NSString *title=firstText(object,@[@"title",@"notificationTitle"],256);
+    NSString *body=firstText(object,@[@"body",@"notificationBody",@"messageText",@"text",@"message"],4096);
+    if(title.length&&body.length) {
+        NSMutableDictionary *notice=[@{@"title":title,@"body":body} mutableCopy];
+        if(identity)notice[@"id"]=identity;
+        return [notice copy];
+    }
+    /* Null or unsupported aliases must not hide another supported envelope.
+       Preserve the envelope's stable ID when its text is in nested content. */
+    for(NSString *key in @[@"notificationContent",@"content",@"notification"]) {
+        id child=SNRead(object,key);
+        if(!child||child==NSNull.null||[child isKindOfClass:NSString.class]||[child isKindOfClass:NSData.class])continue;
+        NSDictionary *notice=noticeAtDepth(child,identity,seen,depth+1,budget);if(notice)return notice;
     }
     return nil;
+}
+NSDictionary *SNHostNotice(id payload) {
+    NSHashTable *seen=[NSHashTable hashTableWithOptions:NSPointerFunctionsObjectPointerPersonality|NSPointerFunctionsStrongMemory];
+    unsigned budget=16;
+    return noticeAtDepth(payload,nil,seen,0,&budget);
 }
 id SNTransportJSON(id payload) {
     if([payload isKindOfClass:NSDictionary.class]||[payload isKindOfClass:NSArray.class])return payload;

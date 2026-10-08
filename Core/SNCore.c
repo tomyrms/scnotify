@@ -235,28 +235,44 @@ static bool time_ok(double now,double ttl) {return isfinite(now)&&now>=0&&isfini
 uint64_t sn_ledger_reserve(SNLedger *l,const char *key,double now,double ttl) {
     if(!l||!key||!time_ok(now,ttl))return 0;
     size_t len=strnlen(key,SN_KEY_SIZE);if(!len||len>=SN_KEY_SIZE)return 0;
-    size_t slot=0;double oldest=INFINITY;bool available=false;
+    size_t slot=SN_LEDGER_SIZE;double oldest=INFINITY;bool available=false;
     for(size_t i=0;i<SN_LEDGER_SIZE;i++){
         SNLedgerEntry *e=&l->entries[i];
         if(e->occupied&&e->expires>now&&!strcmp(e->key,key))return 0;
         if(!e->occupied||e->expires<=now){if(!available){slot=i;available=true;}}
-        else if(!available&&e->expires<oldest){oldest=e->expires;slot=i;}
+        /* A burst must not invalidate an asynchronous delivery's ticket. Only
+           completed entries can be displaced when there is no free slot. */
+        else if(!available&&e->committed&&e->expires<oldest){oldest=e->expires;slot=i;}
     }
+    if(slot==SN_LEDGER_SIZE)return 0;
     SNLedgerEntry *e=&l->entries[slot];memset(e,0,sizeof(*e));memcpy(e->key,key,len+1);
     e->ticket=++l->serial;if(!e->ticket)e->ticket=++l->serial;
     e->expires=now+ttl;e->occupied=true;return e->ticket;
 }
 bool sn_ledger_commit(SNLedger *l,uint64_t ticket,double now,double ttl) {
     if(!l||!ticket||!time_ok(now,ttl))return false;
-    for(size_t i=0;i<SN_LEDGER_SIZE;i++)if(l->entries[i].occupied&&l->entries[i].ticket==ticket){l->entries[i].committed=true;l->entries[i].expires=now+ttl;return true;}
+    for(size_t i=0;i<SN_LEDGER_SIZE;i++) {
+        SNLedgerEntry *e=&l->entries[i];
+        if(e->occupied&&e->ticket==ticket) {
+            if(e->expires<=now)return false;
+            if(!e->committed||e->expires<now+ttl)e->expires=now+ttl;
+            e->committed=true;return true;
+        }
+    }
     return false;
 }
 void sn_ledger_cancel(SNLedger *l,uint64_t ticket) {
     if(!l||!ticket)return;
-    for(size_t i=0;i<SN_LEDGER_SIZE;i++)if(l->entries[i].occupied&&l->entries[i].ticket==ticket){memset(&l->entries[i],0,sizeof(l->entries[i]));return;}
+    for(size_t i=0;i<SN_LEDGER_SIZE;i++)if(l->entries[i].occupied&&!l->entries[i].committed&&l->entries[i].ticket==ticket){memset(&l->entries[i],0,sizeof(l->entries[i]));return;}
 }
 void sn_ledger_mark(SNLedger *l,const char *key,double now,double ttl) {
     if(!l||!key||!time_ok(now,ttl))return;
-    for(size_t i=0;i<SN_LEDGER_SIZE;i++)if(l->entries[i].occupied&&!strcmp(l->entries[i].key,key)){l->entries[i].expires=now+ttl;l->entries[i].committed=true;return;}
+    size_t len=strnlen(key,SN_KEY_SIZE);if(!len||len>=SN_KEY_SIZE)return;
+    for(size_t i=0;i<SN_LEDGER_SIZE;i++)if(l->entries[i].occupied&&!strcmp(l->entries[i].key,key)){
+        if(l->entries[i].expires<now+ttl)l->entries[i].expires=now+ttl;
+        /* STOP owns this key now. A callback holding the old START ticket
+           cannot cancel or shorten the tombstone. */
+        l->entries[i].ticket=0;l->entries[i].committed=true;return;
+    }
     uint64_t t=sn_ledger_reserve(l,key,now,ttl);if(t)sn_ledger_commit(l,t,now,ttl);
 }

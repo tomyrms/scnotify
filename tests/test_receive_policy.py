@@ -1,11 +1,10 @@
 """Exercise the production C receive policy (not a Python reimplementation)."""
 import ctypes as c
 import math
-import os
 from pathlib import Path
-import subprocess
 import tempfile
 import unittest
+from native_build import build_library, unload_library
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -13,11 +12,11 @@ class ReceivePolicyTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cls.tmp = tempfile.TemporaryDirectory()
-        library = str(Path(cls.tmp.name) / 'policy.so')
-        subprocess.run([os.environ.get('CC', 'clang'), '-std=c11', '-D_POSIX_C_SOURCE=200809L',
-                        '-shared', '-fPIC', '-Wall', '-Wextra', '-Werror',
-                        str(ROOT / 'Core/SNReceivePolicy.c'), '-o', library], check=True)
-        cls.lib = c.CDLL(library)
+        library = build_library(cls.tmp.name, 'policy', ROOT / 'Core/SNReceivePolicy.c',
+                                ['sn_receive_kind', 'sn_receive_hint',
+                                 'sn_receive_native_content_kind', 'sn_receive_source',
+                                 'sn_receive_seconds', 'sn_receive_time_valid'])
+        cls.lib = c.CDLL(str(library))
         for name in ('sn_receive_kind', 'sn_receive_hint'):
             f = getattr(cls.lib, name); f.argtypes = [c.c_char_p]; f.restype = c.c_int
         cls.lib.sn_receive_native_content_kind.argtypes = [c.c_char_p, c.c_char_p, c.c_int64]
@@ -31,6 +30,7 @@ class ReceivePolicyTests(unittest.TestCase):
 
     @classmethod
     def tearDownClass(cls):
+        unload_library(cls.lib)
         cls.tmp.cleanup()
 
 
@@ -73,6 +73,16 @@ class ReceivePolicyTests(unittest.TestCase):
     def test_snap_symbols(self):
         for name in ('SNAP', 'RECEIVED_SNAP', 'SNAP_RECEIVED'):
             self.assertEqual(self.lib.sn_receive_kind(name.encode()), 2)
+
+    def test_voice_symbols_are_messages(self):
+        for name in ('AUDIO_NOTE', 'AUDIO_MESSAGE', 'VOICE_NOTE', 'VOICE_MESSAGE', 'VOICE_NOTE_MESSAGE'):
+            for prefix in ('', 'CONTENT_TYPE_', 'MESSAGING_CONTENT_TYPE_'):
+                with self.subTest(name=name, prefix=prefix):
+                    self.assertEqual(self.lib.sn_receive_kind((prefix + name).encode()), 1)
+
+    def test_voice_control_symbols_still_not_messages(self):
+        for name in (b'VOICE_MESSAGE_PLAYED', b'VOICE_NOTE_READ', b'AUDIO_CALL', b'VOICE'):
+            self.assertEqual(self.lib.sn_receive_kind(name), 0)
 
     def test_case(self):
         self.assertEqual(self.lib.sn_receive_kind(b'chat'), 1)

@@ -1,49 +1,39 @@
-# SnapNotify 4.0.0-rc5 — vocaux, rafales et reprise
+# SnapNotify 4.0.0-rc5
 
-Base : `tomyrms/scnotify`, commit `6692b9fe72764d6246174c93eac03348d9e45116` (rc4), dont l'utilisateur confirme le fonctionnement des chats, snaps, appels et saisies. Cette version conserve le décodeur des appels, les transitions de saisie et le correctif de réception natif 14.17.1.
+Correctifs pour Snapchat **14.17.1**, destiné à être injecté dans l’IPA puis signé avec Sideloadly. Appareil cible déclaré : iPhone 14, iOS 26.6.2. La compatibilité sur cet appareil reste à vérifier.
 
-## Ce qui change
+**Archive de sources, sans IPA et sans dylib compilée.** Le cœur C est testé sous Windows. La compilation iOS et les six programmes Foundation doivent réussir sur Mac/Xcode ou via le workflow inclus avant installation.
 
-Les messages vocaux reconnus portent le texte « NOM t’a envoyé un message vocal ». Les photos de chat, les autres médias de chat, les stickers/Bitmoji, les partages, les réponses aux stories et les positions explicitement typées disposent de textes adaptés. La nature est déduite des getters natifs et des types symboliques, pas des mots présents dans une conversation. Une vidéo dont le modèle ne précise pas davantage la nature est annoncée comme un média, pas arbitrairement comme une photo. Les réactions, suppressions et accusés de lecture restent des événements de contrôle, pas de nouvelles réceptions.
+## Changements
 
-Les chats/snaps éligibles vont dans une file persistante `Application Support/SnapNotify/outbox-v5`. Chaque message a son propre identifiant de notification ; un deuxième message du même expéditeur n'écrase pas le premier. Le sous-type ne change pas la clé de déduplication. Les notifications de contenu sont soumises une par une, avec un espacement minimal de 0,4 seconde après la réponse à la soumission précédente. Appels et saisie gardent leur chemin immédiat et ne sont pas mis derrière la file de contenu.
+- Vocaux reconnus via les prédicats natifs et les types symboliques, avec le texte « t’a envoyé un vocal ». Les chats, snaps, médias de chat, stickers, partages et réponses aux stories restent reconnus lorsque Snapchat fournit un type explicite. Les accusés de lecture, suppressions et autres événements de contrôle ne deviennent pas de faux messages. Aucun enum numérique supplémentaire n’est deviné.
+- File FIFO commune aux événements et aux notifications natives : jusqu’à 8192 éléments en attente, 16 envois en cours. Les rafales ne réservent plus tous les tickets de déduplication simultanément. Les identifiants de requêtes séparent aussi les changements de compte.
+- Cache d’identifiants expirant : la limite de 2048 identifiants par conversation ne bloque plus définitivement la réception. Les métadonnées arrivant en plusieurs callbacks ne font plus perdre automatiquement un message.
+- Prise en charge du vrai délégué de notifications, même si Snapchat le remplace ou hérite de son implémentation. Le réglage `NotifyInForeground` vaut désormais `true` pour les nouvelles configurations.
+- Un simple callback d’état d’appel ne coupe plus le lecteur de maintien en arrière-plan. Après une interruption audio, une reprise n’est tentée que si iOS indique `ShouldResume`; une catégorie enregistrement/appel reste protégée.
+- Diagnostics enrichis : état audio, mode audio déclaré, permissions, interruption, durée en arrière-plan, intervalle entre passages du thread principal, dernière réception, file restante et échecs.
 
-Les callbacks connus de grands lots sont traités par paquets de 128, plutôt que tronqués par la limite de 256 du décodeur élémentaire. Lorsque 64 lots attendent déjà le traitement, le callback subit une contre-pression synchrone au lieu de jeter ses données structurées. Cela peut ralentir brièvement l'hôte sous charge extrême. Le cache de messages vus n'arrête plus toute nouvelle réception une fois rempli : il conserve une fenêtre tournante de 8192 identifiants. La file persistante garde aussi les succès de soumission pendant 24 h pour la déduplication.
+## Compiler et installer
 
-## Le problème après environ dix minutes
+1. Copier le projet complet dans un dépôt, y compris `.github`, `Sources`, `Core`, `tests` et `scripts`.
+2. Lancer **SnapNotify tests and build**. Le workflow exécute les tests portables, les **six** programmes Foundation puis compile la bibliothèque iOS arm64.
+3. Télécharger **SnapNotify-v4-dylib** provenant de cette nouvelle exécution. L’artefact contient `SnapNotify.dylib` et son empreinte SHA-256.
+4. Remplacer l’ancienne bibliothèque dans la procédure d’injection Sideloadly, puis signer/réinstaller l’IPA. Ne pas cumuler plusieurs copies de SnapNotify. Vérifier `READY version=4.0.0-rc5 host=14.17.1` dans le journal après lancement.
 
-Il n'y avait pas de minuterie d'arrêt fixe à dix minutes dans rc4. En revanche, la preuve qu'un utilisateur est distant dépendait de l'état temporaire de saisie/présence, supprimé après quelques minutes. Quand le compte local n'était pas encore connu, cela pouvait de nouveau rendre indéterminé le sens entrant d'un snap/chat. rc5 conserve séparément cette preuve pour le même utilisateur et la même conversation (24 h, cache limité), et l'efface à un changement de compte détecté.
+Sur Mac avec Xcode : `make test`, `make test-macos`, puis `make`. Le chemin Theos reste disponible.
 
-La reprise au premier plan réinitialise un ancien état d'interruption audio : iOS n'envoie pas nécessairement une fin d'interruption. Une simple mise à jour de l'état d'appel ne coupe plus le maintien audio ; il est arrêté lorsque la catégorie audio indique effectivement une utilisation du micro/appel. Un arrêt imprévu du lecteur peut faire l'objet de deux tentatives limitées de reprise, seulement lorsque l'état audio et l'arrière-plan le permettent. Le contrôleur ne simule jamais une transition de l'app au premier plan et n'invente aucune connexion réseau. Si la transition d'arrière-plan native a été transmise, `requiresUserResume` le signale.
+**Une configuration déjà présente dans `Documents/SnapNotifyConfig.plist` est conservée.** Pour avoir les notifications quand Snapchat est ouvert, passer sa clé `NotifyInForeground` à `true`. Copier aveuglément le fichier exemple écraserait les alias et préférences : modifier uniquement la clé voulue. `ExperimentalKeepAlive` conserve sa valeur existante.
 
-**Cette correction ne garantit ni une exécution permanente ni des notifications reçues pendant qu'iOS a suspendu/terminé le processus.** Un timer du mod ne peut pas réveiller un processus suspendu. Les diagnostics distinguent absence d'événements réseau, état du lecteur et grand intervalle entre passages du contrôle ; un grand intervalle ne prouve pas, à lui seul, une suspension.
+## L’arrêt après environ dix minutes
 
-## Installer
+Les coupures provoquées par des callbacks idle sont corrigées. Cela ne prouve pas que c’était la cause unique sur cet iPhone. Le maintien audio reste expérimental : il ne rouvre pas automatiquement une connexion Snapchat fermée, ne recrée pas les droits APNs et ne garantit pas que le processus reste actif.
 
-La bibliothèque précompilée validée est incluse dans `prebuilt/SnapNotify.dylib`, avec son SHA-256 et les empreintes des 32 fichiers de code/tests correspondants. Le run de validation est `37852967825` ; les détails figurent dans `docs/TESTS_EFFECTUES.md`. Aucun IPA signé n’est inclus.
+La présence de la carte Snapchat dans le sélecteur d’apps ne signifie pas que le processus exécute encore son code. iOS peut suspendre l’application; sans réception effective, le tweak ne peut pas créer une notification pour un nouveau message. Voir [Apple : temps d’exécution en arrière-plan](https://developer.apple.com/documentation/uikit/extending-your-app-s-background-execution-time) et [notifications locales](https://developer.apple.com/documentation/usernotifications/scheduling-a-notification-locally-from-your-app).
 
-Utiliser la bibliothèque de l'artefact rc5 validé, ou copier la totalité de ce projet puis lancer `SnapNotify tests and build`. Le projet livré n'a pas besoin des fichiers techniques `.ci` de la branche de validation : ses sources sont déjà modifiées. Les tests macOS précèdent la compilation arm64 et bloquent la publication en cas d'échec.
+Les notifications déjà confiées à iOS restent gérées par iOS. Une requête acceptée n’est pas la preuve qu’une bannière a été montrée individuellement : permissions, regroupement et modes de concentration interviennent.
 
-Remplacer l'ancienne bibliothèque dans l'IPA, refaire l'injection/signature habituelle, puis vérifier `READY version=4.0.0-rc5`. Ne pas injecter plusieurs versions à la fois. L'IPA complet n'est pas fourni et sa signature n'est pas réparée par ce projet.
+## Vérifier sur l’iPhone
 
-## Réglages
+Suivre [le protocole appareil](docs/VALIDATION_IPHONE.md), avec une rafale de messages et des essais à 1, 5, 10, 15 et 30 minutes en arrière-plan. En cas de coupure, conserver `snapnotify.log`, `snapnotify_status.json` et `snapnotify_receive_schema.json` avant et après le retour dans Snapchat. Aucun contenu de message n’est exporté dans ces diagnostics.
 
-Les nouvelles clés sont activées par défaut même si une ancienne configuration ne les contient pas : `VoiceNotifications`, `MediaNotifications`, `StickerNotifications`, `ShareNotifications`. `MessageNotifications` reste l'interrupteur général des contenus du chat. `NotificationSpacingSeconds` vaut 0.4 (bornes : 0.05 à 2). `ExperimentalKeepAlive` reste conforme à la base utilisée : activé par défaut, désactivable dans `Documents/SnapNotifyConfig.plist`.
-
-Une notification acceptée par l'API iOS n'est pas une garantie de bannière visible. L'affichage dépend notamment du regroupement, du résumé programmé, de Concentration et des réglages d'alertes. Choisir l'affichage « Liste », désactiver le regroupement pour Snapchat et vérifier ses autorisations pour examiner séparément les éléments, sans confondre une pile avec une perte.
-
-## Données et limites de la file
-
-La file n'enregistre ni texte de chat, ni enregistrement vocal, ni nom, ni jeton : uniquement les identifiants nécessaires, le sous-type et les états de soumission. Ce sont quand même des métadonnées privées, stockées avec la protection iOS jusqu'au premier déverrouillage. Ne pas publier ce répertoire.
-
-Après une erreur temporaire, l'élément est conservé et réessayé avec le même identifiant et un délai croissant. Après un refus d'autorisation, il reste bloqué jusqu'à la prochaine reprise/réévaluation ; le mod n'essaie pas de contourner le refus. Un manque de réponse pendant 15 secondes libère la file pour les autres éléments, sans effacer le message. Un retour au premier plan ne supprime pas les messages déjà mis en attente en arrière-plan.
-
-La restauration après relancement n'envoie que les éléments liés à une identité de compte vérifiée, ou à la session courante. Un élément enregistré lors d'une ancienne session dont le compte était inconnu reste retenu, plutôt que risquer de l'afficher sur un autre compte. Un changement de compte identifié purge les éléments du précédent compte.
-
-Limite de sécurité : 20 000 entrées persistantes ; aucun élément pending n'est évincé pour faire de la place. Une saturation ou une erreur disque est signalée ; en cas d'erreur disque, l'élément nouvellement reçu reste en mémoire si possible. Le dispositif n'est pas une garantie de livraison illimitée. Une mort du processus exactement entre acceptation iOS et enregistrement du succès peut provoquer une resoumission au redémarrage, avec le même identifiant. L'absence d'un élément du centre de notifications n'est jamais utilisée pour le republier : il a pu être effacé par l'utilisateur.
-
-## Validation sur appareil
-
-Faire une rafale de 20 chats, 5 vocaux, 5 snaps et 3 stickers depuis le second compte ; noter les quantités. Laisser ensuite l'app en arrière-plan, sans la fermer, puis envoyer un snap sans activité de saisie préalable après 2, 10, 15 et 30 minutes. Refaire un appel et un vocal après une interruption audio. Les quantités sont un protocole proposé, pas des tests déjà exécutés ici.
-
-Les éléments utiles sont `outbox.pending`, `outbox.accepted`, `outbox.blocked`, `outbox.heldForAccount`, `receiveBackpressureWaits` et `backgroundHealth` dans `snapnotify_status.json`, avec le journal et le schéma habituels. Les résultats effectivement exécutés figurent dans `docs/TESTS_EFFECTUES.md`.
+Les tests effectivement exécutés sont détaillés dans [TESTS_EFFECTUES](docs/TESTS_EFFECTUES.md) et `VALIDATION.json`. Les documents rc4 et `docs/history` décrivent les livraisons précédentes.

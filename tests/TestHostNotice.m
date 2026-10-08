@@ -37,7 +37,18 @@ int main(void) {
     CHECK(SNHostNotice(@{@"title":@"Test",@"body":@123})==nil);
     CHECK(SNHostNotice(@{@"title":@"Test",@"body":@"Chat",@"isOutgoing":@YES})==nil);
     CHECK(SNHostNotice(@{@"title":@"Test",@"body":@"Chat",@"scnotify":@YES})==nil);
+    CHECK(SNHostNotice(@{@"title":@"Test",@"body":@"Chat",@"userInfo":@{@"scnotify":@YES}})==nil);
     CHECK([SNHostNotice(@{@"content":n})[@"body"] isEqual:@"Nouveau chat"]);
+    CHECK([SNHostNotice(@{@"notificationContent":NSNull.null,@"content":n})[@"body"] isEqual:@"Nouveau chat"]);
+    CHECK([SNHostNotice(@{@"notificationContent":@{},@"notification":n})[@"id"] isEqual:@"notice-1"]);
+    CHECK([SNHostNotice(@{@"notificationContent":@"unavailable",@"content":n})[@"id"] isEqual:@"notice-1"]);
+    NSDictionary *noticeContent=@{@"title":@"Test contact",@"body":@"Nouveau chat"};
+    CHECK([SNHostNotice(@{@"notificationId":@"envelope-1",@"content":noticeContent})[@"id"] isEqual:@"envelope-1"]);
+    CHECK([SNHostNotice(@{@"notificationId":@"envelope-1",@"content":n})[@"id"] isEqual:@"notice-1"]);
+    CHECK(SNHostNotice(@{@"isHistorical":@YES,@"content":n})==nil);
+    CHECK(SNHostNotice(@{@"content":@{@"content":@{@"content":@{@"content":n}}}})==nil);
+    NSMutableDictionary *cycle=[NSMutableDictionary dictionary];[cycle setObject:cycle forKey:@"content"];
+    CHECK(SNHostNotice(cycle)==nil);[cycle removeAllObjects];
     CHECK([SNHostNotice(@{@"title":[[NSAttributedString alloc] initWithString:@"Test"],@"messageText":@"Line 1\nLine 2"})[@"body"] isEqual:@"Line 1\nLine 2"]);
     CHECK(SNHostNotice(@{@"title":@"Test",@"body":[@"a" stringByPaddingToLength:4097 withString:@"a" startingAtIndex:0]})==nil);
     CHECK(SNTransportJSON([@"{\"messages\":[]}" dataUsingEncoding:NSUTF8StringEncoding])!=nil);

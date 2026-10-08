@@ -55,9 +55,12 @@ typedef struct {
     bool occupied, committed;
 } SNLedgerEntry;
 typedef struct { SNLedgerEntry entries[SN_LEDGER_SIZE]; uint64_t serial; } SNLedger;
-/* Single-queue owned. Zero means duplicate, invalid key or invalid time. */
+/* Single-queue owned. Zero means duplicate, invalid key/time, or all slots are
+   pending. Active reservations are never evicted before their pending TTL. */
 uint64_t sn_ledger_reserve(SNLedger *ledger, const char *key, double now, double pending_ttl);
+/* Expired tickets cannot commit; repeated commits cannot shorten a tombstone. */
 bool sn_ledger_commit(SNLedger *ledger, uint64_t ticket, double now, double ttl);
+/* Cancel an uncommitted reservation. Accepted events and tombstones survive. */
 void sn_ledger_cancel(SNLedger *ledger, uint64_t ticket);
 /* Tombstone a stopped call to suppress late START retransmissions. */
 void sn_ledger_mark(SNLedger *ledger, const char *key, double now, double ttl);

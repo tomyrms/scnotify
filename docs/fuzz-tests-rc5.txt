@@ -1,0 +1,57 @@
+SnapNotify rc5 - deterministic parser/receive-policy fuzz validation
+Date: 2026-10-09
+
+Evidence type: exact commands and selected output transcribed from completed
+tool executions; not a full redirected compiler log.
+Environment: Windows x64, Zig 0.15.2, target x86_64-windows-gnu.
+Working directory: project root.
+
+Executed PowerShell commands
+---------------------------
+$build = New-Item -ItemType Directory -Path '../fuzz-build' -Force
+
+& '../toolchain/zig-x86_64-windows-0.15.2/zig.exe' cc -std=c11 -D_POSIX_C_SOURCE=200809L -Wall -Wextra -Werror -Wno-unused-command-line-argument -O2 -fsanitize=undefined -fsanitize-trap=all -target x86_64-windows-gnu Core/SNCore.c tests/fuzz_core.c -o '../fuzz-build/fuzz_core.exe'
+if ($LASTEXITCODE -eq 0) { & '../fuzz-build/fuzz_core.exe' tests/fixtures/call_start.bin }
+
+& '../toolchain/zig-x86_64-windows-0.15.2/zig.exe' cc -std=c11 -D_POSIX_C_SOURCE=200809L -Wall -Wextra -Werror -Wno-unused-command-line-argument -O2 -fsanitize=undefined -fsanitize-trap=all -target x86_64-windows-gnu Core/SNReceivePolicy.c tests/fuzz_receive.c -o '../fuzz-build/fuzz_receive.exe'
+if ($LASTEXITCODE -eq 0) { & '../fuzz-build/fuzz_receive.exe' }
+
+Observed output, both commands completed with exit code 0
+--------------------------------------------------------
+core: 100000 deterministic mutation/random inputs + every seed truncation passed.
+receive policy: 100000 seeded inputs completed
+
+Both production C modules were compiled and linked into the executable tests.
+UndefinedBehaviorSanitizer was enabled in trap mode; no UBSan trap occurred.
+The core fuzzer also asserts transactional counts, record payload boundaries,
+and successful call action/UUID lengths. The receive fuzzer checks enum ranges
+and timestamp conversion invariants, including arbitrary double bit patterns.
+
+Tooling note
+------------
+The first compilation attempt omitted -Wno-unused-command-line-argument and
+failed with:
+zig: error: argument unused during compilation: '-fno-rtlib-defaultlib' [-Werror,-Wunused-command-line-argument]
+
+Zig itself injects that unused driver argument. The retry suppresses only
+unused command-line argument diagnostics. C source diagnostics remain subject
+to -Wall -Wextra -Werror; no production-code warning was hidden by that change.
+
+Local build artifacts, outside the packaged source project
+---------------------------------------------------------
+../fuzz-build/fuzz_core.exe       205824 bytes
+../fuzz-build/fuzz_receive.exe    175104 bytes
+
+SHA-256 of fuzz sources recorded after the run:
+tests/fuzz_core.c
+3248D1100B1F907C67401F236B7FA1FD1CA7ED33C3A5F7FDC697E8AB45DB8820
+tests/fuzz_receive.c
+98EBE62DA0B0154993295BA69FB10342CF6ABBEA6EF927A1B4345D5B7F2E10E5
+
+Limits
+------
+These are finite deterministic smoke-fuzz runs, not exhaustive verification.
+AddressSanitizer was not enabled in this Windows execution. The existing
+scripts/test-portable.sh uses ASan/UBSan on supported POSIX systems, but that
+script was not executed here. No Objective-C or iPhone runtime claim follows
+from these C-only executable checks.

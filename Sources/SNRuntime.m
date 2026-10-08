@@ -133,11 +133,35 @@ static NSString *match(NSString *s, NSString *p) {
     return m && m.numberOfRanges>1 && [m rangeAtIndex:1].location!=NSNotFound ? [s substringWithRange:[m rangeAtIndex:1]] : nil;
 }
 static NSArray *descriptionMembers(NSString *part, BOOL typing) {
-    if(!part)return nil; NSMutableArray *out=[NSMutableArray array];
-    NSRegularExpression *re=[NSRegularExpression regularExpressionWithPattern:(typing?@"userId\\s*:\\s*([0-9a-fA-F-]{36})":@"([0-9a-fA-F-]{36})") options:0 error:NULL];
-    for(NSTextCheckingResult *m in [re matchesInString:part options:0 range:NSMakeRange(0,part.length)]) {
-        NSString *uid=SNIdentifier([part substringWithRange:[m rangeAtIndex:1]]);if(uid) [out addObject:@{@"uid":uid,@"rawState":@"unavailable"}];
-        if(out.count>=256)break;
+    if(!part)return nil;
+    part=[part stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet];
+    if(!part.length)return @[];
+    /* Split only between complete entries. A nonempty unreadable list must
+       remain unknown; returning [] would synthesize STOP for every member. */
+    NSMutableArray *entries=[NSMutableArray array],*out=[NSMutableArray array];
+    unichar stack[32];NSUInteger level=0,start=0;
+    for(NSUInteger i=0;i<part.length;i++) {
+        unichar c=[part characterAtIndex:i];
+        if(c=='<'||c=='{'||c=='[') {if(level>=32)return nil;stack[level++]=c;}
+        else if(c=='>'||c=='}'||c==']') {
+            unichar opening=c=='>'?'<':c=='}'?'{':'[';
+            if(!level||stack[level-1]!=opening)return nil;level--;
+        } else if(c==','&&!level) {
+            if(entries.count>=256)return nil;
+            [entries addObject:[part substringWithRange:NSMakeRange(start,i-start)]];start=i+1;
+        }
+    }
+    if(level||entries.count>=256)return nil;
+    [entries addObject:[part substringFromIndex:start]];
+    NSRegularExpression *fields=[NSRegularExpression regularExpressionWithPattern:@"\\buserId\\s*:" options:0 error:NULL];
+    for(NSString *entry in entries) {
+        NSString *uid=nil;
+        if(typing) {
+            if([fields numberOfMatchesInString:entry options:0 range:NSMakeRange(0,entry.length)]!=1)return nil;
+            uid=SNIdentifier(match(entry,@"\\buserId\\s*:\\s*([^\\s,}\\]>]+)"));
+        } else uid=SNIdentifier([entry stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet]);
+        if(!uid)return nil;
+        [out addObject:@{@"uid":uid,@"rawState":@"unavailable"}];
     }
     return out;
 }
@@ -169,8 +193,8 @@ NSArray<NSDictionary *> *SNPresenceRecords(id obj) {
             /* NSDictionary descriptions are not a stable wire protocol. */
             if (![convo isKindOfClass:NSDictionary.class]) {
                 NSString *desc=nil; @try {desc=[convo description];} @catch(__unused NSException *e) {}
-                if (desc.length<=65536 && ([cls containsString:@"Presence"] || [desc hasPrefix:@"<typedObject SCCPresencePlatformActiveConversationInfo:"])) {
-                    uid=uid ?: SNIdentifier(match(desc,@"\\bconversationId\\s*:\\s*([0-9a-fA-F-]{36})"));
+                if ([desc isKindOfClass:NSString.class] && desc.length>0 && desc.length<=65536 && ([cls containsString:@"Presence"] || [desc hasPrefix:@"<typedObject SCCPresencePlatformActiveConversationInfo:"])) {
+                    uid=uid ?: SNIdentifier(match(desc,@"\\bconversationId\\s*:\\s*([^\\s,}\\]>]+)"));
                     typing=typing ?: descriptionMembers(section(desc,@"remoteTypingParticipants"),YES);
                     peeking=peeking ?: descriptionMembers(section(desc,@"remotePeekingParticipantUserIds"),NO);
                     fallback=YES;

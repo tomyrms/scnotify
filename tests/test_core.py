@@ -4,23 +4,25 @@ from __future__ import annotations
 import ctypes as C
 import json
 import math
-import os
 from pathlib import Path
-import subprocess
-import sys
 import tempfile
 import unittest
+from native_build import build_library, unload_library
 
 ROOT = Path(__file__).resolve().parents[1]
 CONV = '11111111-1111-4111-8111-111111111111'
 USER = '22222222-2222-4222-8222-222222222222'
 CALL = '33333333-3333-4333-8333-333333333333'
 TEMP = tempfile.TemporaryDirectory(prefix='snapnotify-tests-')
-LIB = Path(TEMP.name) / ('core.dylib' if sys.platform == 'darwin' else 'core.so')
-subprocess.run([os.environ.get('CC', 'clang'), '-std=c11', '-D_POSIX_C_SOURCE=200809L',
-                '-Wall', '-Wextra', '-Werror', '-shared', '-fPIC', '-O2',
-                str(ROOT / 'Core/SNCore.c'), '-o', str(LIB)], check=True)
+LIB = build_library(TEMP.name, 'core', ROOT / 'Core/SNCore.c',
+                    ['sn_uuid', 'sn_decode_records', 'sn_decode_call',
+                     'sn_presence_update', 'sn_ledger_reserve', 'sn_ledger_commit',
+                     'sn_ledger_cancel', 'sn_ledger_mark'])
 lib = C.CDLL(str(LIB))
+
+def tearDownModule():
+    unload_library(lib)
+    TEMP.cleanup()
 
 class Bytes(C.Structure):
     _fields_ = [('data', C.POINTER(C.c_uint8)), ('size', C.c_size_t)]
@@ -237,8 +239,49 @@ class LedgerTests(unittest.TestCase):
     def test_invalid_keys_rejected_not_truncated(self):
         for key in [b'',b'x'*384,b'x'*1000]: self.assertEqual(self.reserve(key),0)
     def test_bounded_capacity(self):
-        for i in range(2000):self.assertTrue(self.reserve(str(i).encode(),i,3000))
+        for i in range(2000):
+            ticket=self.reserve(str(i).encode(),i,3000)
+            self.assertTrue(ticket)
+            self.assertTrue(lib.sn_ledger_commit(C.byref(self.l),ticket,i,3000))
         self.assertEqual(sum(x.occupied for x in self.l.entries),512)
+    def test_full_pending_ledger_rejects_new_instead_of_losing_ticket(self):
+        tickets=[self.reserve(str(i).encode(),0,15) for i in range(512)]
+        self.assertTrue(all(tickets))
+        self.assertEqual(self.reserve(b'overflow',1,15),0)
+        self.assertEqual(self.reserve(b'0',1,15),0)
+        self.assertTrue(lib.sn_ledger_commit(C.byref(self.l),tickets[0],1,300))
+        self.assertTrue(self.reserve(b'overflow',2,15))
+        self.assertEqual(self.reserve(b'1',2,15),0)
+        self.assertTrue(lib.sn_ledger_commit(C.byref(self.l),tickets[1],2,300))
+    def test_pending_ticket_survives_pressure_from_completed_events(self):
+        pending=self.reserve(b'pending',0,15)
+        for i in range(511):
+            ticket=self.reserve(str(i).encode(),0,15)
+            self.assertTrue(lib.sn_ledger_commit(C.byref(self.l),ticket,0,86400))
+        self.assertTrue(self.reserve(b'new-event',1,15))
+        self.assertEqual(self.reserve(b'pending',1,15),0)
+        self.assertTrue(lib.sn_ledger_commit(C.byref(self.l),pending,1,300))
+    def test_stop_invalidates_inflight_start_ticket(self):
+        ticket=self.reserve()
+        lib.sn_ledger_mark(C.byref(self.l),b'call|one',1,300)
+        lib.sn_ledger_cancel(C.byref(self.l),ticket)
+        self.assertFalse(lib.sn_ledger_commit(C.byref(self.l),ticket,2,1))
+        self.assertEqual(self.reserve(now=300),0)
+        self.assertTrue(self.reserve(now=302))
+    def test_completed_ticket_cannot_be_cancelled(self):
+        ticket=self.reserve()
+        self.assertTrue(lib.sn_ledger_commit(C.byref(self.l),ticket,1,300))
+        lib.sn_ledger_cancel(C.byref(self.l),ticket)
+        self.assertEqual(self.reserve(now=2),0)
+    def test_repeated_commit_cannot_shorten_dedup_window(self):
+        ticket=self.reserve()
+        self.assertTrue(lib.sn_ledger_commit(C.byref(self.l),ticket,1,300))
+        self.assertTrue(lib.sn_ledger_commit(C.byref(self.l),ticket,2,1))
+        self.assertEqual(self.reserve(now=300),0)
+    def test_expired_ticket_cannot_be_committed(self):
+        ticket=self.reserve()
+        self.assertFalse(lib.sn_ledger_commit(C.byref(self.l),ticket,15,300))
+        self.assertTrue(self.reserve(now=16))
     def test_expired_call_not_permanent(self):
         t=self.reserve();lib.sn_ledger_commit(C.byref(self.l),t,0,300);self.assertTrue(self.reserve(now=301))
 

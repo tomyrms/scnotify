@@ -1,93 +1,110 @@
-test_duplicate_envelope_fields (test_core.CallTests.test_duplicate_envelope_fields) ... ok
-test_duplicate_json_semantic_key (test_core.CallTests.test_duplicate_json_semantic_key) ... ok
-test_invalid_uuid (test_core.CallTests.test_invalid_uuid) ... ok
-test_json_failures (test_core.CallTests.test_json_failures) ... ok
-test_missing_ring_policy (test_core.CallTests.test_missing_ring_policy) ... ok
-test_nested_spoof_does_not_classify (test_core.CallTests.test_nested_spoof_does_not_classify) ... ok
-test_permuted_envelope_fields (test_core.CallTests.test_permuted_envelope_fields) ... ok
-test_raw_utf8 (test_core.CallTests.test_raw_utf8) ... ok
-test_silent_call_explicit (test_core.CallTests.test_silent_call_explicit) ... ok
-test_start (test_core.CallTests.test_start) ... ok
-test_stop_is_not_start (test_core.CallTests.test_stop_is_not_start) ... ok
-test_streamer_is_not_message_or_call (test_core.CallTests.test_streamer_is_not_message_or_call) ... ok
-test_string_boolean_is_invalid (test_core.CallTests.test_string_boolean_is_invalid) ... ok
-test_unknown_action (test_core.CallTests.test_unknown_action) ... ok
-test_valid_json_unicode_and_escaped_required_key (test_core.CallTests.test_valid_json_unicode_and_escaped_required_key) ... ok
-test_wrong_type_with_call_word (test_core.CallTests.test_wrong_type_with_call_word) ... ok
-test_bounded_capacity (test_core.LedgerTests.test_bounded_capacity) ... ok
-test_distinct_snaps_from_same_sender (test_core.LedgerTests.test_distinct_snaps_from_same_sender) ... ok
-test_duplicate_does_not_extend_window (test_core.LedgerTests.test_duplicate_does_not_extend_window) ... ok
-test_expired_call_not_permanent (test_core.LedgerTests.test_expired_call_not_permanent) ... ok
-test_failure_rollback (test_core.LedgerTests.test_failure_rollback) ... ok
-test_invalid_keys_rejected_not_truncated (test_core.LedgerTests.test_invalid_keys_rejected_not_truncated) ... ok
-test_old_callback_cannot_cancel_new_ticket (test_core.LedgerTests.test_old_callback_cannot_cancel_new_ticket) ... ok
-test_stop_tombstone (test_core.LedgerTests.test_stop_tombstone) ... ok
-test_success_commit (test_core.LedgerTests.test_success_commit) ... ok
-test_bounce_is_rearmable (test_core.PresenceTests.test_bounce_is_rearmable) ... ok
-test_first_and_duplicate (test_core.PresenceTests.test_first_and_duplicate) ... ok
-test_invalid_time_and_configuration (test_core.PresenceTests.test_invalid_time_and_configuration) ... ok
-test_missing_stop_expires (test_core.PresenceTests.test_missing_stop_expires) ... ok
-test_no_periodic_spam_during_continuous_typing (test_core.PresenceTests.test_no_periodic_spam_during_continuous_typing) ... ok
-test_out_of_order_ignored (test_core.PresenceTests.test_out_of_order_ignored) ... ok
-test_stop_then_restart (test_core.PresenceTests.test_stop_then_restart) ... ok
-test_two_minutes_later_without_stop (test_core.PresenceTests.test_two_minutes_later_without_stop) ... ok
-test_two_users_are_independent (test_core.PresenceTests.test_two_users_are_independent) ... ok
-test_supplied_log_calls_replay_as_one_background_call_not_three_messages (test_core.ReplayTests.test_supplied_log_calls_replay_as_one_background_call_not_three_messages) ... ok
-test_invalid_ids (test_core.UUIDTests.test_invalid_ids) ... ok
-test_uppercase_normalized (test_core.UUIDTests.test_uppercase_normalized) ... ok
-test_all_truncations (test_core.WireTests.test_all_truncations) ... ok
-test_bad_tags_and_overflow (test_core.WireTests.test_bad_tags_and_overflow) ... ok
-test_bounded_records (test_core.WireTests.test_bounded_records) ... ok
-test_duplicate_record_fields (test_core.WireTests.test_duplicate_record_fields) ... ok
-test_invalid_topic (test_core.WireTests.test_invalid_topic) ... ok
-test_malformed_batch_transactional (test_core.WireTests.test_malformed_batch_transactional) ... ok
-test_multiple_records (test_core.WireTests.test_multiple_records) ... ok
-test_no_keyword_search (test_core.WireTests.test_no_keyword_search) ... ok
-test_oversize_packet (test_core.WireTests.test_oversize_packet) ... ok
-test_real_shape (test_core.WireTests.test_real_shape) ... ok
-test_unknown_outer_fields (test_core.WireTests.test_unknown_outer_fields) ... ok
-test_actual_arroyo_callback_stays_snapshot (test_receive_policy.ReceivePolicyTests.test_actual_arroyo_callback_stays_snapshot) ... ok
-test_bad_selector (test_receive_policy.ReceivePolicyTests.test_bad_selector) ... ok
-test_call_typing_presence_separate (test_receive_policy.ReceivePolicyTests.test_call_typing_presence_separate) ... ok
-test_case (test_receive_policy.ReceivePolicyTests.test_case) ... ok
-test_chat_symbols (test_receive_policy.ReceivePolicyTests.test_chat_symbols) ... ok
-test_exact_presenters (test_receive_policy.ReceivePolicyTests.test_exact_presenters) ... ok
-test_hints (test_receive_policy.ReceivePolicyTests.test_hints) ... ok
-test_invalid_symbols (test_receive_policy.ReceivePolicyTests.test_invalid_symbols) ... ok
-test_invalid_time (test_receive_policy.ReceivePolicyTests.test_invalid_time) ... ok
-test_live_multi_arguments (test_receive_policy.ReceivePolicyTests.test_live_multi_arguments) ... ok
-test_live_original (test_receive_policy.ReceivePolicyTests.test_live_original) ... ok
-test_metadata_not_messages (test_receive_policy.ReceivePolicyTests.test_metadata_not_messages) ... ok
-test_metrics_are_not_message_callbacks (test_receive_policy.ReceivePolicyTests.test_metrics_are_not_message_callbacks) ... ok
-test_native_class_boundary (test_receive_policy.ReceivePolicyTests.test_native_class_boundary) ... ok
-test_native_numeric_version_boundary (test_receive_policy.ReceivePolicyTests.test_native_numeric_version_boundary) ... ok
-test_native_snap_zero_is_not_missing (test_receive_policy.ReceivePolicyTests.test_native_snap_zero_is_not_missing) ... ok
-test_native_unknown_numeric_types_not_guessed (test_receive_policy.ReceivePolicyTests.test_native_unknown_numeric_types_not_guessed) ... ok
-test_numeric_not_guessed (test_receive_policy.ReceivePolicyTests.test_numeric_not_guessed) ... ok
-test_numeric_types_remain_unmapped_outside_native_adapter (test_receive_policy.ReceivePolicyTests.test_numeric_types_remain_unmapped_outside_native_adapter) ... ok
-test_observed_native_content_type_one (test_receive_policy.ReceivePolicyTests.test_observed_native_content_type_one) ... ok
-test_plain_words_not_enough (test_receive_policy.ReceivePolicyTests.test_plain_words_not_enough) ... ok
-test_prefixes (test_receive_policy.ReceivePolicyTests.test_prefixes) ... ok
-test_receipts_not_messages (test_receive_policy.ReceivePolicyTests.test_receipts_not_messages) ... ok
-test_send_and_read_callbacks_not_received (test_receive_policy.ReceivePolicyTests.test_send_and_read_callbacks_not_received) ... ok
-test_separate_conversation (test_receive_policy.ReceivePolicyTests.test_separate_conversation) ... ok
-test_snap_symbols (test_receive_policy.ReceivePolicyTests.test_snap_symbols) ... ok
-test_snapshot_known_announcer (test_receive_policy.ReceivePolicyTests.test_snapshot_known_announcer) ... ok
-test_snapshot_native_listener (test_receive_policy.ReceivePolicyTests.test_snapshot_native_listener) ... ok
-test_snapshot_requires_role (test_receive_policy.ReceivePolicyTests.test_snapshot_requires_role) ... ok
-test_system_classes_ignored (test_receive_policy.ReceivePolicyTests.test_system_classes_ignored) ... ok
-test_time_units (test_receive_policy.ReceivePolicyTests.test_time_units) ... ok
-test_window (test_receive_policy.ReceivePolicyTests.test_window) ... ok
-test_invalid_info_rejected (test_tools.IPAInspectorTests.test_invalid_info_rejected) ... ok
-test_missing_profile_not_claimed_valid (test_tools.IPAInspectorTests.test_missing_profile_not_claimed_valid) ... ok
-test_multiple_apps_rejected (test_tools.IPAInspectorTests.test_multiple_apps_rejected) ... ok
-test_path_traversal_not_extracted (test_tools.IPAInspectorTests.test_path_traversal_not_extracted) ... ok
-test_profile_permissions_distinct_from_signature (test_tools.IPAInspectorTests.test_profile_permissions_distinct_from_signature) ... ok
-test_sensitive_profile_data_omitted (test_tools.IPAInspectorTests.test_sensitive_profile_data_omitted) ... ok
+SnapNotify rc5 - portable C/Python validation
+Date: 2026-10-09
 
-----------------------------------------------------------------------
-Ran 86 tests in 3.624s
+Evidence type: summary and selected exact output transcribed from completed
+tool executions. This file is not a full redirected console log. Tests were
+actually executed; no test result was inferred from source inspection.
+
+Environment
+-----------
+Windows x64; Zig 0.15.2; target x86_64-windows-gnu.
+Python: C:/Users/jtoma/.cache/codex-runtimes/codex-primary-runtime/dependencies/python/python.exe
+Zig: ../toolchain/zig-x86_64-windows-0.15.2/zig.exe
+Working directory for commands: project root.
+
+The downloaded compiler is a local validation dependency outside the project.
+It is not required at runtime on iPhone and is not included in the source ZIP.
+MSVC was tried first but could not compile because this machine has no usable
+Windows SDK/UCRT headers (stddef.h and string.h were missing). That attempt
+was a tooling failure, not a passing test run.
+
+Executed PowerShell command
+---------------------------
+$env:CC = (Resolve-Path '../toolchain/zig-x86_64-windows-0.15.2/zig.exe').Path
+& 'C:/Users/jtoma/.cache/codex-runtimes/codex-primary-runtime/dependencies/python/python.exe' -m unittest discover -s tests -p 'test_*.py' -v
+
+tests/native_build.py compiles the production Core/SNCore.c and
+Core/SNReceivePolicy.c into temporary DLLs loaded with ctypes. The generated
+compiler arguments are:
+zig.exe cc -std=c11 -D_POSIX_C_SOURCE=200809L -Wall -Wextra -Werror -shared -fPIC -O2 <production-source> -o <temporary-dll> -target x86_64-windows-gnu -Wl,--export-all-symbols
+
+Observed final output, exit code 0
+--------------------------------
+Ran 94 tests in 2.415s
 
 OK
-100000 deterministic mutation/random inputs + every seed truncation passed (ASan/UBSan).
-receive policy: 100000 seeded inputs completed (ASan/UBSan)
+
+Coverage includes the existing parser/UUID/call/presence/replay/receive-policy
+and IPA-inspection tests, plus six ledger regressions and two voice-symbol
+tests. The macOS Objective-C tests are outside this portable suite.
+
+Before/after check against the original rc4 ZIP
+---------------------------------------------
+The following original files were extracted verbatim from
+C:/Users/jtoma/Downloads/SnapNotify-v4.0.0-rc4.zip into ../core-baseline/:
+  SnapNotify-v4.0.0-rc4/Core/SNCore.c
+  SnapNotify-v4.0.0-rc4/Core/SNCore.h
+  SnapNotify-v4.0.0-rc4/Core/SNReceivePolicy.c
+  SnapNotify-v4.0.0-rc4/Core/SNReceivePolicy.h
+
+The current regression tests were then compiled against those original C
+sources by overriding only native_build.build_library's source argument.
+No production source was temporarily replaced.
+
+Executed PowerShell/Python command (same CC environment as above):
+$code = @'
+import sys, unittest
+from pathlib import Path
+sys.path.insert(0, str(Path('tests').resolve()))
+import native_build
+build = native_build.build_library
+baseline = Path('../core-baseline').resolve()
+native_build.build_library = lambda directory, name, source, exports: build(directory, name, baseline / Path(source).name, exports)
+names = [
+ 'test_core.LedgerTests.test_full_pending_ledger_rejects_new_instead_of_losing_ticket',
+ 'test_core.LedgerTests.test_pending_ticket_survives_pressure_from_completed_events',
+ 'test_core.LedgerTests.test_stop_invalidates_inflight_start_ticket',
+ 'test_core.LedgerTests.test_completed_ticket_cannot_be_cancelled',
+ 'test_core.LedgerTests.test_repeated_commit_cannot_shorten_dedup_window',
+ 'test_core.LedgerTests.test_expired_ticket_cannot_be_committed',
+ 'test_receive_policy.ReceivePolicyTests.test_voice_symbols_are_messages',
+]
+result = unittest.TextTestRunner(verbosity=2).run(unittest.defaultTestLoader.loadTestsFromNames(names))
+print('BASELINE_EXPECTED_FAILURES: tests=',result.testsRun,'failures=',len(result.failures),'errors=',len(result.errors))
+if result.wasSuccessful() or result.errors: sys.exit(1)
+'@
+& 'C:/Users/jtoma/.cache/codex-runtimes/codex-primary-runtime/dependencies/python/python.exe' -c $code
+
+Observed output:
+Ran 7 tests in 0.743s
+
+FAILED (failures=18)
+BASELINE_EXPECTED_FAILURES: tests= 7 failures= 18 errors= 0
+
+All seven regression methods failed on the original code. There are eighteen
+failure records because the voice method contains twelve failing subtests
+(four newly supported symbols, each with three prefixes). The command's exit
+code 0 means the expected baseline failures occurred without tooling errors;
+it does NOT mean the original project passed those regressions.
+
+Representative exact original-code failures:
+  full pending ledger: AssertionError: 513 != 0
+  pending ticket displaced by completed events: AssertionError: 514 != 0
+  stopped call resurrected after cancel: AssertionError: 2 != 0
+  committed notification cancelled: AssertionError: 2 != 0
+  repeated commit shortened window: AssertionError: 2 != 0
+  expired ticket accepted: AssertionError: True is not false
+  voice symbolic kind missing: AssertionError: 0 != 1
+
+SHA-256 of the corrected production C sources recorded after the run:
+Core/SNCore.c
+5F527F90759F835FCCDE43B7D47A6A7C304A401B60EEB05C046C3EF23A5737DE
+Core/SNReceivePolicy.c
+3DC4583B550AE5EED2A498127ACE32D5C76147861E5ED34CDF3780CCAFF622DF
+
+Limits
+------
+This validates C behavior on Windows, not installation or notification
+delivery on an iPhone. UIKit, UserNotifications, Foundation/Objective-C tests,
+signing, IPA injection and the actual Snapchat runtime were not executed by
+this portable run. No ASan claim is made; see fuzz-tests-rc5.txt for UBSan.

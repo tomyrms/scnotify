@@ -11,29 +11,32 @@ xcrun clang -std=gnu11 -Wall -Wextra -Werror -c Core/SNCore.c -o "$build/core.o"
 xcrun clang -std=gnu11 -Wall -Wextra -Werror -c Core/SNReceivePolicy.c -o "$build/policy.o"
 xcrun clang -std=gnu11 -fobjc-arc -fblocks -Wall -Wextra -Werror \
   -Wno-deprecated-declarations -framework Foundation -framework CoreFoundation \
-  Sources/SNRuntime.m Sources/SNReceive.m Sources/SNContent.m tests/TestFoundation.m "$build/core.o" "$build/policy.o" -o "$build/test_foundation"
+  Sources/SNRuntime.m Sources/SNReceive.m tests/TestFoundation.m "$build/core.o" "$build/policy.o" -o "$build/test_foundation"
 "$build/test_foundation"
 
 xcrun clang -std=gnu11 -fobjc-arc -fblocks -Wall -Wextra -Werror \
   -Wno-deprecated-declarations -framework Foundation -framework CoreFoundation \
-  Sources/SNRuntime.m Sources/SNReceive.m Sources/SNContent.m tests/TestReceive.m "$build/core.o" "$build/policy.o" -o "$build/test_receive"
+  Sources/SNRuntime.m Sources/SNReceive.m tests/TestReceive.m "$build/core.o" "$build/policy.o" -o "$build/test_receive"
 "$build/test_receive"
 
 xcrun clang -std=gnu11 -fobjc-arc -fblocks -Wall -Wextra -Werror \
   -Wno-deprecated-declarations -framework Foundation -framework CoreFoundation \
-  Sources/SNRuntime.m Sources/SNReceive.m Sources/SNContent.m Sources/SNHostNotice.m tests/TestHostNotice.m \
+  Sources/SNRuntime.m Sources/SNReceive.m Sources/SNHostNotice.m tests/TestHostNotice.m \
   "$build/core.o" "$build/policy.o" -o "$build/test_host_notice"
 "$build/test_host_notice"
 
 xcrun clang -std=gnu11 -fobjc-arc -fblocks -Wall -Wextra -Werror \
   -Wno-deprecated-declarations -framework Foundation -framework CoreFoundation \
-  Sources/SNRuntime.m Sources/SNReceive.m Sources/SNContent.m tests/TestNativeReceive.m \
+  Sources/SNRuntime.m Sources/SNReceive.m tests/TestNativeReceive.m \
   "$build/core.o" "$build/policy.o" -o "$build/test_native_receive"
 "$build/test_native_receive"
 
-# Burst queue persistence / voice labels / remote-identity lifetime.
 xcrun clang -std=gnu11 -fobjc-arc -fblocks -Wall -Wextra -Werror \
   -Wno-deprecated-declarations -framework Foundation -framework CoreFoundation \
-  Sources/SNRuntime.m Sources/SNReceive.m Sources/SNContent.m Sources/SNOutbox.m tests/TestOutbox.m \
-  "$build/core.o" "$build/policy.o" -o "$build/test_outbox"
-"$build/test_outbox"
+  Sources/SNRuntime.m Sources/SNReceive.m Sources/SNForeground.m tests/TestForeground.m \
+  "$build/core.o" "$build/policy.o" -o "$build/test_foreground"
+"$build/test_foreground"
+
+xcrun clang -std=gnu11 -fobjc-arc -fblocks -Wall -Wextra -Werror \
+  -framework Foundation Sources/SNEventBuffer.m tests/TestEventBuffer.m -o "$build/test_event_buffer"
+"$build/test_event_buffer"

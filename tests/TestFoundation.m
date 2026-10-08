@@ -67,6 +67,25 @@ int main(void) {
         CHECK(decoded.count==1);CHECK([decoded[0][@"typing"][0][@"uid"] isEqual:U]);CHECK([decoded[0][@"peeking"][0][@"uid"] isEqual:V]);
         proxy.fixture=@"<typedObject SCCPresencePlatformActiveConversationInfo: { remoteTypingParticipants: [ truncated";
         CHECK(SNPresenceRecords(@[proxy])==nil);
+        proxy.fixture=nil;CHECK(SNPresenceRecords(@[proxy])==nil);
+        proxy.fixture=[NSString stringWithFormat:@"<typedObject SCCPresencePlatformActiveConversationInfo: { conversationId: %@bad, remoteTypingParticipants: [], remotePeekingParticipantUserIds: [] }>",C];
+        CHECK(SNPresenceRecords(@[proxy])==nil);
+        /* A damaged nonempty fallback must not look like a successful empty
+           snapshot: that would cancel waiting typing notifications. */
+        proxy.fixture=[NSString stringWithFormat:@"<typedObject SCCPresencePlatformActiveConversationInfo: { conversationId: %@, remoteTypingParticipants: [ <typedObject T: { userId: invalid }> ], remotePeekingParticipantUserIds: [] }>",C];
+        CHECK(SNPresenceRecords(@[proxy])==nil);
+        proxy.fixture=[NSString stringWithFormat:@"<typedObject SCCPresencePlatformActiveConversationInfo: { conversationId: %@, remoteTypingParticipants: [ <typedObject T: { userId: %@ }>, <typedObject T: { userId: invalid }> ], remotePeekingParticipantUserIds: [] }>",C,U];
+        CHECK(SNPresenceRecords(@[proxy])==nil);
+        proxy.fixture=[NSString stringWithFormat:@"<typedObject SCCPresencePlatformActiveConversationInfo: { conversationId: %@, remoteTypingParticipants: [], remotePeekingParticipantUserIds: [ invalid ] }>",C];
+        decoded=SNPresenceRecords(@[proxy]);CHECK(decoded.count==1);CHECK(![decoded[0][@"peekingKnown"] boolValue]);
+        proxy.fixture=[NSString stringWithFormat:@"<typedObject SCCPresencePlatformActiveConversationInfo: { conversationId: %@, remoteTypingParticipants: [], remotePeekingParticipantUserIds: [ %@, invalid ] }>",C,U];
+        decoded=SNPresenceRecords(@[proxy]);CHECK(decoded.count==1);CHECK(![decoded[0][@"peekingKnown"] boolValue]);
+        proxy.fixture=[NSString stringWithFormat:@"<typedObject SCCPresencePlatformActiveConversationInfo: { conversationId: %@, remoteTypingParticipants: [], remotePeekingParticipantUserIds: [] }>",C];
+        decoded=SNPresenceRecords(@[proxy]);CHECK(decoded.count==1);CHECK([decoded[0][@"typing"] count]==0);CHECK([decoded[0][@"peekingKnown"] boolValue]);
+        NSMutableArray *tooMany=[NSMutableArray array];
+        for(unsigned i=0;i<257;i++)[tooMany addObject:[NSString stringWithFormat:@"<typedObject T: { userId: %@ }>",U]];
+        proxy.fixture=[NSString stringWithFormat:@"<typedObject SCCPresencePlatformActiveConversationInfo: { conversationId: %@, remoteTypingParticipants: [ %@ ], remotePeekingParticipantUserIds: [] }>",C,[tooMany componentsJoinedByString:@","]];
+        CHECK(SNPresenceRecords(@[proxy])==nil);
         NSDictionary *snap=@{@"messageType":@"SNAP",@"senderId":U,@"conversationId":C,@"messageId":@1,@"senderDisplayName":@"José"};
         CHECK(SNReceivedRecords(snap,nil).count==1);
         CHECK([SNReceivedRecords(snap,nil).firstObject[@"kind"] isEqual:@"snap"]);

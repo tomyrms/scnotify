@@ -40,9 +40,7 @@ static NSString * const SELNAME=@"onConversationUpdated:conversation:updatedMess
 @property(nonatomic) BOOL isSnapMessage;
 @property(nonatomic) BOOL isStatusMessage;
 @property(nonatomic) BOOL isVoiceNote;
-@property(nonatomic) BOOL isStickerMessage;
-@property(nonatomic) BOOL isSingleImageChatMedia;
-@property(nonatomic) BOOL isStoryReplyMessage;
+@property(nonatomic) BOOL isVoiceNoteMessage;
 @property(nonatomic) BOOL isChatMediaMessage;
 @property(nonatomic) BOOL isStickerReaction;
 @property(nonatomic) BOOL isErased;
@@ -88,6 +86,8 @@ int main(void) {@autoreleasepool {
     m.messageContent.contentType=6;CHECK(firstEvent(m)==nil);
     for(NSNumber *n in @[@2,@3,@4,@5]){m.messageContent.contentType=n.integerValue;CHECK(firstEvent(m)==nil);m.isChatMediaMessage=YES;CHECK([firstEvent(m)[@"kind"] isEqual:@"message"]);m.isChatMediaMessage=NO;}
     m.messageContent.contentType=999;CHECK(firstEvent(m)==nil);
+    m.isVoiceNote=YES;CHECK([firstEvent(m)[@"kind"] isEqual:@"message"]);CHECK([firstEvent(m)[@"subtype"] isEqual:@"voice"]);m.isVoiceNote=NO;
+    m.isVoiceNoteMessage=YES;CHECK([firstEvent(m)[@"subtype"] isEqual:@"voice"]);m.isVoiceNoteMessage=NO;
     m.isSnapMessage=YES;CHECK([firstEvent(m)[@"kind"] isEqual:@"snap"]);
     m.isTextMessage=YES;CHECK(firstEvent(m)==nil);CHECK([decode(m)[@"rejected"][@"conflicting-native-predicates"] integerValue]==1);
     m=msg(2,1);m.isTextMessage=YES;m.isStatusMessage=YES;CHECK(firstEvent(m)==nil);
@@ -135,25 +135,24 @@ int main(void) {@autoreleasepool {
     CHECK([tracker newEventsInBatch:prepared(msg(106,1),ME,NO) wallTime:1800000003].count==1);
     // Missing timestamp must stay silent, rather than pretend now is sentAt.
     m=msg(107,1);m.metadata=@{};CHECK([tracker newEventsInBatch:prepared(m,ME,NO) wallTime:1800000003].count==0);
+    m.metadata=@{@"createdAt":@1800000003};CHECK([tracker newEventsInBatch:prepared(m,ME,NO) wallTime:1800000004].count==1);
+    CHECK([tracker newEventsInBatch:prepared(m,ME,NO) wallTime:1800000005].count==0);
+    /* A delayed first observation must retain the original monitoring gate
+       when direction or timestamp becomes available on another callback. */
+    tracker=[[SNReceiveTracker alloc] initWithMonitoringStart:1800000000];
+    m=msg(109,1);CHECK([tracker newEventsInBatch:prepared(m,nil,NO) wallTime:1800000010].count==0);
+    CHECK([tracker newEventsInBatch:prepared(m,ME,NO) wallTime:1800000011].count==1);
+    tracker=[[SNReceiveTracker alloc] initWithMonitoringStart:1800000000];
+    m=msg(110,1);m.metadata=@{};CHECK([tracker newEventsInBatch:prepared(m,ME,NO) wallTime:1800000010].count==0);
+    m.metadata=@{@"createdAt":@1800000001};CHECK([tracker newEventsInBatch:prepared(m,ME,NO) wallTime:1800000011].count==1);
+    tracker=[[SNReceiveTracker alloc] initWithMonitoringStart:1800000000];
+    m=msg(111,1);m.metadata=@{};CHECK([tracker newEventsInBatch:prepared(m,ME,NO) wallTime:1800000010].count==0);
+    m.metadata=@{@"createdAt":@1799999999};CHECK([tracker newEventsInBatch:prepared(m,ME,NO) wallTime:1800000011].count==0);
     m=msg(108,999);m.metadata=@{@"secret":@"PRIVATE_BODY_NOT_FOR_LOGS",@"currentUserId":ME};
     NSString *schema=[[NSString alloc] initWithData:[NSJSONSerialization dataWithJSONObject:decode(m) options:0 error:NULL] encoding:NSUTF8StringEncoding];
     CHECK(![schema containsString:@"PRIVATE_BODY_NOT_FOR_LOGS"]); // entire rejected batch has only event identities, no text
     NSString *shapes=[[NSString alloc] initWithData:[NSJSONSerialization dataWithJSONObject:decode(m)[@"shapes"] options:0 error:NULL] encoding:NSUTF8StringEncoding];
     CHECK(![shapes containsString:U]);CHECK(![shapes containsString:ME]);
-    m=msg(109,999);m.isVoiceNote=YES;CHECK([firstEvent(m)[@"kind"] isEqual:@"message"]);CHECK([firstEvent(m)[@"subtype"] isEqual:@"voice"]);
-    m.isVoiceNote=NO;m.isStickerMessage=YES;CHECK([firstEvent(m)[@"subtype"] isEqual:@"sticker"]);
-    m.isStickerMessage=NO;m.isSingleImageChatMedia=YES;CHECK([firstEvent(m)[@"subtype"] isEqual:@"photo"]);
-    m.isSingleImageChatMedia=NO;m.isStoryReplyMessage=YES;CHECK([firstEvent(m)[@"subtype"] isEqual:@"story_reply"]);
-    NSMutableArray *burst=[NSMutableArray array];for(NSUInteger i=1;i<=600;i++)[burst addObject:msg(1000+i,1)];
-    __block NSUInteger total=0,batches=0;
-    SNEnumerateReceiveBatches(CLS,SELNAME,@[uuid(C),NSNull.null,burst,@[]],^(NSDictionary *batch){batches++;total+=[batch[@"events"] count];CHECK([batch[@"events"] count]<=128);});
-    CHECK(total==600);CHECK(batches==5);
-    // The old 2048-entry set stopped accepting every subsequent message.
-    tracker=[[SNReceiveTracker alloc] initWithMonitoringStart:1800000000];
-    for(NSUInteger i=1;i<=8300;i++){
-        NSDictionary *ev=@{@"event":[@(10000+i) stringValue],@"uid":U,@"conversation":C,@"kind":@"message",@"incoming":@YES,@"timestamp":@1800000001};
-        CHECK([tracker newEventsInSnapshot:@[ev] wallTime:1800000002].count==1);
-    }
     // The supplied encoding B32@0:8@16@24 was rejected by rc3.
     __block NSUInteger hits=0;__block int last=-7;RC4BoolHost *host=[RC4BoolHost new];
     CHECK(SNInstallHook(RC4BoolHost.class,@selector(present:delegate:),^(id self,NSArray *args,id result){hits++;last=[result intValue];CHECK(self==host);CHECK(args.count==2);CHECK(args[1]==NSNull.null);}));

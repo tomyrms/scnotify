@@ -7,7 +7,6 @@ void SNSetReceiveTypeMappings(NSDictionary *mappings);
 void SNSetReceiveHostVersion(NSString *version);
 /* Snapshot adapter for the exact four-argument Arroyo callback. Removed
    messages and conversation history are not new-message candidates. */
-void SNEnumerateReceiveBatches(NSString *className, NSString *selector, NSArray *arguments, void (^visit)(NSDictionary *batch));
 NSDictionary *SNDecodeReceiveCallback(NSString *className, NSString *selector, NSArray *arguments);
 /* Return an incoming flag only with independent direction evidence. */
 NSDictionary *SNResolveReceiveDirection(NSDictionary *event, NSString * _Nullable account, BOOL knownRemote);
@@ -18,9 +17,13 @@ NSString * _Nullable SNCallbackConversation(NSString *selector, NSArray *argumen
    All results are detached Foundation values, never retained host objects. */
 NSDictionary *SNDecodeReceived(NSArray *arguments, NSString * _Nullable conversation,
                                NSString * _Nullable hint);
-/* Snapshot observers are not receive callbacks. Old first-batch records seed
+/* Message events may include subtype="voice" when a native semantic getter
+   or symbolic content type identifies a voice note; no numeric enum guessing.
+   Snapshot observers are not receive callbacks. Old first-batch records seed
    a baseline; newly created incoming IDs can notify under the date/direction
-   gates, including first-batch records created since monitoring began. */
+   gates, including first-batch records created since monitoring began.
+   Incomplete live records await timestamp/direction evidence. Seen identities
+   expire after the entire date-eligibility horizon instead of filling forever. */
 @interface SNReceiveTracker : NSObject
 /* A positive start permits first-batch incoming records created after start. */
 - (instancetype)initWithMonitoringStart:(NSTimeInterval)start;

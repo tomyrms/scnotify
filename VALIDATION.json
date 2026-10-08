@@ -1,59 +1,54 @@
 {
   "version": "4.0.0-rc5",
-  "base_version": "4.0.0-rc4",
-  "ci": {
-    "workflow_run_id": 37852967825,
-    "job_id": 113570291032,
-    "run_url": "https://github.com/tomyrms/scnotify/actions/runs/37852967825",
-    "branch": "chatgpt/rc5-voice-bursts-background",
-    "commit": "ebeccf68303f24106a1a29915a90c20b08b8e48b",
-    "base_commit": "6692b9fe72764d6246174c93eac03348d9e45116",
-    "readable_patch_sha256": "1ffce9ccb472f8326df642957f13a46e5369f6a04a512ed8a30185dc5338b993",
-    "result": "success",
-    "artifact_id": 11583221063,
-    "artifact_name": "SnapNotify-rc5-validated",
-    "artifact_zip_sha256": "96dbf95d04ba6f014eb69841b812c1993ab81d227d6a2b7cf74b88882326b83f",
-    "binary_sha256": "812e223a0bd0b3debf349ce77b28f5541f5b7ca885a824a1b53a97639a39aff6",
-    "binary_size_bytes": 294224,
-    "source_hashes_verified": 32,
-    "ios_architecture": "arm64",
-    "validated_at_utc": "2026-10-08T22:22:30Z",
-    "on_device_test_performed": false,
-    "branch_note": "Readable integration patch applied by CI; full delivered ZIP already contains integrated sources. main unchanged."
+  "date": "2026-10-09",
+  "base_archive": "SnapNotify-v4.0.0-rc4.zip",
+  "base_archive_sha256": "a4d21adb118b255ff21d52150da31b3a71123f0351b75ad8b7e9d9f841c4beab",
+  "target_reported_by_user": {
+    "device": "iPhone 14",
+    "ios": "26.6.2",
+    "snapchat": "14.17.1",
+    "installation": "Sideloadly"
   },
-  "executed": {
-    "portable_python_c_tests": 86,
-    "portable_result": "pass",
-    "asan_ubsan_core_seeded_inputs": 100000,
-    "asan_ubsan_receive_policy_seeded_inputs": 100000,
-    "native_test_programs": {
-      "Foundation/runtime": 50,
-      "Receive adapters/runtime": 107,
-      "Host bridge": 52,
-      "Native messaging regression": 8402,
-      "Outbox/burst/content": 5471
-    },
-    "native_total_assertions": 14082,
-    "native_assertions_note": "Includes repeated assertions in loops, not this many independent tests.",
-    "persisted_burst_messages": 600,
-    "chunked_native_models": 600,
-    "sequential_snapshot_ids": 8300,
-    "ios_compile": "success",
-    "source_manifest_match": true
+  "portable_tests": {
+    "executed": true,
+    "passed": 94,
+    "failed": 0,
+    "compiler": "Zig 0.15.2 / Clang, Windows x64",
+    "log": "docs/portable-tests-rc5.txt"
   },
-  "not_executed": [
-    "Installation on iPhone",
-    "Actual voice/sticker/photo notifications on this device",
-    "Real 15–30 minute background reception",
-    "Battery/performance profiling on device",
-    "iOS banner rendering for 600 real notifications"
-  ],
-  "limitations": [
-    "OS API acceptance does not prove banner presentation",
-    "Timer does not wake suspended process",
-    "Unknown old-session account records held rather than sent to unverified account",
-    "Pending queue bounded at 20000 entries; IO/capacity failures reported",
-    "Packet path retains separate rate limits; structured receive path uses backpressure",
-    "No guaranteed exactly-once delivery across OS-acceptance / persistence crash window"
-  ]
+  "fuzz": {
+    "executed": true,
+    "random_inputs": 200000,
+    "seed_truncations": true,
+    "ubsan_trap": true,
+    "asan": false,
+    "log": "docs/fuzz-tests-rc5.txt"
+  },
+  "baseline_regressions": {
+    "selected_tests": 7,
+    "failed_on_original_rc4": 7
+  },
+  "foundation_tests": {
+    "executed": false,
+    "programs": [
+      "TestFoundation",
+      "TestReceive",
+      "TestHostNotice",
+      "TestNativeReceive",
+      "TestForeground",
+      "TestEventBuffer"
+    ],
+    "reason": "macOS Foundation unavailable on this Windows host"
+  },
+  "ios_compilation": {
+    "executed": false,
+    "reason": "Apple SDK unavailable"
+  },
+  "phone_tests": {
+    "executed": false,
+    "background_30_minutes_verified": false,
+    "visual_delivery_verified": false
+  },
+  "remote_changes": false,
+  "distribution": "sources and tests only; no IPA or dylib"
 }
