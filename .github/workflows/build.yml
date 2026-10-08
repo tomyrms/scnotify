@@ -17,6 +17,9 @@ jobs:
           git clone --recursive --depth 1 https://github.com/theos/theos.git "$THEOS"
           echo "$THEOS/bin" >> "$GITHUB_PATH"
 
+      - name: Install ldid
+        run: brew install ldid
+
       - name: Setup SDK
         run: |
           git clone --depth 1 --filter=blob:none --sparse https://github.com/theos/sdks.git /tmp/sdks
