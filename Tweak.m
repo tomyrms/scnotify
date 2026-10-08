@@ -10,6 +10,7 @@
 #include <stdarg.h>
 #include <stdlib.h>
 #include <string.h>
+#include <ctype.h>
 
 static AVAudioPlayer *gPlayer = nil;
 static NSMutableDictionary *gOrig = nil;
@@ -119,9 +120,11 @@ static NSString *sck_extract_name_depth(id obj, BOOL *found, int depth) {
         ident = sck_regex_first(@"(?:conversationId|senderId|userId)[^A-Za-z0-9]{0,12}([A-Za-z0-9._-]{2,64})", desc);
     }
     if (ident && name.length) {
+        BOOL changed = NO;
         [gLock lock];
-        gNameCache[ident] = name;
+        if (![gNameCache[ident] isEqual:name]) { gNameCache[ident] = name; changed = YES; }
         [gLock unlock];
+        if (changed) sck_log(@"NAMECACHE %@ -> %@", ident, name);
     } else if (!name && ident) {
         [gLock lock];
         name = gNameCache[ident];
@@ -411,8 +414,11 @@ static void sck_hit(id self, SEL _cmd, id a, id b, id c) {
         sck_log_obj(@"a", a);
         if (b && b != a) sck_log_obj(@"b", b);
         if (c && c != a && c != b) sck_log_obj(@"c", c);
-        if ([cls containsString:@"Snapchatter"] || [cls containsString:@"ChatConversation"] || [cls containsString:@"ConversationViewModel"] || [cls containsString:@"ConversationMetadata"]) {
+        if ([cls containsString:@"Snapchatter"] || [cls containsString:@"ChatConversation"] || [cls containsString:@"ConversationViewModel"] || [cls containsString:@"ConversationMetadata"] || [cls containsString:@"FriendsFeed"]) {
             sck_extract_name(self, NULL);
+            sck_extract_name(a, NULL);
+            if (b && b != a) sck_extract_name(b, NULL);
+            if (c && c != a && c != b) sck_extract_name(c, NULL);
         }
         if ([cls containsString:@"TypingBubbleView"]) return;
         NSString *t = sck_event_type(cls, sel);
@@ -457,10 +463,26 @@ static id sck_repl_id1(id self, SEL _cmd, id a) {
     id ret = o ? ((id (*)(id, SEL, id))o)(self, _cmd, a) : nil;
     @try {
         if ([a isKindOfClass:[NSString class]] && [ret isKindOfClass:[NSString class]] && [ret length] > 0 && [ret length] < 40) {
+            BOOL changed = NO;
             [gLock lock];
-            gNameCache[a] = ret;
+            if (![gNameCache[a] isEqual:ret]) { gNameCache[a] = ret; changed = YES; }
             [gLock unlock];
-            sck_log(@"NAMECACHE %@ -> %@", a, ret);
+            if (changed) sck_log(@"NAMECACHE %@ -> %@", a, ret);
+        }
+    } @catch (NSException *e) {}
+    return ret;
+}
+
+static id sck_repl_id2(id self, SEL _cmd, id a, id b) {
+    IMP o = sck_orig(self, _cmd);
+    id ret = o ? ((id (*)(id, SEL, id, id))o)(self, _cmd, a, b) : nil;
+    @try {
+        if ([a isKindOfClass:[NSString class]] && [ret isKindOfClass:[NSString class]] && [ret length] > 0 && [ret length] < 40) {
+            BOOL changed = NO;
+            [gLock lock];
+            if (![gNameCache[a] isEqual:ret]) { gNameCache[a] = ret; changed = YES; }
+            [gLock unlock];
+            if (changed) sck_log(@"NAMECACHE %@ -> %@", a, ret);
         }
     } @catch (NSException *e) {}
     return ret;
@@ -476,13 +498,22 @@ static void sck_attach(Class c, Method m) {
     BOOL done = (gOrig[key] != nil);
     [gLock unlock];
     if (done) return;
-    if (colons == 1 && (strstr(sn, "displayNameForUserId") || strstr(sn, "usernameForUserId") || strstr(sn, "nameForUserId"))) {
-        IMP old = method_setImplementation(m, (IMP)sck_repl_id1);
-        [gLock lock];
-        gOrig[key] = [NSValue valueWithPointer:(void *)old];
-        [gLock unlock];
-        sck_log(@"swizzled(ret) -[%s %s]", class_getName(c), sn);
-        return;
+    {
+        char lowbuf[300];
+        size_t ln = strlen(sn);
+        if (ln >= sizeof(lowbuf)) ln = sizeof(lowbuf) - 1;
+        for (size_t k = 0; k < ln; k++) lowbuf[k] = (char)tolower((unsigned char)sn[k]);
+        lowbuf[ln] = 0;
+        BOOL resolver = (strstr(lowbuf, "displaynameforuser") != NULL) || (strstr(lowbuf, "usernameforuser") != NULL) || (strstr(lowbuf, "nameforuserid") != NULL) || (strstr(lowbuf, "displaynameforcontact") != NULL);
+        if (resolver && (colons == 1 || colons == 2)) {
+            IMP newImp = (colons == 1) ? (IMP)sck_repl_id1 : (IMP)sck_repl_id2;
+            IMP old = method_setImplementation(m, newImp);
+            [gLock lock];
+            gOrig[key] = [NSValue valueWithPointer:(void *)old];
+            [gLock unlock];
+            sck_log(@"swizzled(ret%d) -[%s %s]", colons, class_getName(c), sn);
+            return;
+        }
     }
     if (!sck_enc_ok(m, colons)) return;
     IMP newImp = NULL;
@@ -604,6 +635,12 @@ static void sck_scan(void) {
             }
             free(ms);
         }
+        NSArray *models = @[@"SCSnapchatter", @"SCChatConversation", @"SCChatConversationViewModel", @"SCChatConversationViewModelV3", @"SCFriendsFeedItem", @"SCFriendsFeedViewModel"];
+        for (NSString *mn in models) {
+            Class mc = objc_getClass([mn UTF8String]);
+            if (!mc) { sck_log(@"model: class %@ not found", mn); continue; }
+            sck_hook_all(mc);
+        }
         sck_log(@"scan done hooks=%lu", (unsigned long)gOrig.count);
     } @catch (NSException *e) { sck_log(@"scan exc %@", e); }
 }
@@ -630,7 +667,7 @@ static void sck_setup(void) {
             sck_log(@"notif permission=%ld alert=%ld sound=%ld badge=%ld", (long)settings.authorizationStatus, (long)settings.alertSetting, (long)settings.soundSetting, (long)settings.badgeSetting);
         }];
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 2 * NSEC_PER_SEC), dispatch_get_main_queue(), ^{
-            sck_notify_thr(@"boot", @"Snapchat", [NSString stringWithFormat:@"SnapNotify v3.5 chargé (%lu hooks)", (unsigned long)gOrig.count], YES, 0.0);
+            sck_notify_thr(@"boot", @"Snapchat", [NSString stringWithFormat:@"SnapNotify v3.6 chargé (%lu hooks)", (unsigned long)gOrig.count], YES, 0.0);
         });
     }];
     [nc addObserverForName:UIApplicationWillResignActiveNotification object:nil queue:[NSOperationQueue mainQueue] usingBlock:^(NSNotification *note) { sck_log(@"app -> resignActive"); }];
