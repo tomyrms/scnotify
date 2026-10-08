@@ -1,96 +1,52 @@
-# SnapNotify 4.0.0-rc1
+# SnapNotify 4.0.0-rc2 — réception des chats et snaps
 
-Version candidate issue de l'audit du projet fourni (`87bc01f597134c3f9aa82f675f33a2823948ba7d`) et des trois journaux de test. Le projet reste une bibliothèque à injecter dans **ta propre installation de Snapchat**.
+Correctif ciblé de la version `dd9471b02154b2def0f52981f26dced6e829c44e` du dépôt `tomyrms/scnotify`. Les fichiers de code de référence `Tweak.m` et `Sources/SNRuntime.m` ont été vérifiés contre les empreintes GitHub. Les deux changements présents dans cette version sont conservés : hooks ARC en `if/else` et `ExperimentalKeepAlive=true` par défaut. Une configuration utilisateur existante n'est pas écrasée.
 
-**Cette archive contient les sources et les tests, pas un IPA signé. Le cœur C a été exécuté et testé ; la compilation Xcode, les tests Foundation/macOS et le fonctionnement dans Snapchat sur iPhone restent à valider.**
+**Sources complètes, pas un IPA ni une bibliothèque déjà compilée.** Les 78 tests Python/C et deux corpus de 100 000 entrées sous sanitizers passent dans l'environnement Linux de préparation. Les tests Foundation/macOS et la compilation iOS de **rc2** doivent encore passer sur le runner Mac. La réussite CI de rc1 ne vaut pas validation de rc2.
 
-## Ce qui change
+Le retour utilisateur confirme les appels et la saisie dans rc1, mais pas les chats/snaps. Le dernier fichier joint est une transcription de compilation ; il ne contient pas les événements de réception des nouveaux essais. Cette livraison corrige des défauts de code vérifiables et ajoute des adaptateurs de compatibilité, sans prétendre avoir observé des chats/snaps reçus sur l'iPhone.
 
-Les appels sont décodés à partir du vrai paquet `volatile / CALLER_PUSH`, de son action `START` ou `STOP` et de son identifiant `callUuid`. Le mot `messageType` dans le JSON ne provoque plus une fausse notification de message. Un appel retransmis avec le même identifiant ne sonne pas une deuxième fois ; une fin d'appel n'est pas un nouvel appel.
+## Correctif
 
-La saisie et l'entrouverture utilisent des sessions indépendantes par conversation **et par utilisateur**. Un arrêt observé réarme la session. Une nouvelle activité après huit secondes sans mise à jour la réarme également, même si l'arrêt a été perdu. Une saisie continue ne produit pas une notification toutes les quinze secondes. Un arrêt annule une notification encore en attente de résolution du nom.
+Le récepteur lit désormais `descriptor.messageId`, `descriptor.conversationId`, `messageContent.contentType` et les métadonnées structurées. Une conversation passée séparément dans un callback explicite reste associée à ses messages. Les identifiants natifs enveloppés dans 16 octets et les identifiants de message `uint64_t` sont pris en charge sans conversion signée destructive. Les dates Unix en secondes, millisecondes, microsecondes et nanosecondes sont normalisées.
 
-Les noms sont récupérés après le retour des méthodes de résolution, notamment `snapchatterForUserId:`. Les UUID objets sont normalisés, les noms Unicode conservés, les noms affichés préférés aux pseudonymes. Le cache ne mélange plus identifiants de conversation et identifiants de personne. Un nom absent n'est jamais inventé : le repli `Contact xxxxxxxx` signale explicitement un utilisateur non résolu.
+Les notifications « écrit », « message reçu » et « snap reçu » gardent des clés distinctes. Deux vrais messages avec deux identifiants restent deux événements ; un reçu de lecture, une suppression, une modification et un ancien message rechargé ne doivent pas être annoncés comme une nouvelle réception.
 
-Les réceptions de snaps/messages passent par des adaptateurs explicites de callbacks de réception et exigent un expéditeur, une conversation, un type reconnu et un identifiant de message. Deux snaps distincts ne se bloquent pas mutuellement. **Le déclenchement de ces callbacks n'est pas confirmé dans la version Snapchat utilisée pour les logs.** Les paquets inconnus sont diagnostiqués, pas transformés en fausses notifications.
+Les callbacks de réception directs et les mises à jour de conversation sont distingués. Les mises à jour prennent d'abord une référence initiale, puis comparent les identifiants et la date de création. Un premier chargement, une liste vide, un retrait/réajout ou un déchiffrement tardif d'un message déjà connu ne devient pas artificiellement une nouvelle réception. Ce chemin exige l'identité du compte local ou un indicateur entrant explicite. Les callbacks à quatre arguments objets sont maintenant supportés ; une signature scalaire incompatible est signalée, pas appelée avec un type arbitraire.
 
-## Construire sur GitHub Actions
+Les types numériques sont résolus par le descripteur d'enum de l'hôte lorsqu'il existe. Aucun tableau numérique Snapchat n'est inventé : un type inconnu reste rejeté et diagnostiqué. Un réglage avancé `ReceiveTypeMappings` permet une correspondance **Class.field** uniquement après vérification sur l'appareil ; il est vide par défaut.
 
-1. Remplacer le contenu du dépôt par les fichiers de cette archive, **y compris `Core`, `Sources`, `tests`, `scripts` et `.github`**. Ne pas copier uniquement `Tweak.m`.
-2. Lancer le workflow **SnapNotify tests and build**. Il exécute les tests C, les tests de mémoire, les tests Foundation et compile la bibliothèque avec le SDK Xcode du runner macOS.
-3. Après réussite, récupérer l'artefact **SnapNotify-v4-dylib** : `SnapNotify.dylib` et sa somme SHA-256.
-4. Remplacer l'ancienne bibliothèque dans ton processus d'injection/signature de l'IPA. Ne pas injecter simultanément v3 et v4, ni ajouter deux commandes de chargement pour la même bibliothèque. Réinstaller l'IPA avec ton outil habituel.
+## Compiler et installer
 
-Le workflow n'a pas été exécuté à distance lors de la préparation de cette archive. Il bloque la publication de l'artefact si un test ou la compilation échoue.
+1. Copier **tout le projet**, y compris `Sources`, `Core`, `tests`, `scripts` et `.github`, dans le dépôt. Copier seulement `Tweak.m` ne suffit pas.
+2. Lancer **SnapNotify tests and build** et attendre la réussite des tests portables, des tests Foundation et de la compilation arm64.
+3. Récupérer **SnapNotify-v4-dylib**, remplacer `SnapNotify.dylib` dans le processus habituel de reconditionnement/signature, puis installer l'IPA. Ne pas empiler rc1 et rc2 dans le même binaire.
+4. Vérifier `READY version=4.0.0-rc2` dans `snapnotify.log`. Ouvrir une fois la conversation du compte de test avant de mettre l'application en arrière-plan. Cela fournit une référence pour les observateurs de conversation.
 
-### Sur un Mac équipé de Xcode
+Sur Mac avec Xcode : `make test`, `make test-macos`, puis `make`. Theos reste également supporté via `THEOS`.
 
-```sh
-make test
-make test-macos
-make
-```
+## Test attendu
 
-Avec Theos déjà installé, le Makefile conserve ce chemin de build :
+Depuis le deuxième compte, écrire puis envoyer un chat : une notification de saisie et, lorsque le message est réellement reçu, une notification de message distincte. Envoyer ensuite deux chats courts et deux snaps sans nouvelle saisie, puis refaire un appel. Recharger une conversation ne doit pas réannoncer l'historique.
 
-```sh
-export THEOS=/chemin/vers/theos
-make
-```
+Par défaut, les notifications locales sont supprimées au premier plan (`NotifyInForeground=false`). Faire le test avec l'application réceptrice en arrière-plan ; `NotifyInForeground=true` permet un essai diagnostic au premier plan. Le texte du chat n'est pas recopié : la bannière indique qui a envoyé un message ou un snap.
 
-## Premier essai sur l'iPhone
+## Diagnostic de réception
 
-Ouvrir Snapchat, afficher la liste d'amis et le profil de ton compte de test pour donner aux résolveurs l'occasion de fournir les noms. Vérifier ensuite les fichiers du dossier Documents de l'application :
+`Documents/snapnotify_receive_schema.json` contient les callbacks trouvés, leur signature, le succès de leur installation, leurs compteurs et les raisons de rejet. Les descriptions d'objets et le contenu des messages ne sont pas exportés : les échantillons portent sur des noms de classes/champs, des noms de getters déclarés et, si nécessaire, une valeur numérique d'enum.
 
-| Fichier | Utilité |
-|---|---|
-| `snapnotify.log` et `snapnotify.log.1` | Session courante et rotation précédente. |
-| `snapnotify_status.json` | Nombre de paquets, noms connus et requêtes de notification acceptées. |
-| `SnapNotifyConfig.plist` | Réglages créés au premier lancement, relus au retour au premier plan. |
+`snapnotify_status.json` ajoute `receiveCallbacks`, `decodedMessages`, `decodedSnaps`, `snapshotRecordsSuppressed`, `receiveQueueDrops`. Les compteurs « decoded » comptent les observations, y compris les doublons techniques : **pas des bannières affichées**. `NOTIF-ACCEPTED` reste une requête acceptée par iOS, pas une preuve d'affichage.
 
-`NOTIF-ACCEPTED` signifie que le système a accepté la requête locale, **pas qu'une bannière a nécessairement été montrée**. Les réglages iOS de notification restent applicables.
+Après les tests, revenir au premier plan pour actualiser les fichiers. Le trio utile est `snapnotify.log`, `snapnotify_status.json`, `snapnotify_receive_schema.json`. Une absence totale de callbacks ne peut pas être réparée en diminuant encore le délai anti-doublons.
 
-### Résolution des noms
+## Arrière-plan et limites
 
-Le cache v3 n'est pas importé, car il pouvait associer un titre de conversation à une personne. Si un nom n'est toujours pas disponible, rechercher `IDENTITY-LEARNED`, regarder `knownUsers` dans le statut et vérifier les hooks présents dans `SCAN`/`HOOK`.
+Le maintien expérimental en arrière-plan de la version utilisée est conservé, pas réécrit. Il reste expérimental, dépend du mode audio de l'IPA et peut perturber l'audio ou la batterie ; `ExperimentalKeepAlive=false` le désactive. Cette livraison n'ajoute aucun entitlement de signature et ne promet pas un accès push natif. Elle ne récupère ni ne télécharge elle-même les médias : elle transforme des événements observés dans l'application en notifications locales.
 
-Un alias manuel est possible en dernier recours dans `SnapNotifyConfig.plist` :
-
-```xml
-<key>Aliases</key>
-<dict>
-    <key>22222222-2222-4222-8222-222222222222</key>
-    <string>Nom du compte de test</string>
-</dict>
-```
-
-L'identifiant ci-dessus est fictif : utiliser l'identifiant réel du contact. `DiagnosticsIncludeIdentifiers=true` affiche les UUID complets dans le journal, uniquement pour ce diagnostic. Remettre ce réglage à `false` avant de partager les logs. `SelfUserID` permet de définir explicitement l'UUID du compte connecté si sa méthode de résolution n'est pas observable.
-
-## Important : arrière-plan et signature
-
-**Dans ce build, `ExperimentalKeepAlive` est activé par défaut** — sans lui, aucune notification ne peut arriver écran verrouillé (même mécanisme que le keepalive v3). La v3 changeait constamment la session audio de Snapchat, même au premier plan et après une interruption audio. Ce comportement pouvait interférer avec les appels et le micro ; il n'est plus imposé : l'expérience ne s'active qu'en arrière-plan, refuse d'écraser une session d'enregistrement/appel et s'arrête lors d'une interruption audio. Pour la désactiver, passer `ExperimentalKeepAlive` à `false` dans `SnapNotifyConfig.plist`.
-
-Un mode de test est conservé : mettre `ExperimentalKeepAlive` à `true` dans le fichier de configuration, puis ramener l'application au premier plan et refaire le test. Il tente une boucle audio silencieuse uniquement en arrière-plan et, si le callback observé est exécuté sur le thread principal, diffère le passage en arrière-plan du composant Duplex. Il exige le mode `audio` dans `UIBackgroundModes`, refuse d'écraser une session d'enregistrement/appel et abandonne son maintien lors d'une interruption audio.
-
-**Ce mode est expérimental, peut consommer de la batterie et n'est pas une garantie de connexion permanente.** Le laisser activé uniquement pour des essais contrôlés ; revenir à `false` si le micro, les appels, le son ou la stabilité se dégradent. Il ne ressuscite pas une application suspendue ou fermée de force et ne répare pas APNs.
-
-Les logs fournis contiennent l'erreur APNs 3000 : l'enregistrement push échoue. Un entitlement `aps-environment` doit être autorisé par la signature/le profil ; l'ajouter simplement à `Info.plist` ou à du code ne suffit pas. Même un profil personnel autorisant APNs ne prouve pas que les serveurs Snapchat enverront leurs notifications vers cet identifiant d'application.
-
-L'outil suivant vérifie en lecture seule les métadonnées utiles de ton IPA :
-
-```sh
-python3 scripts/inspect_ipa.py Snapchat.ipa
-```
-
-Sur macOS, il lit aussi les entitlements du binaire avec `codesign`. Sur les autres systèmes, il distingue explicitement les droits du profil de la signature non inspectée. Il ne modifie ni ne signe le fichier.
-
-**Si plus aucun paquet n'arrive après le passage en arrière-plan, modifier encore l'anti-doublons ne suffira pas.** Le rapport de statut et le protocole ci-dessous permettent de distinguer absence d'événement, nom non résolu, refus de notification et suspension/arrêt du transport.
+Les callbacks privés peuvent varier selon la version de Snapchat. Le rapport de diagnostic permet de distinguer un callback absent, une signature incompatible, un type non résolu, une date invalide et une notification dédupliquée. Sans les nouveaux journaux d'exécution, il n'est pas établi lequel de ces chemins correspond exactement au symptôme restant sur ton appareil.
 
 ## Documents
 
-- `docs/AUDIT_FR.md` : défauts identifiés, preuves et périmètre réel des corrections.
-- `docs/TESTS_EFFECTUES.md` : tests réellement exécutés et vérifications restantes.
-- `docs/VALIDATION_IPHONE.md` : essais à reproduire avec tes deux comptes.
-- `docs/SOURCES.md` : documentation technique de référence.
+`docs/CORRECTION_CHATS_SNAPS.md` expose les modifications et leur niveau de preuve. `docs/TESTS_EFFECTUES.md` et `VALIDATION.json` décrivent la validation réelle. `docs/VALIDATION_IPHONE.md` donne le protocole de vérification. Les documents rc1 sont conservés dans `docs/history/rc1` et ne décrivent pas la validation actuelle.
 
-Aucun log brut, token, certificat, identifiant réel de contact ou binaire Snapchat n'est inclus dans cette archive. Les trames de régression ont été anonymisées. Aucune fonctionnalité n'envoie ces données vers un serveur externe.
+Aucun journal privé brut, token, certificat, binaire Snapchat ou nouveau paquet prétendument capturé n'est inclus. Les nouveaux tests d'adaptateurs sont des fixtures synthétiques ; les anciennes trames d'appel anonymisées restent des tests de régression.

@@ -62,8 +62,8 @@ static NSString *identifierDepth(id value, unsigned depth) {
     else if ([value isKindOfClass:NSData.class] && [value length]==16) {
         s=[[[NSUUID alloc] initWithUUIDBytes:[value bytes]] UUIDString];
     } else {
-        for(NSString *key in @[@"UUIDString",@"uuidString",@"stringValue",@"uuid",@"value"]) {
-            id child=SNRead(value,key);if(child && child!=value){NSString *u=identifierDepth(child,depth+1);if(u)return u;}
+        for(NSString *key in @[@"UUIDString",@"uuidString",@"stringValue",@"uuid",@"value",@"id"]) {
+            id child=SNRead(value,key);if([key isEqual:@"id"] && ![child isKindOfClass:NSData.class] && ![child isKindOfClass:NSUUID.class])continue;if(child && child!=value){NSString *u=identifierDepth(child,depth+1);if(u)return u;}
         }
     }
     if (!s) return nil;
@@ -182,52 +182,6 @@ NSArray<NSDictionary *> *SNPresenceRecords(id obj) {
     }
     return [out copy];
 }
-static NSString *eventID(id obj) {
-    id value=first(obj,@[@"messageId",@"messageID",@"snapId",@"snapID",@"clientMessageId"]);
-    if([value isKindOfClass:NSNumber.class])return [value longLongValue]>0?[value stringValue]:nil;
-    if([value isKindOfClass:NSUUID.class])return [[value UUIDString] lowercaseString];
-    if([value isKindOfClass:NSString.class] && [value length]>0 && [value length]<=128 && [value rangeOfCharacterFromSet:NSCharacterSet.controlCharacterSet].location==NSNotFound && [value rangeOfString:@"|"].location==NSNotFound) return [value copy];
-    return nil;
-}
-static void collectReceived(id obj, NSString *hint, NSMutableArray *out, unsigned depth, unsigned *budget) {
-    if(!obj||depth>4||!*budget||out.count>=128)return;--*budget;
-    if([obj isKindOfClass:NSArray.class]) {NSUInteger n=0;for(id c in obj){if(++n>128)break;collectReceived(c,hint,out,depth+1,budget);}return;}
-    NSString *cls=NSStringFromClass(object_getClass(obj));NSString *kind=hint;
-    if([cls isEqualToString:@"SOJUReceivedSnap"])kind=@"snap";
-    NSString *type=first(obj,@[@"eventType",@"messageType",@"contentType"]);
-    if([type isKindOfClass:NSString.class]) {
-        NSString *upper=type.uppercaseString;
-        if([@[@"READ",@"READ_RECEIPT",@"DELIVERED",@"DELIVERY_RECEIPT",@"SNAP_OPENED",@"SNAP_STATE",@"TYPING",@"CALLER_PUSH"] containsObject:upper])return;
-        if([@[@"SNAP",@"RECEIVED_SNAP",@"SNAP_RECEIVED"] containsObject:upper])kind=@"snap";
-        else if([@[@"CHAT",@"TEXT",@"CHAT_MESSAGE",@"MESSAGE_RECEIVED"] containsObject:upper])kind=@"message";
-        /* Numeric/unknown protobuf enum values are deliberately not guessed. */
-    }
-    NSString *sender=SNIdentifier(first(obj,@[@"senderId",@"senderUserId",@"fromUserId"]));
-    id senderObject=SNRead(obj,@"sender");
-    sender=sender ?: SNIdentifier(first(senderObject,@[@"userId",@"userID",@"snapchatUserId"]));
-    NSString *convo=SNIdentifier(first(obj,@[@"conversationId",@"conversationID"]));
-    NSString *eid=eventID(obj);
-    id outgoing=first(obj,@[@"isOutgoing",@"outgoing",@"isFromMe"]);
-    id historical=first(obj,@[@"isHistorical",@"isHistory",@"fromHistory"]);
-    if([historical isKindOfClass:NSNumber.class]&&[historical boolValue])return;
-    if(kind&&sender&&convo&&eid&&!([outgoing isKindOfClass:NSNumber.class]&&[outgoing boolValue])) {
-        NSMutableDictionary *r=[@{@"kind":kind,@"uid":sender,@"conversation":convo,@"event":eid} mutableCopy];
-        NSDictionary *u=SNUserRecord(senderObject,sender);
-        NSString *name=u[@"name"] ?: SNName(first(obj,@[@"senderDisplayName",@"senderUsername"]));
-        if(name)r[@"name"]=name;
-        id ts=first(obj,@[@"timestamp",@"createdAt",@"sentAt",@"creationTimestamp"]);
-        if([ts isKindOfClass:NSNumber.class])r[@"timestamp"]=ts;
-        if([ts isKindOfClass:NSDate.class])r[@"timestamp"]=@([ts timeIntervalSince1970]);
-        [out addObject:[r copy]];
-    }
-    for(NSString *key in @[@"message",@"snap",@"receivedSnap",@"receivedMessage",@"messages",@"snaps",@"updates",@"items"]) {
-        id child=SNRead(obj,key); if(child && child!=obj)collectReceived(child,hint,out,depth+1,budget);
-    }
-}
-NSArray<NSDictionary *> *SNReceivedRecords(id obj, NSString *hint) {
-    NSMutableArray *out=[NSMutableArray array];unsigned budget=256;collectReceived(obj,hint,out,0,&budget);return [out copy];
-}
-
 static BOOL ownedFamily(NSString *s) {
     /* Objective-C method families carry +1 return ownership; the generic +0
        wrappers below must not replace them (init/new/copy/alloc). */
@@ -245,7 +199,7 @@ BOOL SNInstallHook(Class cls, SEL sel, SNHookObserver observer) {
         unsigned count=0;Method *list=class_copyMethodList(cls,&count);Method m=NULL;
         for(unsigned i=0;i<count;i++)if(method_getName(list[i])==sel){m=list[i];break;}free(list);
         if(!m)return NO;
-        unsigned argc=method_getNumberOfArguments(m);if(argc<2||argc>5)return NO;argc-=2;
+        unsigned argc=method_getNumberOfArguments(m);if(argc<2||argc>6)return NO;argc-=2;
         char *ret=method_copyReturnType(m);const char *r=unqualified(ret);
         BOOL isVoid=r&&r[0]=='v'&&r[1]==0;
         BOOL isObject=r&&r[0]=='@'&&r[1]!='?';free(ret);
@@ -261,6 +215,7 @@ BOOL SNInstallHook(Class cls, SEL sel, SNHookObserver observer) {
             else if(argc==1) replacement=imp_implementationWithBlock(^(id self,id a){((void(*)(id,SEL,id))original)(self,sel,a);SNInspect(^{observe(self,@[a?:NSNull.null],nil);});});
             else if(argc==2) replacement=imp_implementationWithBlock(^(id self,id a,id b){((void(*)(id,SEL,id,id))original)(self,sel,a,b);SNInspect(^{observe(self,@[a?:NSNull.null,b?:NSNull.null],nil);});});
             else if(argc==3) replacement=imp_implementationWithBlock(^(id self,id a,id b,id c){((void(*)(id,SEL,id,id,id))original)(self,sel,a,b,c);SNInspect(^{observe(self,@[a?:NSNull.null,b?:NSNull.null,c?:NSNull.null],nil);});});
+            else if(argc==4) replacement=imp_implementationWithBlock(^(id self,id a,id b,id c,id d){((void(*)(id,SEL,id,id,id,id))original)(self,sel,a,b,c,d);SNInspect(^{observe(self,@[a?:NSNull.null,b?:NSNull.null,c?:NSNull.null,d?:NSNull.null],nil);});});
         } else {
             if(argc==0) replacement=imp_implementationWithBlock(^id(id self){id v=((id(*)(id,SEL))original)(self,sel);SNInspect(^{observe(self,@[],v);});return v;});
             else if(argc==1) replacement=imp_implementationWithBlock(^id(id self,id a){id v=((id(*)(id,SEL,id))original)(self,sel,a);SNInspect(^{observe(self,@[a?:NSNull.null],v);});return v;});

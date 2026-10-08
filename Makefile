@@ -7,8 +7,8 @@ ARCHS = arm64
 TARGET = iphone:clang:latest:15.0
 include $(THEOS)/makefiles/common.mk
 TWEAK_NAME = SnapNotify
-SnapNotify_FILES = Tweak.m Sources/SNRuntime.m Core/SNCore.c
-SnapNotify_FRAMEWORKS = Foundation UIKit AVFoundation UserNotifications
+SnapNotify_FILES = Tweak.m Sources/SNRuntime.m Sources/SNReceive.m Core/SNCore.c Core/SNReceivePolicy.c
+SnapNotify_FRAMEWORKS = Foundation CoreFoundation UIKit AVFoundation UserNotifications
 SnapNotify_CFLAGS = -std=gnu11 -Wall -Wextra -Werror -Wno-deprecated-declarations -O2
 SnapNotify_OBJCFLAGS = -fobjc-arc -fblocks
 SnapNotify_LDFLAGS = -Wl,-dead_strip

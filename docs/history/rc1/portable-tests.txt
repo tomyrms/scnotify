@@ -46,30 +46,6 @@ test_no_keyword_search (test_core.WireTests.test_no_keyword_search) ... ok
 test_oversize_packet (test_core.WireTests.test_oversize_packet) ... ok
 test_real_shape (test_core.WireTests.test_real_shape) ... ok
 test_unknown_outer_fields (test_core.WireTests.test_unknown_outer_fields) ... ok
-test_bad_selector (test_receive_policy.ReceivePolicyTests.test_bad_selector) ... ok
-test_call_typing_presence_separate (test_receive_policy.ReceivePolicyTests.test_call_typing_presence_separate) ... ok
-test_case (test_receive_policy.ReceivePolicyTests.test_case) ... ok
-test_chat_symbols (test_receive_policy.ReceivePolicyTests.test_chat_symbols) ... ok
-test_exact_presenters (test_receive_policy.ReceivePolicyTests.test_exact_presenters) ... ok
-test_hints (test_receive_policy.ReceivePolicyTests.test_hints) ... ok
-test_invalid_symbols (test_receive_policy.ReceivePolicyTests.test_invalid_symbols) ... ok
-test_invalid_time (test_receive_policy.ReceivePolicyTests.test_invalid_time) ... ok
-test_live_multi_arguments (test_receive_policy.ReceivePolicyTests.test_live_multi_arguments) ... ok
-test_live_original (test_receive_policy.ReceivePolicyTests.test_live_original) ... ok
-test_metadata_not_messages (test_receive_policy.ReceivePolicyTests.test_metadata_not_messages) ... ok
-test_numeric_not_guessed (test_receive_policy.ReceivePolicyTests.test_numeric_not_guessed) ... ok
-test_plain_words_not_enough (test_receive_policy.ReceivePolicyTests.test_plain_words_not_enough) ... ok
-test_prefixes (test_receive_policy.ReceivePolicyTests.test_prefixes) ... ok
-test_receipts_not_messages (test_receive_policy.ReceivePolicyTests.test_receipts_not_messages) ... ok
-test_send_and_read_callbacks_not_received (test_receive_policy.ReceivePolicyTests.test_send_and_read_callbacks_not_received) ... ok
-test_separate_conversation (test_receive_policy.ReceivePolicyTests.test_separate_conversation) ... ok
-test_snap_symbols (test_receive_policy.ReceivePolicyTests.test_snap_symbols) ... ok
-test_snapshot_known_announcer (test_receive_policy.ReceivePolicyTests.test_snapshot_known_announcer) ... ok
-test_snapshot_native_listener (test_receive_policy.ReceivePolicyTests.test_snapshot_native_listener) ... ok
-test_snapshot_requires_role (test_receive_policy.ReceivePolicyTests.test_snapshot_requires_role) ... ok
-test_system_classes_ignored (test_receive_policy.ReceivePolicyTests.test_system_classes_ignored) ... ok
-test_time_units (test_receive_policy.ReceivePolicyTests.test_time_units) ... ok
-test_window (test_receive_policy.ReceivePolicyTests.test_window) ... ok
 test_invalid_info_rejected (test_tools.IPAInspectorTests.test_invalid_info_rejected) ... ok
 test_missing_profile_not_claimed_valid (test_tools.IPAInspectorTests.test_missing_profile_not_claimed_valid) ... ok
 test_multiple_apps_rejected (test_tools.IPAInspectorTests.test_multiple_apps_rejected) ... ok
@@ -78,8 +54,7 @@ test_profile_permissions_distinct_from_signature (test_tools.IPAInspectorTests.t
 test_sensitive_profile_data_omitted (test_tools.IPAInspectorTests.test_sensitive_profile_data_omitted) ... ok
 
 ----------------------------------------------------------------------
-Ran 78 tests in 4.052s
+Ran 54 tests in 4.940s
 
 OK
 100000 deterministic mutation/random inputs + every seed truncation passed (ASan/UBSan).
-receive policy: 100000 seeded inputs completed (ASan/UBSan)

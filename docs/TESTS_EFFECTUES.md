@@ -1,33 +1,25 @@
-# État de validation — 8 octobre 2026
+# Validation réellement effectuée — 4.0.0-rc2
 
-## Exécuté dans l'environnement de préparation (Linux, Clang)
+## Exécuté dans l'environnement de préparation
 
-**54 tests automatisés réussis.** Les 48 tests du cœur compilent et chargent le fichier `Core/SNCore.c` utilisé par la bibliothèque iOS, pas une réécriture Python de ses algorithmes. Six autres tests vérifient l'inspecteur d'IPA et son absence de modification du fichier d'entrée.
+Commande : `bash scripts/test-portable.sh` sur Linux, Clang 17, Python 3.
 
-Les tests couvrent les UUID, enveloppes Protobuf, données tronquées, champs dupliqués, limites de taille, actions d'appel, vrais booléens JSON, Unicode, JSON mal formé, absence de faux appels issus de sous-chaînes, réarmement de saisie après 120 secondes, absence de spam durant une saisie continue, séparation des utilisateurs, annulation/confirmation de réservation, retransmissions, collisions de callbacks tardifs et registre borné.
+**78 tests Python/C : tous réussis.** Ils chargent le cœur C et la nouvelle politique de réception compilés ; il ne s'agit pas d'une réimplémentation Python de ces fonctions. Cela comprend les 54 tests de base (identifiants, enveloppes, appels, saisie, registre anti-doublons et inspecteur d'IPA) et 24 nouveaux tests de politique de réception (avec plusieurs sous-cas).
 
-**100 000 entrées de mutation/aléatoires, plus toutes les troncatures de la trame de départ, ont été exécutées avec AddressSanitizer et UndefinedBehaviorSanitizer.** Aucun défaut n'a été signalé dans ce corpus. Ce résultat ne prouve pas l'absence de tout défaut mémoire possible.
+**100 000 entrées déterministes sur le cœur existant**, plus les troncatures de la fixture d'appel, sous AddressSanitizer et UndefinedBehaviorSanitizer : aucune erreur signalée dans le corpus exécuté.
 
-**Rejeu de 14 trames complètes anonymisées de `snapnotify(3).log`.** Dix trames sont des actions d'appel et quatre concernent le transport. La simulation d'acheminement utilisant le décodeur et le registre de production décide d'une seule notification d'appel en arrière-plan ; les `STOP` et la retransmission ne créent pas de nouveaux messages. Les UUID, adresses, identifiants de tentative et données de portée ont été remplacés dans les fixtures.
+**100 000 entrées supplémentaires sur la politique de réception**, sous les mêmes sanitizers : aucune erreur signalée dans le corpus exécuté. Ce test exerce les chaînes de classification/sélecteurs et des représentations flottantes variées ; ce n'est pas un fuzzer de l'adaptateur Objective-C.
 
-La syntaxe des scripts Python et Bash, les deux fichiers plist et le workflow YAML ont aussi été vérifiés. Une compilation minimale Objective-C a confirmé la validité syntaxique du boxing des UUID C et de l'utilisation de `Class *` avec ARC ; **ce n'est pas une compilation du projet iOS**.
+Les 14 anciennes trames d'appel anonymisées restent couvertes par le rejeu existant. Elles ne sont pas des captures de chats/snaps. Aucun résultat de test n'est présenté comme une bannière vue sur l'iPhone.
 
-Commande reproductible :
-
-```sh
-bash scripts/test-portable.sh
-```
-
-La sortie de référence est conservée dans `docs/portable-tests.txt`.
+Contrôles de livraison : scripts shell analysés avec `bash -n`, fichiers Python compilés avec `py_compile`, plists analysées avec `plistlib`, fichiers de compilation cohérents, fonctions d'appel/pré­sence et cœur C comparés à la base, intégrité et chemins de l'archive vérifiés. Sortie complète des tests portables : `portable-tests.txt`.
 
 ## Fourni, mais non exécuté ici
 
-`tests/TestFoundation.m` et `scripts/test-macos.sh` vérifient les lecteurs de propriétés, noms Unicode, UUID objets/binaires, snapshots multi-participants, repli des proxies, rejet d'événements sortants/historiques et sécurité des wrappers dans une hiérarchie Objective-C. Ces tests nécessitent Foundation et le runtime macOS ; ils ne sont pas inclus dans le chiffre des 54 tests réussis.
+`tests/TestFoundation.m` et `tests/TestReceive.m` requièrent Foundation et le runtime Objective-C macOS. Le runner Linux de préparation ne les exécute pas. Le nouveau programme comprend des fixtures synthétiques pour les descripteurs, UUID natifs, IDs uint64, enums hôtes, conversation séparée, tableaux, cycles, contrôle/historique/sortant, dates, référence initiale vide, déchiffrement tardif et hook à quatre arguments. La CI doit encore confirmer leur résultat.
 
-Le workflow GitHub Actions doit ensuite exécuter ces tests, puis `scripts/build-macos.sh`. Aucun runner distant n'a été lancé et **aucune compilation/link iOS arm64 n'a été réalisée dans l'environnement de préparation**, qui ne dispose pas du SDK Xcode. Aucun `.dylib` ni IPA prétendument compilé n'est donc fourni dans cette archive.
+Le workflow `.github/workflows/build.yml` compile et exécute ces deux programmes avant de compiler et publier `SnapNotify.dylib`. Il n'ignore pas leurs erreurs. **Le workflow rc2 n'a pas été lancé depuis cette livraison ; compilation iOS rc2 non effectuée.** La CI réussie mentionnée dans le texte joint concerne rc1, commit `dd9471b`.
 
-## À confirmer sur l'iPhone
+## Non réalisé
 
-La présence effective des méthodes privées de Snapchat, la résolution réelle des noms, l'arrivée des réceptions de snaps/messages, l'affichage des bannières, le fonctionnement sous écran verrouillé, le mode expérimental de maintien et l'absence d'interférence avec les appels/le micro restent des tests sur appareil.
-
-Les sources corrigent des défauts identifiés et les comportements déterministes testables. **Le statut de cette livraison est une version candidate, pas une certification de fonctionnement complet dans ton Snapchat.**
+Aucun test d'installation ou d'exécution de rc2 sur iPhone ; aucun envoi réel de chat/snap ; aucune mesure d'autonomie ; aucun test prouvant le maintien réseau après suspension. L'absence de nouvelles traces de l'appareil interdit d'attribuer le problème restant avec certitude à un callback privé précis.
