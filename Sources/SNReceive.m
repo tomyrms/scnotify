@@ -229,7 +229,7 @@ static void collect(id obj,NSString *inheritedConversation,NSString *hint,NSMuta
         /* Traverse only structural envelopes, never message text or raw blobs.
            Inherit conversation context, not sender IDs or message IDs. */
         for(NSString *key in @[@"message",@"snap",@"receivedSnap",@"receivedMessage",@"messages",@"receivedMessages",@"newMessages",@"addedMessages",@"insertedMessages",@"snaps",@"updates",@"update",@"items",@"entries",@"conversation",@"conversations",@"conversationViewModel",@"viewModel",@"messageData",@"payload",@"notification",@"inAppNotification",@"userInfo"]){
-            if(!*budget)break;id child=SNRead(obj,key);if(child&&child!=obj)collect(child,conversation,hint,out,rejected,shapes,path,eventKeys,identities,depth+1,budget);
+            if(!*budget)break;id child=SNRead(obj,key);if(child)collect(child,conversation,hint,out,rejected,shapes,path,eventKeys,identities,depth+1,budget);
         }
     } @finally {[path removeObject:obj];}
 }
