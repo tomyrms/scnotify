@@ -1,68 +1,59 @@
 {
-  "version": "4.0.0-rc4",
-  "base_commit": "092adc746dcd1b677bca7cb921c4736d7f318e25",
-  "base_archive": "SnapNotify-v4.0.0-rc3.zip",
-  "observed_host_version": "14.17.1",
-  "observed_host_build": "14.17.1.0",
-  "portable_tests": {
-    "executed": true,
-    "passed": 86,
-    "failed": 0,
-    "log": "docs/portable-tests-rc4.txt"
+  "version": "4.0.0-rc5",
+  "base_version": "4.0.0-rc4",
+  "ci": {
+    "workflow_run_id": 37852967825,
+    "job_id": 113570291032,
+    "run_url": "https://github.com/tomyrms/scnotify/actions/runs/37852967825",
+    "branch": "chatgpt/rc5-voice-bursts-background",
+    "commit": "ebeccf68303f24106a1a29915a90c20b08b8e48b",
+    "base_commit": "6692b9fe72764d6246174c93eac03348d9e45116",
+    "readable_patch_sha256": "1ffce9ccb472f8326df642957f13a46e5369f6a04a512ed8a30185dc5338b993",
+    "result": "success",
+    "artifact_id": 11583221063,
+    "artifact_name": "SnapNotify-rc5-validated",
+    "artifact_zip_sha256": "96dbf95d04ba6f014eb69841b812c1993ab81d227d6a2b7cf74b88882326b83f",
+    "binary_sha256": "812e223a0bd0b3debf349ce77b28f5541f5b7ca885a824a1b53a97639a39aff6",
+    "binary_size_bytes": 294224,
+    "source_hashes_verified": 32,
+    "ios_architecture": "arm64",
+    "validated_at_utc": "2026-10-08T22:22:30Z",
+    "on_device_test_performed": false,
+    "branch_note": "Readable integration patch applied by CI; full delivered ZIP already contains integrated sources. main unchanged."
   },
-  "sanitizer_runs": [
-    {
-      "target": "existing C core",
-      "inputs": 100000,
-      "passed": true
+  "executed": {
+    "portable_python_c_tests": 86,
+    "portable_result": "pass",
+    "asan_ubsan_core_seeded_inputs": 100000,
+    "asan_ubsan_receive_policy_seeded_inputs": 100000,
+    "native_test_programs": {
+      "Foundation/runtime": 50,
+      "Receive adapters/runtime": 107,
+      "Host bridge": 52,
+      "Native messaging regression": 8402,
+      "Outbox/burst/content": 5471
     },
-    {
-      "target": "C receive policy",
-      "inputs": 100000,
-      "passed": true
-    }
+    "native_total_assertions": 14082,
+    "native_assertions_note": "Includes repeated assertions in loops, not this many independent tests.",
+    "persisted_burst_messages": 600,
+    "chunked_native_models": 600,
+    "sequential_snapshot_ids": 8300,
+    "ios_compile": "success",
+    "source_manifest_match": true
+  },
+  "not_executed": [
+    "Installation on iPhone",
+    "Actual voice/sticker/photo notifications on this device",
+    "Real 15–30 minute background reception",
+    "Battery/performance profiling on device",
+    "iOS banner rendering for 600 real notifications"
   ],
-  "foundation_tests": {
-    "executed": false,
-    "programs": [
-      "TestFoundation",
-      "TestReceive",
-      "TestHostNotice",
-      "TestNativeReceive"
-    ]
-  },
-  "ios_compilation": {
-    "executed": false,
-    "result": null,
-    "reason": "Native CI creation blocked; Apple SDK unavailable locally"
-  },
-  "phone_tests": {
-    "executed": false,
-    "chat_delivery_confirmed": false,
-    "snap_delivery_confirmed": false
-  },
-  "remote_state": {
-    "main_modified": false,
-    "branch_created": false,
-    "commit_created": false,
-    "workflow_launched": false,
-    "unreferenced_preparatory_blob_created": true
-  },
-  "compatibility_mapping": {
-    "model": "SCNMessagingMessage",
-    "content_class": "SCNMessagingMessageContent",
-    "host_version": "14.17.1",
-    "mapping": {
-      "0": "snap",
-      "1": "chat"
-    },
-    "basis": "Native semantic predicates preferred; numeric values corroborated by pinned reverse-engineered source, not validated on the phone"
-  },
-  "input_sha256": {
-    "snapnotify_receive_schema.json": "64afc45973fd29db7e33ac990d3b27349788483b2c3094802bc7f10c90d48a59",
-    "snapnotify_status.json": "c55aaa750bbcf95c06c8ba0707760bb091743d8747348491b936e31a7670ab1d",
-    "snapnotify(4).log": "c3fd09a9e92073c3a6361a01f73ea7f95f2cdc0b490933e6f0cc179132c77b7c"
-  },
-  "unchanged_paths": "docs/UNCHANGED_PATHS.json",
-  "distribution": "source project, tests and documentation only; no IPA or dylib"
+  "limitations": [
+    "OS API acceptance does not prove banner presentation",
+    "Timer does not wake suspended process",
+    "Unknown old-session account records held rather than sent to unverified account",
+    "Pending queue bounded at 20000 entries; IO/capacity failures reported",
+    "Packet path retains separate rate limits; structured receive path uses backpressure",
+    "No guaranteed exactly-once delivery across OS-acceptance / persistence crash window"
+  ]
 }

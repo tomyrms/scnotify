@@ -1,0 +1,22 @@
+{
+  "call_packet_decoder": {
+    "unchanged": true,
+    "sha256": "b836c259d29d488b94bd5b91dfe57da5ec84e6f9d19ffdb61168c3b6899278d4"
+  },
+  "presence_state_machine": {
+    "unchanged": true,
+    "sha256": "1b3ae21cddc884ec81bde7cb2bc62de9287bf0042bd500a1db471383c48edf01"
+  },
+  "notification_delivery": {
+    "unchanged": true,
+    "sha256": "f92a1d8c0ed953980cdb35b1a505c436308f0b8bf2635d94f227b310fb43eea5"
+  },
+  "notification_event_dispatch": {
+    "unchanged": true,
+    "sha256": "ed88b41d82a9d83a9ae0f13b951040e40c2e36f4e414cfc71b42f507228acab6"
+  },
+  "audio_and_background_experiment": {
+    "unchanged": true,
+    "sha256": "fe1b825bc1241189cfa456d5bd993e21dbdb76c46a2b7d25c690ca1559fe0ffc"
+  }
+}

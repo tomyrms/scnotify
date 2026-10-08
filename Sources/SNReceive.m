@@ -1,5 +1,6 @@
 #import "SNReceive.h"
 #import "SNRuntime.h"
+#import "SNContent.h"
 #import <CoreFoundation/CoreFoundation.h>
 #include <math.h>
 #include <string.h>
@@ -71,7 +72,7 @@ static SNReceiveKind nativeKind(id object,id content,NSString **via) {
     if(rxTrue(object,@[@"isStatusMessage",@"isSystemConversationRetentionMessage",@"isScreenRecording",@"isErasedSnapStatusMessage",@"isStickerReaction",@"isErased"])){
         *via=@"host-control-predicate";return SN_RX_CONTROL;
     }
-    BOOL chat=rxTrue(object,@[@"isTextMessage",@"isChatMediaMessage",@"isVoiceNote",@"isStickerMessage",@"isContentShareMessage",@"isStoryReplyMessage"]);
+    BOOL chat=rxTrue(object,@[@"isTextMessage",@"isChatMediaMessage",@"isVoiceNote",@"isStickerMessage",@"isContentShareMessage",@"isStoryReplyMessage",@"isSingleImageChatMedia",@"isSingleImageOrVideoChatMedia",@"isBitmojiSticker",@"isBloopMessage",@"isSpotlightStoryShareMessage",@"isSpotlightCommentShareMessage",@"isBitmojiUserShare"]);
     BOOL snap=rxTrue(object,@[@"isSnapMessage",@"isSnap",@"isTinySnapMessage"]);
     if(chat&&snap){*via=@"conflicting-native-predicates";return SN_RX_NONE;}
     if(chat||snap){*via=@"host-message-predicate";return snap?SN_RX_SNAP:SN_RX_MESSAGE;}
@@ -265,6 +266,7 @@ static void collect(id obj,NSString *inheritedConversation,NSString *hint,NSMuta
                 NSString *key=[@[conversation,sender,eid] componentsJoinedByString:@"|"];
                 if(![eventKeys containsObject:key]) {
                     NSMutableDictionary *event=[@{@"kind":type,@"uid":sender,@"conversation":conversation,@"event":eid,@"kindSource":kindSource} mutableCopy];
+                    if(kind==SN_RX_MESSAGE)event[@"subtype"]=SNContentSubtype(obj,content);
                     NSDictionary *u=SNUserRecord(senderObject,sender);
                     NSString *name=u[@"name"] ?: SNName(rxFirst(obj,@[@"senderDisplayName",@"senderUsername"]));if(name)event[@"name"]=name;
                     id ts=rxFirst(metadata,@[@"creationTimestamp",@"creationTimestampMs",@"messageCreationTimestamp",@"createdAt",@"createdAtMs",@"serverTimestamp",@"serverTimestampMs",@"timestamp"])
@@ -329,6 +331,23 @@ NSDictionary *SNDecodeReceiveCallback(NSString *className,NSString *selector,NSA
     NSDictionary *batch=SNDecodeReceived(payloads,cid,kind==SN_RX_SNAP?@"snap":kind==SN_RX_MESSAGE?@"message":nil);
     return batch;
 }
+void SNEnumerateReceiveBatches(NSString *className,NSString *selector,NSArray *arguments,void (^visit)(NSDictionary *)) {
+    if(!visit)return;
+    NSUInteger index=NSNotFound;
+    if([className isEqual:@"SCArroyoConversationDataUpdateAnnouncer"]&&[selector isEqual:@"onConversationUpdated:conversation:updatedMessages:removedMessages:"]&&arguments.count==4)index=2;
+    else if([selector isEqual:@"didReceiveMessages:"]||[selector isEqual:@"onMessagesReceived:"]||[selector isEqual:@"onNewMessages:"])index=0;
+    else if([selector isEqual:@"conversation:didReceiveMessages:"]||[selector isEqual:@"conversationId:didReceiveMessages:"])index=1;
+    id list=index<arguments.count?arguments[index]:nil;
+    if([list isKindOfClass:NSSet.class])list=[list allObjects];
+    if(![list isKindOfClass:NSArray.class]||[list count]<=128){visit(SNDecodeReceiveCallback(className,selector,arguments));return;}
+    for(NSUInteger offset=0;offset<[list count];offset+=128){
+        @autoreleasepool {
+            NSMutableArray *args=[arguments mutableCopy];
+            args[index]=[list subarrayWithRange:NSMakeRange(offset,MIN((NSUInteger)128,[list count]-offset))];
+            visit(SNDecodeReceiveCallback(className,selector,args));
+        }
+    }
+}
 NSArray<NSDictionary *> *SNReceivedRecords(id obj,NSString *hint) {
     return SNDecodeReceived(obj?@[obj]:@[],nil,hint)[@"events"];
 }
@@ -357,20 +376,22 @@ NSArray<NSDictionary *> *SNReceivedRecords(id obj,NSString *hint) {
         NSMutableDictionary *state=self.conversations[cid];BOOL initial=!state;
         if(!state){
             if(self.conversations.count>=128){NSString *oldest=nil;double time=INFINITY;for(NSString *key in self.conversations){double t=[self.conversations[key][@"last"] doubleValue];if(t<time){time=t;oldest=key;}}if(oldest)[self.conversations removeObjectForKey:oldest];}
-            state=[@{@"seen":[NSMutableSet set],@"start":@(wall),@"last":@(wall)} mutableCopy];self.conversations[cid]=state;
+            state=[@{@"seen":[NSMutableOrderedSet orderedSet],@"start":@(wall),@"last":@(wall)} mutableCopy];self.conversations[cid]=state;
         }
-        NSMutableSet *seen=state[@"seen"];
+        NSMutableOrderedSet *seen=state[@"seen"];
         NSMutableDictionary *waiting=state[@"waiting"];
         if(!waiting){waiting=[NSMutableDictionary dictionary];state[@"waiting"]=waiting;}
         NSMutableSet *decodedIDs=[NSMutableSet set];
         for(NSDictionary *e in groups[cid]) {
             NSString *key=e[@"event"];if(!key)continue;[decodedIDs addObject:key];
-            BOOL known=[seen containsObject:key];if(!known&&seen.count>=2048)continue;NSNumber *firstSeen=waiting[key];
+            BOOL known=[seen containsObject:key];
+            if(!known&&seen.count>=8192){NSString *old=seen.firstObject;[seen removeObjectAtIndex:0];[waiting removeObjectForKey:old];}
+            NSNumber *firstSeen=waiting[key];
             NSNumber *ts=e[@"timestamp"];
             BOOL fresh=ts&&sn_receive_time_valid(ts.doubleValue,wall);
             BOOL firstLive=initial&&self.monitoringStart>0&&[e[@"incoming"] boolValue]&&fresh&&ts.doubleValue>=self.monitoringStart;
             BOOL newlyDecoded=known&&firstSeen&&fresh&&ts.doubleValue>=firstSeen.doubleValue-1;
-            if(!known&&seen.count<2048)[seen addObject:key];
+            if(!known)[seen addObject:key];
             if((!known&&(!initial||firstLive))||newlyDecoded) {
                 double start=firstLive?self.monitoringStart:[state[@"start"] doubleValue]-1;
                 if(fresh&&ts.doubleValue>=start){
@@ -389,7 +410,7 @@ NSArray<NSDictionary *> *SNReceivedRecords(id obj,NSString *hint) {
            baseline; delayed decoding of old baseline history stays silent. */
         for(NSString *eid in identities[cid]){
             if(![seen containsObject:eid]&&!initial&&![decodedIDs containsObject:eid]&&waiting.count<256)waiting[eid]=@(wall);
-            if(seen.count<2048)[seen addObject:eid];
+            if(![seen containsObject:eid]){if(seen.count>=8192){NSString *old=seen.firstObject;[seen removeObjectAtIndex:0];[waiting removeObjectForKey:old];}[seen addObject:eid];}
         }
         for(NSString *eid in [waiting allKeys])if(wall-[waiting[eid] doubleValue]>300)[waiting removeObjectForKey:eid];
         state[@"last"]=@(wall);

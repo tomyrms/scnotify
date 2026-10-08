@@ -1,15 +1,29 @@
-# Validation iPhone — rc4
+# Essai sur l'iPhone — rc5
 
-Compiler depuis **ce projet complet**. Vérifier la nouvelle exécution GitHub Actions et l'artefact correspondant avant de reconditionner l'IPA. Les anciens artefacts rc3 restent rc3 même si leur nom générique est identique.
+Vérifier `READY version=4.0.0-rc5` après remplacement de la bibliothèque et re-signature de l'IPA. Ouvrir la liste des amis et la conversation du compte de test, puis quitter le premier plan sans fermer la carte de l'app.
 
-Après installation, le journal doit contenir `READY version=4.0.0-rc4 host=14.17.1`.
+## Types et rafale
 
-Ouvrir le chat du compte de test, laisser Snapchat en arrière-plan sans fermer la carte, puis essayer : saisie suivie d'un chat ; deuxième chat ; snap photo ; deuxième snap ; appel. Vérifier les bannières, pas seulement les compteurs.
+Envoyer depuis le second compte un vocal, un chat, un snap, une photo dans le chat, un sticker et un partage. Vérifier le nom et le libellé. Envoyer ensuite une série comptée (par exemple vingt chats, cinq vocaux, cinq snaps, trois stickers). Distinguer les bannières successives des éléments regroupés dans le centre de notifications. Les appels et la saisie ne doivent pas attendre la file de chats.
 
-Le succès de détection doit apparaître dans le callback Arroyo avec `decoded > 0`, puis `eligible > 0`. Le journal doit ensuite afficher `NOTIF-REQUEST type=message` ou `type=snap`, puis `NOTIF-ACCEPTED`. Cette dernière étape signifie acceptation de la demande par iOS, pas preuve de présentation visuelle.
+Une série de cinquante notifications peut prendre environ vingt secondes plus le temps de réponse de l'API avec l'espacement de 0,4 s. Ne pas conclure à une perte avant d'examiner les éléments en attente.
 
-Si `decoded > 0` mais `eligible = 0`, regarder les filtres cumulés `snapshot-missing-time`, `snapshot-direction-unknown`, et le statut `localAccountKnown`. La version rc3 s'arrêtait avant ces filtres ; le fait de corriger son type inconnu ne garantit pas que la date ou l'identité locale soit disponible sur chaque objet.
+## Inactivité
 
-Si `unknown-content-type` persiste, regarder le nom de la classe, la version hôte, les prédicats booléens et le type numérique dans le nouveau schéma. Ne pas attribuer des numéros au hasard. Les métriques Blizzard sont maintenant ignorées volontairement.
+Laisser Snapchat en arrière-plan et envoyer un snap/chat **sans saisie préalable** après deux, dix, quinze et trente minutes. Noter l'heure de chaque envoi. Refaire l'essai après une interruption audio, puis après une vraie réouverture de l'app. Il ne faut pas simuler une présence ou un appel pour obtenir un message.
 
-Les fichiers de diagnostic sont toujours `snapnotify.log`, `snapnotify_status.json` et `snapnotify_receive_schema.json`. Ne pas envoyer de corps de message, identifiants de connexion ou données de signature.
+## Lire l'état
+
+`outbox.pending` : contenu reçu et admissible, en attente de soumission/réessai.
+
+`outbox.accepted` : réponses positives de l'API conservées en file ; ce n'est pas un compteur de bannières vues.
+
+`outbox.blocked` : autorisation/configuration bloque un élément, retenu jusqu'à réévaluation.
+
+`outbox.heldForAccount` : ancien élément dont l'identité de compte ne peut pas être liée sans risque ; pas de livraison arbitraire.
+
+`outbox.ioFailures` / `capacityFailures` : stockage ou limite de sécurité atteint. Pas de garantie de livraison illimitée.
+
+`backgroundHealth.audioPlaying`, `audioInterrupted`, `duplexBackgroundDeferred`, `requiresUserResume` et `executionGaps` distinguent les états observés. Une lacune d'exécution peut être une suspension, un retard d'ordonnancement ou un changement d'heure : ce n'est pas un diagnostic définitif. Le fichier est une dernière photographie et cesse de changer si le processus est suspendu.
+
+Conserver `snapnotify.log`, `snapnotify_status.json` et `snapnotify_receive_schema.json`, avec les horaires d'essai. Ne pas publier le répertoire `outbox-v5` : ses identifiants restent des métadonnées privées, même sans texte.

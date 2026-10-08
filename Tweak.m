@@ -1,10 +1,12 @@
-// SnapNotify 4.0.0-rc4 — explicit event adapters, not notifications from hook names.
+// SnapNotify 4.0.0-rc5 — explicit event adapters, not notifications from hook names.
 #import <Foundation/Foundation.h>
 #import <UIKit/UIKit.h>
 #import <UserNotifications/UserNotifications.h>
 #import <AVFoundation/AVFoundation.h>
 #import "Sources/SNRuntime.h"
 #import "Sources/SNReceive.h"
+#import "Sources/SNContent.h"
+#import "Sources/SNOutbox.h"
 #import "Sources/SNHostNotice.h"
 #import <CommonCrypto/CommonDigest.h>
 #import "Core/SNCore.h"
@@ -13,7 +15,7 @@
 #include <stdarg.h>
 #include <math.h>
 
-static NSString * const SNVersion=@"4.0.0-rc4";
+static NSString * const SNVersion=@"4.0.0-rc5";
 static dispatch_queue_t worker, logQueue;
 static NSMutableDictionary *users, *presence, *pendingEvents, *issuedRequests;
 static NSDictionary *config;
@@ -36,6 +38,20 @@ static atomic_bool experiments;
 static NSUInteger hookCount, nameHits, nameMisses, wireCount, malformedCount, postedCount;
 static atomic_ulong packetDrops;
 static uint64_t queueGeneration;
+static char workerKey;
+static SNOutbox *outbox;
+static SNRemoteParticipants *remoteParticipants;
+static BOOL outboxBusy=NO;
+static double outboxNextSubmissionAt=0;
+static NSString *outboxActiveID;
+static NSUInteger outboxActiveAttempt, outboxAcceptedThisRun, outboxTimeouts;
+static uint64_t outboxScheduleToken;
+static atomic_ulong receiveBackpressure;
+static NSDictionary *backgroundHealth;
+static double backgroundStartedWall=0,lastHeartbeatWall=0,maxHeartbeatGap=0;
+static NSUInteger heartbeatGaps=0,audioRecoveryAttempts=0;
+static BOOL backgroundNeedsUserResume=NO;
+static void scheduleOutbox(double delay);
 static BOOL nativePushRegistered=NO, cacheDirty=NO;
 static NSDateFormatter *logFormat;
 static NSFileHandle *logHandle;
@@ -96,6 +112,8 @@ static void loadConfig(void) {
     NSMutableDictionary *defaults=[@{
         @"Enabled":@YES,@"TypingNotifications":@YES,@"SnapNotifications":@YES,
         @"MessageNotifications":@YES,@"CallNotifications":@YES,@"PeekingNotifications":@YES,
+        @"VoiceNotifications":@YES,@"MediaNotifications":@YES,@"StickerNotifications":@YES,@"ShareNotifications":@YES,
+        @"NotificationSpacingSeconds":@0.4,
         @"NotifyInForeground":@NO,@"ExperimentalKeepAlive":@YES,@"NativeNotificationBridge":@YES,
         @"DiagnosticsIncludeIdentifiers":@NO,@"TypingIdleSeconds":@8.0,
         @"TypingRestartGapSeconds":@1.5,@"NameWaitSeconds":@0.8,
@@ -127,9 +145,12 @@ static void setAccount(NSString *uid) {
     if(!uid.length||[account isEqualToString:uid])return;
     BOOL switching=account.length>0;
     saveCache();account=[uid copy];
+    if(!switching)[outbox bindSessionScope:[@"session/" stringByAppendingString:session] toAccount:account];
     if(switching){
-        queueGeneration++;
-        NSArray *owned=issuedRequests.allKeys;
+        queueGeneration++;outboxScheduleToken++;outboxBusy=NO;outboxActiveID=nil;
+        [remoteParticipants reset];
+        NSArray *outboxIDs=[outbox clear];
+        NSArray *owned=[issuedRequests.allKeys arrayByAddingObjectsFromArray:outboxIDs?:@[]];
         [[UNUserNotificationCenter currentNotificationCenter] removePendingNotificationRequestsWithIdentifiers:owned];
         [[UNUserNotificationCenter currentNotificationCenter] removeDeliveredNotificationsWithIdentifiers:owned];
         [issuedRequests removeAllObjects];[users removeAllObjects];[presence removeAllObjects];[pendingEvents removeAllObjects];[receiveTracker reset];[receiveSources removeAllObjects];memset(&ledger,0,sizeof(ledger));
@@ -170,14 +191,64 @@ static NSString *eventKey(NSDictionary *event) {
 }
 static NSString *bodyFor(NSDictionary *event,NSString *name) {
     NSString *who=name ?: [NSString stringWithFormat:@"Contact %@",shortID(event[@"uid"])];
-    NSString *kind=event[@"kind"];
-    if([kind isEqual:@"typing"])return [who stringByAppendingString:@" est en train d’écrire…"];
-    if([kind isEqual:@"peek"])return [who stringByAppendingString:@" entrouvre la conversation"];
-    if([kind isEqual:@"snap"])return [who stringByAppendingString:@" t’a envoyé un snap"];
-    if([kind isEqual:@"message"])return [who stringByAppendingString:@" t’a envoyé un message"];
-    return [who stringByAppendingString:[event[@"video"] boolValue]?@" t’appelle en vidéo":@" t’appelle"];
+    return SNNotificationBody(event,who);
 }
 static BOOL isForegroundSuppressed(void) {return atomic_load(&appState)==UIApplicationStateActive&&!enabled(@"NotifyInForeground");}
+/* Chats/snaps use a durable outbox; calls and presence keep their immediate
+   path. No 15-second pending expiry, no global sender throttle for content. */
+static NSSet *deliveryScopes(void) {
+    NSString *transient=[@"session/" stringByAppendingString:session];
+    return account.length?[NSSet setWithArray:@[transient,account]]:[NSSet setWithObject:transient];
+}
+static BOOL contentEnabled(NSDictionary *event) {
+    if(!eventEnabled(event[@"kind"]))return NO;
+    NSDictionary *flags=@{@"voice":@"VoiceNotifications",@"photo":@"MediaNotifications",@"media":@"MediaNotifications",@"sticker":@"StickerNotifications",@"share":@"ShareNotifications",@"story_reply":@"ShareNotifications",@"location":@"ShareNotifications"};
+    NSString *key=flags[event[@"subtype"]?:@""];return !key||enabled(key);
+}
+static void drainOutbox(void) {
+    if(outboxBusy||!enabled(@"Enabled"))return;
+    double wall=NSDate.date.timeIntervalSince1970;
+    NSDictionary *item=[outbox nextReadyInScopes:deliveryScopes() atTime:wall];
+    if(!item){if([[outbox statisticsForScopes:deliveryScopes()][@"pending"] unsignedIntegerValue])scheduleOutbox(1);return;}
+    NSString *rid=item[@"id"];NSDictionary *event=item[@"event"];NSUInteger attempt=[item[@"attempt"] unsignedIntegerValue];
+    if(!contentEnabled(event)){
+        [outbox finishIdentifier:rid attempt:attempt success:NO blocked:YES atTime:wall];
+        logLine(@"OUTBOX-BLOCKED reason=disabled subtype=%@",event[@"subtype"]?:event[@"kind"]);scheduleOutbox(0);return;
+    }
+    outboxBusy=YES;outboxActiveID=rid;outboxActiveAttempt=attempt;uint64_t generation=queueGeneration;
+    UNMutableNotificationContent *content=[UNMutableNotificationContent new];
+    content.title=@"Snapchat";content.body=bodyFor(event,resolveName(event[@"uid"]));content.sound=UNNotificationSound.defaultSound;
+    content.threadIdentifier=[@"snapnotify." stringByAppendingString:event[@"conversation"]];
+    content.userInfo=@{@"scnotify":@YES,@"version":SNVersion,@"kind":event[@"kind"],@"subtype":event[@"subtype"]?:@"snap"};
+    issuedRequests[rid]=@(nowTime());
+    logLine(@"OUTBOX-REQUEST type=%@ subtype=%@ attempt=%lu",event[@"kind"],event[@"subtype"]?:@"snap",(unsigned long)attempt);
+    [[UNUserNotificationCenter currentNotificationCenter] addNotificationRequest:[UNNotificationRequest requestWithIdentifier:rid content:content trigger:nil] withCompletionHandler:^(NSError *error){
+        dispatch_async(worker,^{
+            if(generation!=queueGeneration){[[UNUserNotificationCenter currentNotificationCenter] removePendingNotificationRequestsWithIdentifiers:@[rid]];[[UNUserNotificationCenter currentNotificationCenter] removeDeliveredNotificationsWithIdentifiers:@[rid]];return;}
+            if(![outboxActiveID isEqual:rid]||outboxActiveAttempt!=attempt)return;
+            BOOL denied=error&&[error.domain isEqual:UNErrorDomain]&&error.code==UNErrorCodeNotificationsNotAllowed;
+            BOOL finished=[outbox finishIdentifier:rid attempt:attempt success:error==nil blocked:denied atTime:NSDate.date.timeIntervalSince1970];
+            outboxBusy=NO;outboxActiveID=nil;
+            if(finished&&!error){postedCount++;outboxAcceptedThisRun++;logLine(@"NOTIF-ACCEPTED type=%@ subtype=%@ path=outbox",event[@"kind"],event[@"subtype"]?:@"snap");}
+            else if(error)logLine(@"OUTBOX-FAILED domain=%@ code=%ld retained=1",error.domain,(long)error.code);
+            outboxNextSubmissionAt=nowTime()+setting(@"NotificationSpacingSeconds",0.4,0.05,2);
+            scheduleOutbox(0);
+        });
+    }];
+    /* A missing completion cannot block every later message indefinitely.
+       Retry uses the SAME per-message identifier, never a replacement ID. */
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW,15*NSEC_PER_SEC),worker,^{
+        if(generation!=queueGeneration||![outboxActiveID isEqual:rid]||outboxActiveAttempt!=attempt)return;
+        [outbox finishIdentifier:rid attempt:attempt success:NO blocked:NO atTime:NSDate.date.timeIntervalSince1970];
+        outboxBusy=NO;outboxActiveID=nil;outboxTimeouts++;logLine(@"OUTBOX-COMPLETION-TIMEOUT retained=1");scheduleOutbox(0);
+    });
+}
+static void scheduleOutbox(double delay) {
+    if(outboxBusy)return;
+    delay=fmax(delay,outboxNextSubmissionAt-nowTime());
+    uint64_t token=++outboxScheduleToken;
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW,(int64_t)(delay*NSEC_PER_SEC)),worker,^{if(token==outboxScheduleToken)drainOutbox();});
+}
 static void deliver(NSDictionary *event,uint64_t ticket,uint64_t generation,unsigned attempt) {
     if(generation!=queueGeneration)return;
     NSString *key=eventKey(event);
@@ -229,6 +300,16 @@ static void notifyEvent(NSDictionary *event) {
     if(!SNIdentifier(uid)||!SNIdentifier(event[@"conversation"])||!event[@"event"]||!kind)return;
     if(account.length&&[uid isEqual:account]){logLine(@"EVENT-DROP reason=self type=%@",kind);return;}
     if(!eventEnabled(kind))return;
+    if([kind isEqual:@"message"]||[kind isEqual:@"snap"]){
+        if(!contentEnabled(event)||isForegroundSuppressed()||([event[@"observedInForeground"] boolValue]&&!enabled(@"NotifyInForeground")))return;
+        NSError *error=nil;
+        NSMutableDictionary *queued=[event mutableCopy];
+        queued[@"nameWait"]=(SNName(config[@"Aliases"][uid])||SNName(users[uid][@"name"]))?@0:@(setting(@"NameWaitSeconds",0.8,0,2));
+        NSString *rid=[outbox enqueueEvent:queued scope:account?:[@"session/" stringByAppendingString:session] atTime:NSDate.date.timeIntervalSince1970 error:&error];
+        if(error)logLine(@"OUTBOX-STORAGE code=%ld retainedInMemory=%d",(long)error.code,rid!=nil);
+        if(rid)scheduleOutbox(0);
+        return;
+    }
     NSString *key=eventKey(event);double now=nowTime();
     uint64_t ticket=sn_ledger_reserve(&ledger,key.UTF8String,now,15);
     if(!ticket){logLine(@"EVENT-DROP reason=duplicate type=%@ uid=%@",kind,shortID(uid));return;}
@@ -308,6 +389,7 @@ static void consumePresence(NSArray<NSDictionary *> *snapshots) {
         for(NSString *kind in @[@"typing",@"peek"]) {
             for(NSDictionary *person in convo[[kind isEqual:@"typing"]?@"typing":@"peeking"]) {
                 NSString *uid=person[@"uid"],*key=[@[kind,cid,uid] componentsJoinedByString:@"|"];
+                [remoteParticipants observeUser:uid conversation:cid atTime:now];
                 [seen addObject:key];
                 BOOL active=person[@"active"]?[person[@"active"] boolValue]:YES;
                 /* RemoteTypingParticipants membership is used when the proxy
@@ -365,9 +447,7 @@ static void consumeReceiveBatch(NSDictionary *batch,NSString *source,SNReceiveSo
             /* Remote typing/peeking participants are independently identified
                as remote by Snapchat. Use the same conversation + sender, not
                mere temporal proximity or somebody else's presence event. */
-            NSString *typing=[@[@"typing",record[@"conversation"],record[@"uid"]] componentsJoinedByString:@"|"];
-            NSString *peeking=[@[@"peek",record[@"conversation"],record[@"uid"]] componentsJoinedByString:@"|"];
-            NSDictionary *r=SNResolveReceiveDirection(record,account,presence[typing]!=nil||presence[peeking]!=nil);
+            NSDictionary *r=SNResolveReceiveDirection(record,account,[remoteParticipants containsUser:record[@"uid"] conversation:record[@"conversation"] atTime:nowTime()]);
             if(!r[@"timestamp"])reasons[@"snapshot-missing-time"]=@([reasons[@"snapshot-missing-time"] unsignedIntegerValue]+1);
             if(!r[@"incoming"])reasons[@"snapshot-direction-unknown"]=@([reasons[@"snapshot-direction-unknown"] unsignedIntegerValue]+1);
             [directional addObject:r];
@@ -390,18 +470,25 @@ static void consumeReceiveBatch(NSDictionary *batch,NSString *source,SNReceiveSo
     }
     consumeReceived(events);
 }
+static void enqueueReceiveWork(dispatch_block_t work) {
+    if(dispatch_get_specific(&workerKey)){work();return;}
+    if(atomic_fetch_add(&receiveInflight,1)>=64){
+        atomic_fetch_sub(&receiveInflight,1);atomic_fetch_add(&receiveBackpressure,1);
+        /* Results are already detached. worker never synchronously waits for
+           this host thread, so bounded backpressure cannot form a main/worker
+           cycle. An extreme burst may briefly slow the source callback. */
+        dispatch_sync(worker,work);return;
+    }
+    dispatch_async(worker,^{@try{work();}@finally{atomic_fetch_sub(&receiveInflight,1);}});
+}
 static void observeReceived(NSString *className,NSString *selector,NSArray *arguments,SNReceiveSource mode) {
-    if(atomic_fetch_add(&receiveInflight,1)>=64){atomic_fetch_sub(&receiveInflight,1);atomic_fetch_add(&receiveDrops,1);return;}
     @try {
         BOOL foreground=atomic_load(&appState)==UIApplicationStateActive;
-        NSDictionary *batch=SNDecodeReceiveCallback(className,selector,arguments);
         NSString *source=[NSString stringWithFormat:@"%@/%@",className,selector];
-        dispatch_async(worker,^{
-            @try{@autoreleasepool{consumeReceiveBatch(batch,source,mode,foreground);}}
-            @catch(NSException *e){logLine(@"RECEIVE-ERROR exception=%@",e.name);}
-            @finally{atomic_fetch_sub(&receiveInflight,1);}
+        SNEnumerateReceiveBatches(className,selector,arguments,^(NSDictionary *batch){
+            enqueueReceiveWork(^{@try{consumeReceiveBatch(batch,source,mode,foreground);}@catch(NSException *e){logLine(@"RECEIVE-ERROR exception=%@",e.name);}});
         });
-    } @catch(NSException *e){atomic_fetch_sub(&receiveInflight,1);logLine(@"RECEIVE-ERROR exception=%@",e.name);}
+    }@catch(NSException *e){logLine(@"RECEIVE-ERROR exception=%@",e.name);}
 }
 
 
@@ -434,20 +521,27 @@ static void consumeNativeNotice(NSDictionary *notice, BOOL foreground) {
         });
     }];
 }
+static NSString *hostNoticeIdentity(id object) {
+    static NSMapTable *identities;static dispatch_once_t once;
+    dispatch_once(&once,^{identities=[NSMapTable mapTableWithKeyOptions:NSPointerFunctionsWeakMemory|NSPointerFunctionsObjectPointerPersonality valueOptions:NSPointerFunctionsStrongMemory];});
+    @synchronized(identities){
+        NSString *rid=[identities objectForKey:object];
+        if(!rid){if(identities.count>=2048)[identities removeAllObjects];rid=NSUUID.UUID.UUIDString;[identities setObject:rid forKey:object];}
+        return rid;
+    }
+}
 static void observeHostNotice(id payload) {
-    if(atomic_fetch_add(&receiveInflight,1)>=64){atomic_fetch_sub(&receiveInflight,1);atomic_fetch_add(&receiveDrops,1);return;}
     @try {
         BOOL foreground=atomic_load(&appState)==UIApplicationStateActive;
         NSDictionary *batch=SNDecodeReceived(payload?@[payload]:@[],nil,nil);
         NSDictionary *notice=[batch[@"events"] count]?nil:SNHostNotice(payload);
-        dispatch_async(worker,^{
-            @try{
-                consumeReceiveBatch(batch,@"host/inAppNotification",SN_SOURCE_LIVE,foreground);
-                if(notice)consumeNativeNotice(notice,foreground);
-            }@catch(NSException *error){logLine(@"NATIVE-NOTICE-ERROR exception=%@",error.name);}
-            @finally{atomic_fetch_sub(&receiveInflight,1);}
-        });
-    }@catch(__unused NSException *e){atomic_fetch_sub(&receiveInflight,1);}
+        if(notice&&!notice[@"id"]&&payload){
+            NSString *identity=hostNoticeIdentity(payload);
+            NSMutableDictionary *copy=[notice mutableCopy];copy[@"id"]=identity;notice=[copy copy];
+        }
+        NSDictionary *snapshot=notice;
+        enqueueReceiveWork(^{@try{consumeReceiveBatch(batch,@"host/inAppNotification",SN_SOURCE_LIVE,foreground);if(snapshot)consumeNativeNotice(snapshot,foreground);}@catch(NSException *e){logLine(@"NATIVE-NOTICE-ERROR exception=%@",e.name);}});
+    }@catch(__unused NSException *e){}
 }
 static void observeTransport(id receiver,id payload) {
     if(atomic_fetch_add(&transportInflight,1)>=64){atomic_fetch_sub(&transportInflight,1);atomic_fetch_add(&packetDrops,1);return;}
@@ -475,15 +569,26 @@ static void observeHandlerRegistration(NSArray *args) {
     }
 }
 
+static void recordBackgroundHealth(void) {
+    double wall=NSDate.date.timeIntervalSince1970;
+    if(lastHeartbeatWall>0&&wall-lastHeartbeatWall>90){
+        heartbeatGaps++;maxHeartbeatGap=fmax(maxHeartbeatGap,wall-lastHeartbeatWall);
+        logLine(@"EXECUTION-GAP seconds=%.1f cause=unproven-suspension-or-scheduling-delay",wall-lastHeartbeatWall);
+    }
+    lastHeartbeatWall=wall;
+    AVAudioSession *audio=AVAudioSession.sharedInstance;
+    NSDictionary *snapshot=@{@"sampledAt":@(wall),@"backgroundSeconds":@(backgroundStartedWall>0?fmax(0,wall-backgroundStartedWall):0),@"audioPlaying":@(keepPlayer.isPlaying),@"audioInterrupted":@(audioInterrupted),@"audioCategory":audio.category?:@"unknown",@"audioMode":audio.mode?:@"unknown",@"duplexBackgroundDeferred":@(deferringLifecycle),@"requiresUserResume":@(backgroundNeedsUserResume),@"executionGaps":@(heartbeatGaps),@"largestGapSeconds":@(maxHeartbeatGap),@"recoveryAttempts":@(audioRecoveryAttempts),@"permanentExecutionGuaranteed":@NO};
+    dispatch_async(worker,^{backgroundHealth=snapshot;});
+}
 #pragma mark - Optional background experiment (main thread only)
 static void stopExperiment(NSString *reason) {
     [keepPlayer stop];keepPlayer=nil;
     /* Never deactivate or reset Snapchat's shared audio session. */
-    if(deferringLifecycle){dispatch_block_t callback=deferredBackground;deferredBackground=nil;deferringLifecycle=NO;if(callback)callback();}
+    if(deferringLifecycle){backgroundNeedsUserResume=YES;dispatch_block_t callback=deferredBackground;deferredBackground=nil;deferringLifecycle=NO;if(callback)callback();}
     deferredReceiver=nil;logLine(@"KEEPALIVE-STOP reason=%@",reason);
 }
 static BOOL startExperiment(void) {
-    if(!atomic_load(&experiments)||audioInterrupted||atomic_load(&appState)!=UIApplicationStateBackground)return NO;
+    if(!atomic_load(&experiments)||audioInterrupted||backgroundNeedsUserResume||atomic_load(&appState)!=UIApplicationStateBackground)return NO;
     NSArray *modes=NSBundle.mainBundle.infoDictionary[@"UIBackgroundModes"];
     if(![modes isKindOfClass:NSArray.class]||![modes containsObject:@"audio"]){logLine(@"KEEPALIVE-UNAVAILABLE reason=no-audio-background-mode");return NO;}
     AVAudioSession *audio=AVAudioSession.sharedInstance;
@@ -566,7 +671,10 @@ static void scan(void) {
                 (void)self;(void)r;id state=SNRead(a.count>1?a[1]:nil,@"state");id local=SNRead(state,@"localParticipant");NSString *uid=SNIdentifier(SNRead(local,@"snapchatUserId"));
                 if(uid)dispatch_async(worker,^{setAccount(uid);});
                 /* Do not classify a state-provider callback as an incoming call. */
-                dispatch_async(dispatch_get_main_queue(),^{if(keepPlayer)stopExperiment(@"host-call-state");});
+                dispatch_async(dispatch_get_main_queue(),^{
+                    NSString *category=AVAudioSession.sharedInstance.category;
+                    if(keepPlayer&&([category isEqual:AVAudioSessionCategoryRecord]||[category isEqual:AVAudioSessionCategoryPlayAndRecord]))stopExperiment(@"host-recording-or-call");
+                });
             });
         }
         if([cn isEqual:@"SCDuplexAppUserLifecycleObserver"])installBackgroundExperiment(cls);
@@ -625,7 +733,12 @@ static void writeStatus(void) {
         [issuedRequests removeObjectForKey:oldest];
     }
     for(NSString *key in [pendingEvents allKeys])if(now-[pendingEvents[key][@"created"] doubleValue]>15){sn_ledger_cancel(&ledger,[pendingEvents[key][@"ticket"] unsignedLongLongValue]);[pendingEvents removeObjectForKey:key];}
-    NSDictionary *status=@{@"version":SNVersion,@"state":stateLabel(),@"knownUsers":@(users.count),@"nameHits":@(nameHits),@"nameMisses":@(nameMisses),@"wirePackets":@(wireCount),@"unsupportedWirePackets":@(malformedCount),@"packetDrops":@(atomic_load(&packetDrops)),@"notificationRequestsAccepted":@(postedCount),@"secondsSinceWire":lastWire?@(now-lastWire):@(-1),@"apnsRegisteredThisRun":@(nativePushRegistered),@"apnsDeliveryCallbacks":@(apnsCallbacks),@"nativeNoticeCandidates":@(nativeNoticeCandidates),@"nativeNoticesAccepted":@(nativeNoticeAccepted),@"experimentalKeepAlive":@(atomic_load(&experiments)),@"onDeviceValidationRequired":@YES,@"receiveCallbacks":@(receivedCallbacks),@"decodedMessages":@(decodedMessages),@"decodedSnaps":@(decodedSnaps),@"snapshotRecordsSuppressed":@(snapshotSuppressed),@"receiveQueueDrops":@(atomic_load(&receiveDrops)),@"localAccountKnown":@(account.length>0)};
+    NSMutableDictionary *status=[@{@"version":SNVersion,@"state":stateLabel(),@"knownUsers":@(users.count),@"nameHits":@(nameHits),@"nameMisses":@(nameMisses),@"wirePackets":@(wireCount),@"unsupportedWirePackets":@(malformedCount),@"packetDrops":@(atomic_load(&packetDrops)),@"notificationRequestsAccepted":@(postedCount),@"secondsSinceWire":lastWire?@(now-lastWire):@(-1),@"apnsRegisteredThisRun":@(nativePushRegistered),@"apnsDeliveryCallbacks":@(apnsCallbacks),@"nativeNoticeCandidates":@(nativeNoticeCandidates),@"nativeNoticesAccepted":@(nativeNoticeAccepted),@"experimentalKeepAlive":@(atomic_load(&experiments)),@"onDeviceValidationRequired":@YES,@"receiveCallbacks":@(receivedCallbacks),@"decodedMessages":@(decodedMessages),@"decodedSnaps":@(decodedSnaps),@"snapshotRecordsSuppressed":@(snapshotSuppressed),@"receiveQueueDrops":@(atomic_load(&receiveDrops)),@"localAccountKnown":@(account.length>0)} mutableCopy];
+    status[@"outbox"]=[outbox statisticsForScopes:deliveryScopes()];
+    status[@"outboxAcceptedThisRun"]=@(outboxAcceptedThisRun);status[@"outboxCompletionTimeouts"]=@(outboxTimeouts);
+    status[@"receiveBackpressureWaits"]=@(atomic_load(&receiveBackpressure));
+    status[@"backgroundHealth"]=backgroundHealth?:@{};
+    status[@"submissionDoesNotProveBannerDisplay"]=@YES;
     NSData *json=[NSJSONSerialization dataWithJSONObject:status options:NSJSONWritingPrettyPrinted error:NULL];
     [json writeToFile:[documents stringByAppendingPathComponent:@"snapnotify_status.json"] options:NSDataWritingAtomic|NSDataWritingFileProtectionCompleteUntilFirstUserAuthentication error:NULL];
     NSDictionary *schema=@{@"version":SNVersion,@"hooks":receiveHooks?:@[],@"sources":[receiveSources copy],@"containsMessageBodies":@NO,@"transportSources":[transportSources copy]};
@@ -637,26 +750,43 @@ static void setup(void) {
     atomic_store(&appState,UIApplication.sharedApplication.applicationState);
     NSNotificationCenter *nc=NSNotificationCenter.defaultCenter;
     [nc addObserverForName:UIApplicationDidEnterBackgroundNotification object:nil queue:NSOperationQueue.mainQueue usingBlock:^(__unused NSNotification *note){
-        atomic_store(&appState,UIApplicationStateBackground);logLine(@"LIFECYCLE background");startExperiment();dispatch_async(worker,^{saveCache();writeStatus();});
+        atomic_store(&appState,UIApplicationStateBackground);backgroundStartedWall=NSDate.date.timeIntervalSince1970;audioRecoveryAttempts=0;
+        logLine(@"LIFECYCLE background");startExperiment();recordBackgroundHealth();dispatch_async(worker,^{saveCache();scheduleOutbox(0);writeStatus();});
     }];
     [nc addObserverForName:UIApplicationWillResignActiveNotification object:nil queue:NSOperationQueue.mainQueue usingBlock:^(__unused NSNotification *note){atomic_store(&appState,UIApplicationStateInactive);}];
     [nc addObserverForName:UIApplicationDidBecomeActiveNotification object:nil queue:NSOperationQueue.mainQueue usingBlock:^(__unused NSNotification *note){
-        atomic_store(&appState,UIApplicationStateActive);
+        recordBackgroundHealth();
+        atomic_store(&appState,UIApplicationStateActive);backgroundStartedWall=0;
+        /* iOS need not send an interruption-ended event. Explicit foreground
+           interaction re-arms the experiment, not a forged lifecycle event. */
+        audioInterrupted=NO;backgroundNeedsUserResume=NO;audioRecoveryAttempts=0;
         /* A deferred background transition is obsolete once the host is active. */
         deferredBackground=nil;deferredReceiver=nil;deferringLifecycle=NO;[keepPlayer stop];keepPlayer=nil;
-        logLine(@"LIFECYCLE active");scan();dispatch_async(worker,^{loadConfig();NSString *uid=SNIdentifier(config[@"SelfUserID"]);if(uid)setAccount(uid);writeStatus();});
+        logLine(@"LIFECYCLE active");scan();dispatch_async(worker,^{loadConfig();NSString *uid=SNIdentifier(config[@"SelfUserID"]);if(uid)setAccount(uid);[outbox retryBlockedInScopes:deliveryScopes() atTime:NSDate.date.timeIntervalSince1970];scheduleOutbox(0);writeStatus();});
     }];
     [nc addObserverForName:AVAudioSessionInterruptionNotification object:nil queue:NSOperationQueue.mainQueue usingBlock:^(NSNotification *note){
         AVAudioSessionInterruptionType type=[note.userInfo[AVAudioSessionInterruptionTypeKey] unsignedIntegerValue];
         audioInterrupted=type==AVAudioSessionInterruptionTypeBegan;
         if(audioInterrupted)stopExperiment(@"audio-interruption");
-        /* No forced resume: do not fight a phone call / microphone recording. */
+        if(type==AVAudioSessionInterruptionTypeEnded)logLine(@"AUDIO-INTERRUPTION-ENDED requiresUserResume=%d",backgroundNeedsUserResume);
+        recordBackgroundHealth();
+        /* Never fake a foreground event to reopen a closed native socket. */
     }];
     [nc addObserverForName:AVAudioSessionMediaServicesWereResetNotification object:nil queue:NSOperationQueue.mainQueue usingBlock:^(__unused NSNotification *note){stopExperiment(@"media-services-reset");}];
-    housekeeping=[NSTimer scheduledTimerWithTimeInterval:30 repeats:YES block:^(__unused NSTimer *timer){
-        if(deferringLifecycle&&(!keepPlayer.isPlaying||!atomic_load(&experiments)))stopExperiment(@"audio-stopped-or-disabled");
-        dispatch_async(worker,^{saveCache();writeStatus();});
+    housekeeping=[NSTimer timerWithTimeInterval:5 repeats:YES block:^(__unused NSTimer *timer){
+        if(deferringLifecycle&&!atomic_load(&experiments))stopExperiment(@"disabled");
+        if(deferringLifecycle&&!keepPlayer.isPlaying){
+            NSString *category=AVAudioSession.sharedInstance.category;
+            BOOL safe=!audioInterrupted&&!backgroundNeedsUserResume&&[category isEqual:AVAudioSessionCategoryPlayback]&&atomic_load(&appState)==UIApplicationStateBackground;
+            BOOL recovered=NO;
+            if(safe&&audioRecoveryAttempts<2){audioRecoveryAttempts++;recovered=[keepPlayer play];logLine(@"KEEPALIVE-RECOVERY playing=%d attempt=%lu guaranteed=0",recovered,(unsigned long)audioRecoveryAttempts);}
+            if(!recovered)stopExperiment(@"audio-stopped");
+        }
+        recordBackgroundHealth();
+        static unsigned ticks=0;
+        dispatch_async(worker,^{if(++ticks%6==0){saveCache();writeStatus();}scheduleOutbox(0);});
     }];
+    [NSRunLoop.mainRunLoop addTimer:housekeeping forMode:NSRunLoopCommonModes];
     [[UNUserNotificationCenter currentNotificationCenter] requestAuthorizationWithOptions:UNAuthorizationOptionAlert|UNAuthorizationOptionSound completionHandler:^(BOOL granted,NSError *error){logLine(@"NOTIFICATION-AUTH granted=%d code=%ld",granted,(long)error.code);}];
     scan();
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW,2*NSEC_PER_SEC),dispatch_get_main_queue(),^{scan();});
@@ -671,14 +801,17 @@ __attribute__((constructor)) static void start(void) {
         Class guard=objc_allocateClassPair(NSObject.class,"SnapNotifyV4ProcessGuard",0);if(!guard)return;objc_registerClassPair(guard);
         worker=dispatch_queue_create("ch.snapnotify.events",dispatch_queue_attr_make_with_autorelease_frequency(DISPATCH_QUEUE_SERIAL,DISPATCH_AUTORELEASE_FREQUENCY_WORK_ITEM));
         logQueue=dispatch_queue_create("ch.snapnotify.log",DISPATCH_QUEUE_SERIAL);
+        dispatch_queue_set_specific(worker,&workerKey,&workerKey,NULL);
+        remoteParticipants=[SNRemoteParticipants new];
         users=[NSMutableDictionary dictionary];presence=[NSMutableDictionary dictionary];pendingEvents=[NSMutableDictionary dictionary];issuedRequests=[NSMutableDictionary dictionary];
         receiveTracker=[[SNReceiveTracker alloc] initWithMonitoringStart:NSDate.date.timeIntervalSince1970];transportSources=[NSMutableDictionary dictionary];receiveSources=[NSMutableDictionary dictionary];receiveHooks=@[];
         session=NSUUID.UUID.UUIDString;queueGeneration=1;
         documents=[NSSearchPathForDirectoriesInDomains(NSDocumentDirectory,NSUserDomainMask,YES) firstObject];
         support=[[NSSearchPathForDirectoriesInDomains(NSApplicationSupportDirectory,NSUserDomainMask,YES) firstObject] stringByAppendingPathComponent:@"SnapNotify"];
         [NSFileManager.defaultManager createDirectoryAtPath:support withIntermediateDirectories:YES attributes:@{NSFileProtectionKey:NSFileProtectionCompleteUntilFirstUserAuthentication} error:NULL];
+        outbox=[[SNOutbox alloc] initWithDirectory:[support stringByAppendingPathComponent:@"outbox-v5"]];
         atomic_store(&appState,UIApplicationStateInactive);
         dispatch_sync(worker,^{loadConfig();NSString *uid=SNIdentifier(config[@"SelfUserID"]);if(uid)setAccount(uid);});
-        dispatch_async(dispatch_get_main_queue(),^{setup();});
+        dispatch_async(dispatch_get_main_queue(),^{setup();dispatch_async(worker,^{scheduleOutbox(0);});});
     }
 }

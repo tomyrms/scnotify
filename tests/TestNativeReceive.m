@@ -40,6 +40,9 @@ static NSString * const SELNAME=@"onConversationUpdated:conversation:updatedMess
 @property(nonatomic) BOOL isSnapMessage;
 @property(nonatomic) BOOL isStatusMessage;
 @property(nonatomic) BOOL isVoiceNote;
+@property(nonatomic) BOOL isStickerMessage;
+@property(nonatomic) BOOL isSingleImageChatMedia;
+@property(nonatomic) BOOL isStoryReplyMessage;
 @property(nonatomic) BOOL isChatMediaMessage;
 @property(nonatomic) BOOL isStickerReaction;
 @property(nonatomic) BOOL isErased;
@@ -137,6 +140,20 @@ int main(void) {@autoreleasepool {
     CHECK(![schema containsString:@"PRIVATE_BODY_NOT_FOR_LOGS"]); // entire rejected batch has only event identities, no text
     NSString *shapes=[[NSString alloc] initWithData:[NSJSONSerialization dataWithJSONObject:decode(m)[@"shapes"] options:0 error:NULL] encoding:NSUTF8StringEncoding];
     CHECK(![shapes containsString:U]);CHECK(![shapes containsString:ME]);
+    m=msg(109,999);m.isVoiceNote=YES;CHECK([firstEvent(m)[@"kind"] isEqual:@"message"]);CHECK([firstEvent(m)[@"subtype"] isEqual:@"voice"]);
+    m.isVoiceNote=NO;m.isStickerMessage=YES;CHECK([firstEvent(m)[@"subtype"] isEqual:@"sticker"]);
+    m.isStickerMessage=NO;m.isSingleImageChatMedia=YES;CHECK([firstEvent(m)[@"subtype"] isEqual:@"photo"]);
+    m.isSingleImageChatMedia=NO;m.isStoryReplyMessage=YES;CHECK([firstEvent(m)[@"subtype"] isEqual:@"story_reply"]);
+    NSMutableArray *burst=[NSMutableArray array];for(NSUInteger i=1;i<=600;i++)[burst addObject:msg(1000+i,1)];
+    __block NSUInteger total=0,batches=0;
+    SNEnumerateReceiveBatches(CLS,SELNAME,@[uuid(C),NSNull.null,burst,@[]],^(NSDictionary *batch){batches++;total+=[batch[@"events"] count];CHECK([batch[@"events"] count]<=128);});
+    CHECK(total==600);CHECK(batches==5);
+    // The old 2048-entry set stopped accepting every subsequent message.
+    tracker=[[SNReceiveTracker alloc] initWithMonitoringStart:1800000000];
+    for(NSUInteger i=1;i<=8300;i++){
+        NSDictionary *ev=@{@"event":[@(10000+i) stringValue],@"uid":U,@"conversation":C,@"kind":@"message",@"incoming":@YES,@"timestamp":@1800000001};
+        CHECK([tracker newEventsInSnapshot:@[ev] wallTime:1800000002].count==1);
+    }
     // The supplied encoding B32@0:8@16@24 was rejected by rc3.
     __block NSUInteger hits=0;__block int last=-7;RC4BoolHost *host=[RC4BoolHost new];
     CHECK(SNInstallHook(RC4BoolHost.class,@selector(present:delegate:),^(id self,NSArray *args,id result){hits++;last=[result intValue];CHECK(self==host);CHECK(args.count==2);CHECK(args[1]==NSNull.null);}));

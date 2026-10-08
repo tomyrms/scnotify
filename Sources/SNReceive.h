@@ -7,6 +7,7 @@ void SNSetReceiveTypeMappings(NSDictionary *mappings);
 void SNSetReceiveHostVersion(NSString *version);
 /* Snapshot adapter for the exact four-argument Arroyo callback. Removed
    messages and conversation history are not new-message candidates. */
+void SNEnumerateReceiveBatches(NSString *className, NSString *selector, NSArray *arguments, void (^visit)(NSDictionary *batch));
 NSDictionary *SNDecodeReceiveCallback(NSString *className, NSString *selector, NSArray *arguments);
 /* Return an incoming flag only with independent direction evidence. */
 NSDictionary *SNResolveReceiveDirection(NSDictionary *event, NSString * _Nullable account, BOOL knownRemote);
