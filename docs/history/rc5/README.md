@@ -1,4 +1,4 @@
-# SnapNotify 4.0.0-rc6
+# SnapNotify 4.0.0-rc5
 
 Correctifs pour Snapchat **14.17.1**, destiné à être injecté dans l’IPA puis signé avec Sideloadly. Appareil cible déclaré : iPhone 14, iOS 26.6.2. La compatibilité sur cet appareil reste à vérifier.
 
@@ -18,7 +18,7 @@ Correctifs pour Snapchat **14.17.1**, destiné à être injecté dans l’IPA pu
 1. Copier le projet complet dans un dépôt, y compris `.github`, `Sources`, `Core`, `tests` et `scripts`.
 2. Lancer **SnapNotify tests and build**. Le workflow exécute les tests portables, les **six** programmes Foundation puis compile la bibliothèque iOS arm64.
 3. Télécharger **SnapNotify-v4-dylib** provenant de cette nouvelle exécution. L’artefact contient `SnapNotify.dylib` et son empreinte SHA-256.
-4. Remplacer l’ancienne bibliothèque dans la procédure d’injection Sideloadly, puis signer/réinstaller l’IPA. Ne pas cumuler plusieurs copies de SnapNotify. Vérifier `READY version=4.0.0-rc6 host=14.17.1` dans le journal après lancement.
+4. Remplacer l’ancienne bibliothèque dans la procédure d’injection Sideloadly, puis signer/réinstaller l’IPA. Ne pas cumuler plusieurs copies de SnapNotify. Vérifier `READY version=4.0.0-rc5 host=14.17.1` dans le journal après lancement.
 
 Sur Mac avec Xcode : `make test`, `make test-macos`, puis `make`. Le chemin Theos reste disponible.
 
@@ -36,4 +36,4 @@ Les notifications déjà confiées à iOS restent gérées par iOS. Une requête
 
 Suivre [le protocole appareil](docs/VALIDATION_IPHONE.md), avec une rafale de messages et des essais à 1, 5, 10, 15 et 30 minutes en arrière-plan. En cas de coupure, conserver `snapnotify.log`, `snapnotify_status.json` et `snapnotify_receive_schema.json` avant et après le retour dans Snapchat. Aucun contenu de message n’est exporté dans ces diagnostics.
 
-Les vérifications de rc6 et les tests précédemment exécutés sur rc5 sont détaillés dans [TESTS_EFFECTUES](docs/TESTS_EFFECTUES.md) et `VALIDATION.json`. Les documents rc4 et `docs/history` décrivent les livraisons précédentes.
+Les tests effectivement exécutés sont détaillés dans [TESTS_EFFECTUES](docs/TESTS_EFFECTUES.md) et `VALIDATION.json`. Les documents rc4 et `docs/history` décrivent les livraisons précédentes.

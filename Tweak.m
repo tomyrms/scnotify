@@ -1,4 +1,4 @@
-// SnapNotify 4.0.0-rc5 — explicit event adapters, not notifications from hook names.
+// SnapNotify 4.0.0-rc6 — explicit event adapters, not notifications from hook names.
 #import <Foundation/Foundation.h>
 #import <UIKit/UIKit.h>
 #import <UserNotifications/UserNotifications.h>
@@ -15,7 +15,7 @@
 #include <stdarg.h>
 #include <math.h>
 
-static NSString * const SNVersion=@"4.0.0-rc5";
+static NSString * const SNVersion=@"4.0.0-rc6";
 static dispatch_queue_t worker, logQueue;
 static NSMutableDictionary *users, *presence, *pendingEvents, *issuedRequests;
 static NSDictionary *config;
@@ -181,7 +181,10 @@ static NSString *eventKey(NSDictionary *event) {
 static NSString *bodyFor(NSDictionary *event,NSString *name) {
     NSString *who=name ?: [NSString stringWithFormat:@"Contact %@",shortID(event[@"uid"])];
     NSString *kind=event[@"kind"];
-    if([kind isEqual:@"typing"])return [who stringByAppendingString:@" est en train d’écrire…"];
+    /* The presence callback also covers composing a voice note. Its raw
+       numeric state is not a verified text/voice discriminator, so use a
+       truthful shared label until a distinct semantic signal is available. */
+    if([kind isEqual:@"typing"])return [who stringByAppendingString:@" prépare un message…"];
     if([kind isEqual:@"peek"])return [who stringByAppendingString:@" entrouvre la conversation"];
     if([kind isEqual:@"snap"])return [who stringByAppendingString:@" t’a envoyé un snap"];
     if([kind isEqual:@"message"]){
