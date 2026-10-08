@@ -1,0 +1,44 @@
+name: build
+
+on:
+  push:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: macos-14
+    env:
+      THEOS: /Users/runner/theos
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Theos
+        run: |
+          git clone --recursive --depth 1 https://github.com/theos/theos.git "$THEOS"
+          echo "$THEOS/bin" >> "$GITHUB_PATH"
+
+      - name: Setup SDK
+        run: |
+          git clone --depth 1 --filter=blob:none --sparse https://github.com/theos/sdks.git /tmp/sdks
+          cd /tmp/sdks
+          SDK=$(git ls-tree --name-only HEAD | grep '^iPhoneOS.*\.sdk$' | sort -V | tail -1)
+          echo "Using SDK: $SDK"
+          git sparse-checkout set "$SDK"
+          mkdir -p "$THEOS/sdks"
+          cp -R "$SDK" "$THEOS/sdks/"
+
+      - name: Build
+        run: |
+          make -j4
+
+      - name: Collect artifacts
+        run: |
+          mkdir -p out
+          find .theos -name '*.dylib' -print -exec cp {} out/ \;
+          ls -la out
+
+      - name: Upload dylib
+        uses: actions/upload-artifact@v4
+        with:
+          name: SnapNotify-dylib
+          path: out/*.dylib
