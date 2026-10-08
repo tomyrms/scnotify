@@ -33,6 +33,7 @@ jobs:
           for name,wanted in expected.items():
               assert hashlib.sha256(pathlib.Path(name).read_bytes()).hexdigest()==wanted,name+' new file mismatch'
           PY
+          python3 .ci/finalize_rc5_1.py
       - name: Portable regression and sanitizers
         run: bash scripts/test-portable.sh
       - name: Native tests including blocked disk and continuous input
