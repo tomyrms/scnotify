@@ -47,7 +47,11 @@ int main(void) {
     CHECK([SNHostNotice(@{@"notificationId":@"envelope-1",@"content":n})[@"id"] isEqual:@"notice-1"]);
     CHECK(SNHostNotice(@{@"isHistorical":@YES,@"content":n})==nil);
     CHECK(SNHostNotice(@{@"content":@{@"content":@{@"content":@{@"content":n}}}})==nil);
+    /* The duplicate-cycle guard is the behaviour under test here. */
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wobjc-circular-container"
     NSMutableDictionary *cycle=[NSMutableDictionary dictionary];[cycle setObject:cycle forKey:@"content"];
+#pragma clang diagnostic pop
     CHECK(SNHostNotice(cycle)==nil);[cycle removeAllObjects];
     CHECK([SNHostNotice(@{@"title":[[NSAttributedString alloc] initWithString:@"Test"],@"messageText":@"Line 1\nLine 2"})[@"body"] isEqual:@"Line 1\nLine 2"]);
     CHECK(SNHostNotice(@{@"title":@"Test",@"body":[@"a" stringByPaddingToLength:4097 withString:@"a" startingAtIndex:0]})==nil);
