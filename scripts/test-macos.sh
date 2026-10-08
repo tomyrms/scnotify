@@ -24,3 +24,9 @@ xcrun clang -std=gnu11 -fobjc-arc -fblocks -Wall -Wextra -Werror \
   Sources/SNRuntime.m Sources/SNReceive.m Sources/SNHostNotice.m tests/TestHostNotice.m \
   "$build/core.o" "$build/policy.o" -o "$build/test_host_notice"
 "$build/test_host_notice"
+
+xcrun clang -std=gnu11 -fobjc-arc -fblocks -Wall -Wextra -Werror \
+  -Wno-deprecated-declarations -framework Foundation -framework CoreFoundation \
+  Sources/SNRuntime.m Sources/SNReceive.m tests/TestNativeReceive.m \
+  "$build/core.o" "$build/policy.o" -o "$build/test_native_receive"
+"$build/test_native_receive"

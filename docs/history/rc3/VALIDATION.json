@@ -1,0 +1,30 @@
+{
+  "version": "4.0.0-rc3",
+  "base_commit": "d718a6b4de438362453f8b3467d9d41d3618cc91",
+  "validation_commit": "47be842e27496821cd6a3564881b40df60ec8153",
+  "validation_branch": "chatgpt/rc3-notification-validation",
+  "workflow_run_id": 37843432418,
+  "workflow_job_id": 113538280382,
+  "workflow_url": "https://github.com/tomyrms/scnotify/actions/runs/37843432418",
+  "workflow_conclusion": "success",
+  "artifact_id": 11578248481,
+  "artifact_name": "SnapNotify-rc3-validated",
+  "artifact_url": "https://github.com/tomyrms/scnotify/actions/runs/37843432418/artifacts/11578248481",
+  "artifact_zip_sha256": "dbadacc8bc30c2e5b5f4e44569dc3d1e06dbfb60149810900dcd38a84d92cee7",
+  "verified_patch_sha256": "31f9ce692ad64762b3a1a3c73ed0bb2018a184a50c84844a76f74bdfc1ad478f",
+  "checks": {
+    "python_c_tests": 78,
+    "foundation_checks": 46,
+    "receive_checks": 107,
+    "host_notice_checks": 52,
+    "sanitizer_core_inputs": 100000,
+    "sanitizer_policy_inputs": 100000
+  },
+  "ios_arm64_compilation": "passed on GitHub macOS runner",
+  "iphone_validation": "not performed",
+  "apns_delivery_validation": "not performed",
+  "source_hashes_verified": 26,
+  "source_hash_file": "docs/SOURCE_HASHES_CI.json",
+  "zip_contains": "source code, tests and documentation; compiled binary available separately in GitHub artifact",
+  "main_modified": false
+}

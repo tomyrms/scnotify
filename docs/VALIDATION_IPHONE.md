@@ -1,32 +1,15 @@
-# Essai sur iPhone — rc3
+# Validation iPhone — rc4
 
-## Préparer
+Compiler depuis **ce projet complet**. Vérifier la nouvelle exécution GitHub Actions et l'artefact correspondant avant de reconditionner l'IPA. Les anciens artefacts rc3 restent rc3 même si leur nom générique est identique.
 
-Utiliser la bibliothèque de l'artefact rc3 référencé dans le README, ou reconstruire tout le projet. Remplacer l'ancienne injection plutôt qu'en ajouter une deuxième. La signature finale et l'installation restent celles du processus habituel de l'utilisateur.
+Après installation, le journal doit contenir `READY version=4.0.0-rc4 host=14.17.1`.
 
-Lancer Snapchat manuellement et rechercher `READY version=4.0.0-rc3` dans `snapnotify.log`. Une ligne ancienne rc1/rc2 n'est pas suffisante. Vérifier dans le statut que les notifications sont autorisées ; conserver les réglages d'aperçu souhaités. Une ancienne configuration personnalisée peut désactiver `MessageNotifications`, `SnapNotifications` ou le maintien expérimental.
+Ouvrir le chat du compte de test, laisser Snapchat en arrière-plan sans fermer la carte, puis essayer : saisie suivie d'un chat ; deuxième chat ; snap photo ; deuxième snap ; appel. Vérifier les bannières, pas seulement les compteurs.
 
-## Essai principal
+Le succès de détection doit apparaître dans le callback Arroyo avec `decoded > 0`, puis `eligible > 0`. Le journal doit ensuite afficher `NOTIF-REQUEST type=message` ou `type=snap`, puis `NOTIF-ACCEPTED`. Cette dernière étape signifie acceptation de la demande par iOS, pas preuve de présentation visuelle.
 
-Avec le compte destinataire, ouvrir la liste de conversations, puis laisser Snapchat en arrière-plan **sans balayer sa carte pour la fermer**. Noter l'heure, le réseau utilisé et si l'écran est verrouillé.
+Si `decoded > 0` mais `eligible = 0`, regarder les filtres cumulés `snapshot-missing-time`, `snapshot-direction-unknown`, et le statut `localAccountKnown`. La version rc3 s'arrêtait avant ces filtres ; le fait de corriger son type inconnu ne garantit pas que la date ou l'identité locale soit disponible sur chaque objet.
 
-Depuis le second compte : écrire puis envoyer un chat, attendre quelques secondes, envoyer un deuxième chat sans nouvelle session de saisie, puis envoyer deux snaps. Refaire ensuite un appel et une nouvelle saisie. Conserver les heures précises pour corréler les logs. Effectuer un essai après 10 secondes en arrière-plan, puis un autre après deux minutes ; ce sont des conditions de test, pas des garanties de délai.
+Si `unknown-content-type` persiste, regarder le nom de la classe, la version hôte, les prédicats booléens et le type numérique dans le nouveau schéma. Ne pas attribuer des numéros au hasard. Les métriques Blizzard sont maintenant ignorées volontairement.
 
-Le résultat attendu est une notification de saisie indépendante de celle du chat, ainsi que des notifications pour les deux snaps distincts lorsque ces réceptions sont observables par le mod. L'appel et la reprise de saisie ne doivent pas régresser. Ouvrir une ancienne conversation ne doit pas réannoncer son historique.
-
-## Distinguer les étapes
-
-- `TRANSPORT-REGISTER` indique un récepteur observé, pas la réception d'un chat.
-- `transportSources` compte les callbacks des récepteurs ; `WIRE-UNSUPPORTED` signale un format non décodé, pas nécessairement un paquet corrompu.
-- `RECEIVE` / les raisons de rejet du schéma montrent le résultat de l'adaptateur.
-- `NATIVE-NOTICE-REQUEST` correspond au relais d'une notification interne déjà formée.
-- `NATIVE-NOTICE-ACCEPTED` / `NOTIF-ACCEPTED` signifie qu'iOS a accepté la requête locale, pas que sa bannière a été affichée.
-- `APNS-REGISTERED` signifie qu'un jeton a été obtenu. `apnsDeliveryCallbacks` compte les callbacks dans ce processus, pas toutes les notifications visibles livrées par iOS lorsqu'il est suspendu.
-
-Si un événement manque, exporter après l'essai `snapnotify.log`, `snapnotify_status.json` et `snapnotify_receive_schema.json`, avec les heures et le type de chaque envoi. Garder également `snapnotify.log.1` si la session a été répartie par rotation. Ne pas fournir de mot de passe, jeton APNs complet, profil de signature ni contenu privé de conversation.
-
-## En cas de doublons ou de gêne
-
-Le nouveau repli peut relayer une notification interne non classable par type. Pour isoler son effet, mettre `NativeNotificationBridge=false` dans `Documents/SnapNotifyConfig.plist` et relancer manuellement l'application. Les réceptions structurées restent actives.
-
-Pour isoler un problème audio/batterie, mettre `ExperimentalKeepAlive=false`, en tenant compte du fait que le comportement arrière-plan peut alors changer. Ne pas activer de nouveaux modes d'arrière-plan ou changer de signature au milieu d'un essai comparatif sans le noter.
+Les fichiers de diagnostic sont toujours `snapnotify.log`, `snapnotify_status.json` et `snapnotify_receive_schema.json`. Ne pas envoyer de corps de message, identifiants de connexion ou données de signature.

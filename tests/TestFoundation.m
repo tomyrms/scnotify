@@ -82,7 +82,12 @@ int main(void) {
         SNTestChild *child=[SNTestChild new];[child receive:@"x"];
         CHECK(child.calls==2);CHECK(parentHits==1);CHECK(childHits==1);
         CHECK(!SNInstallHook(SNTestChild.class,@selector(receive:),^(__unused id self,__unused NSArray *a,__unused id r){}));
-        CHECK(!SNInstallHook(SNTestParent.class,@selector(notAnObject:),^(__unused id self,__unused NSArray *a,__unused id r){}));
+        /* rc4 supports the BOOL result used by the observed presenter. Use a
+           separate instance so inheritance/resolver call counts stay exact. */
+        __block NSUInteger booleanHits=0;
+        CHECK(SNInstallHook(SNTestParent.class,@selector(notAnObject:),^(__unused id self,__unused NSArray *a,id r){booleanHits++;CHECK([r boolValue]);}));
+        SNTestParent *booleanParent=[SNTestParent new];
+        CHECK([booleanParent notAnObject:nil]);CHECK(booleanParent.calls==1);CHECK(booleanHits==1);
         CHECK(!SNInstallHook(SNTestParent.class,@selector(init),^(__unused id self,__unused NSArray *a,__unused id r){}));
         CHECK(SNInstallHook(SNTestParent.class,@selector(displayNameForUserId:),^(id self,NSArray *a,id r){
             resolverHits++;CHECK([a.firstObject isEqual:U]);CHECK([r isEqual:@"João 日本語"]);

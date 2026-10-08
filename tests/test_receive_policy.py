@@ -20,6 +20,8 @@ class ReceivePolicyTests(unittest.TestCase):
         cls.lib = c.CDLL(library)
         for name in ('sn_receive_kind', 'sn_receive_hint'):
             f = getattr(cls.lib, name); f.argtypes = [c.c_char_p]; f.restype = c.c_int
+        cls.lib.sn_receive_native_content_kind.argtypes = [c.c_char_p, c.c_char_p, c.c_int64]
+        cls.lib.sn_receive_native_content_kind.restype = c.c_int
         cls.lib.sn_receive_source.argtypes = [c.c_char_p, c.c_char_p]
         cls.lib.sn_receive_source.restype = c.c_int
         cls.lib.sn_receive_seconds.argtypes = [c.c_double]
@@ -30,6 +32,39 @@ class ReceivePolicyTests(unittest.TestCase):
     @classmethod
     def tearDownClass(cls):
         cls.tmp.cleanup()
+
+
+    def test_observed_native_content_type_one(self):
+        # The device diagnostic reports this exact class and raw value 1.
+        self.assertEqual(self.lib.sn_receive_native_content_kind(b'SCNMessagingMessageContent', b'14.17.1', 1), 1)
+
+    def test_native_snap_zero_is_not_missing(self):
+        self.assertEqual(self.lib.sn_receive_native_content_kind(b'SCNMessagingMessageContent', b'14.17.1', 0), 2)
+
+    def test_native_numeric_version_boundary(self):
+        for version in (None, b'', b'14.17.0', b'14.17.10', b'14.18.1', b'15.0.0'):
+            for raw in (0, 1):
+                with self.subTest(version=version, raw=raw):
+                    self.assertEqual(self.lib.sn_receive_native_content_kind(b'SCNMessagingMessageContent', version, raw), 0)
+
+    def test_native_class_boundary(self):
+        for cls in (None, b'', b'Dictionary', b'SCNMessagingMessage', b'SCNMessagingReceiveMessageMetricsResult', b'SCNMessagingMessageContentOther'):
+            self.assertEqual(self.lib.sn_receive_native_content_kind(cls, b'14.17.1', 1), 0)
+
+    def test_native_unknown_numeric_types_not_guessed(self):
+        for raw in (-2**63, -1, 2, 3, 4, 5, 6, 7, 42, 999, 2**63-1):
+            self.assertEqual(self.lib.sn_receive_native_content_kind(b'SCNMessagingMessageContent', b'14.17.1', raw), 0)
+
+    def test_metrics_are_not_message_callbacks(self):
+        for selector in (b'onMessageReceived:', b'onMessagesReceived:'):
+            self.assertEqual(self.lib.sn_receive_source(b'SCNativeBlizzardLoggerDelegateImpl', selector), 0)
+
+    def test_actual_arroyo_callback_stays_snapshot(self):
+        self.assertEqual(self.lib.sn_receive_source(b'SCArroyoConversationDataUpdateAnnouncer', b'onConversationUpdated:conversation:updatedMessages:removedMessages:'), 2)
+
+    def test_numeric_types_remain_unmapped_outside_native_adapter(self):
+        self.assertEqual(self.lib.sn_receive_kind(b'0'), 0)
+        self.assertEqual(self.lib.sn_receive_kind(b'1'), 0)
 
     def test_chat_symbols(self):
         for name in ('CHAT', 'TEXT', 'CHAT_MESSAGE', 'RECEIVED_CHAT_MESSAGE', 'EXTERNAL_MEDIA', 'NOTE', 'STICKER'):

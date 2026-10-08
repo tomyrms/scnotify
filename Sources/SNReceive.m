@@ -58,6 +58,47 @@ NSString *SNCallbackConversation(NSString *selector, NSArray *arguments) {
     }
     return nil;
 }
+static BOOL native14171;
+void SNSetReceiveHostVersion(NSString *version) {
+    @synchronized(SNReceiveTracker.class){native14171=[version isEqualToString:@"14.17.1"];}
+}
+static BOOL nativeMessage(id object) {
+    /* A numeric enum on telemetry or an arbitrary dictionary is NOT a message. */
+    return [NSStringFromClass(object_getClass(object)) isEqualToString:@"SCNMessagingMessage"];
+}
+static SNReceiveKind nativeKind(id object,id content,NSString **via) {
+    if(!nativeMessage(object))return SN_RX_NONE;
+    if(rxTrue(object,@[@"isStatusMessage",@"isSystemConversationRetentionMessage",@"isScreenRecording",@"isErasedSnapStatusMessage",@"isStickerReaction",@"isErased"])){
+        *via=@"host-control-predicate";return SN_RX_CONTROL;
+    }
+    BOOL chat=rxTrue(object,@[@"isTextMessage",@"isChatMediaMessage",@"isVoiceNote",@"isStickerMessage",@"isContentShareMessage",@"isStoryReplyMessage"]);
+    BOOL snap=rxTrue(object,@[@"isSnapMessage",@"isSnap",@"isTinySnapMessage"]);
+    if(chat&&snap){*via=@"conflicting-native-predicates";return SN_RX_NONE;}
+    if(chat||snap){*via=@"host-message-predicate";return snap?SN_RX_SNAP:SN_RX_MESSAGE;}
+    BOOL supported=NO;@synchronized(SNReceiveTracker.class){supported=native14171;}
+    if(!supported||![NSStringFromClass(object_getClass(content)) isEqualToString:@"SCNMessagingMessageContent"])return SN_RX_NONE;
+    id value=SNRead(content,@"contentType"),has=SNRead(content,@"hasContentType");
+    if([has isKindOfClass:NSNumber.class]&&![has boolValue])return SN_RX_NONE;
+    if(![value isKindOfClass:NSNumber.class]||CFGetTypeID((__bridge CFTypeRef)value)==CFBooleanGetTypeID())return SN_RX_NONE;
+    const char *type=[value objCType];if(!type||strchr("fd",type[0]))return SN_RX_NONE;
+    /* The compatibility table covers only SNAP=0 and CHAT=1. Native semantic
+       getters above handle media/notes/stickers without guessing enum numbers. */
+    SNReceiveKind kind=sn_receive_native_content_kind(NSStringFromClass(object_getClass(content)).UTF8String,"14.17.1",[value longLongValue]);
+    if(kind!=SN_RX_NONE)*via=@"native-14.17.1-content-enum";
+    return kind;
+}
+NSString *SNLocalAccountIdentifier(id object) {
+    /* Do not confuse senderId/userId on a message with the local account. */
+    return SNIdentifier(rxFirst(object,@[@"currentUserId",@"loggedInUserId",@"selfUserId"]));
+}
+NSDictionary *SNResolveReceiveDirection(NSDictionary *event,NSString *account,BOOL knownRemote) {
+    NSMutableDictionary *r=[event mutableCopy];
+    if(account.length){r[@"incoming"]=@(![account isEqual:r[@"uid"]]);r[@"directionSource"]=@"local-account";}
+    else if([r[@"incoming"] isKindOfClass:NSNumber.class])r[@"directionSource"]=@"explicit-host-flag";
+    else if(knownRemote){r[@"incoming"]=@YES;r[@"directionSource"]=@"remote-presence";}
+    else r[@"directionSource"]=@"unknown";
+    return [r copy];
+}
 static NSDictionary *typeMappings;
 void SNSetReceiveTypeMappings(NSDictionary *mappings) {
     NSMutableDictionary *clean=[NSMutableDictionary dictionary];
@@ -124,9 +165,10 @@ static NSDictionary *shape(id object) {
     NSMutableDictionary *fields=[NSMutableDictionary dictionary];
     /* Only field availability, class names and numeric enum values. No sender
        identifiers, message bodies, attachment bytes, tokens or descriptions. */
-    for(NSString *key in @[@"conversationId",@"descriptor",@"messageDescriptor",@"messageId",@"senderId",@"messageContent",@"messageType",@"contentType",@"eventType",@"messages",@"message",@"items",@"metadata",@"timestamp"]){
+    for(NSString *key in @[@"conversationId",@"descriptor",@"messageDescriptor",@"messageId",@"senderId",@"messageContent",@"messageType",@"contentType",@"eventType",@"messages",@"message",@"items",@"metadata",@"timestamp",@"createdAt",@"creationTimestamp",@"creationTimestampMs",@"messageCreationTimestamp",@"isSender",@"isIncoming",@"currentUserId",@"isTextMessage",@"isSnapMessage",@"isSnap",@"isStatusMessage",@"isChatMediaMessage",@"isVoiceNote"]){
         id v=SNRead(object,key);if(v&&v!=NSNull.null){
             if(( [key isEqual:@"contentType"]||[key isEqual:@"messageType"]||[key isEqual:@"eventType"])&&[v isKindOfClass:NSNumber.class])fields[key]=@{ @"class":NSStringFromClass(object_getClass(v)),@"enum":v};
+            else if([key hasPrefix:@"is"]&&[v isKindOfClass:NSNumber.class])fields[key]=@([v boolValue]);
             else fields[key]=NSStringFromClass(object_getClass(v));
         }
     }
@@ -168,7 +210,7 @@ static void collect(id obj,NSString *inheritedConversation,NSString *hint,NSMuta
         NSString *conversation=rxConversation(obj) ?: rxConversation(metadata) ?: inheritedConversation;
         id descriptor=rxDescriptor(obj);
         id senderObject=rxFirst(obj,@[@"sender",@"fromUser"]);
-        NSString *sender=SNIdentifier(rxFirst(obj,@[@"senderId",@"senderUserId",@"fromUserId",@"senderID"]))
+        NSString *sender=SNIdentifier(rxFirst(obj,@[@"senderId",@"senderUserId",@"fromUserId",@"senderID",@"snapchatterUserId"]))
             ?: SNIdentifier(rxFirst(metadata,@[@"senderId",@"senderUserId"])) ?: SNIdentifier(rxFirst(descriptor,@[@"senderId",@"senderUserId"])) ?: SNIdentifier(senderObject)
             ?: SNIdentifier(rxFirst(senderObject,@[@"userId",@"userID",@"snapchatUserId"]));
         NSString *eid=SNMessageIdentifier(rxFirst(obj,@[@"messageId",@"messageID",@"serverMessageId",@"snapId",@"snapID",@"clientMessageId"]))
@@ -201,6 +243,14 @@ static void collect(id obj,NSString *inheritedConversation,NSString *hint,NSMuta
             else if([hint isEqual:@"snap"])kind=SN_RX_SNAP;
             else if([hint isEqual:@"message"])kind=SN_RX_MESSAGE;
         }
+        NSString *kindSource=@"structured-type";
+        NSString *nativeSource=nil;SNReceiveKind native=nativeKind(obj,content,&nativeSource);
+        if(native==SN_RX_CONTROL){reject(rejected,@"control-event");return;}
+        if([nativeSource isEqualToString:@"conflicting-native-predicates"]){reject(rejected,nativeSource);return;}
+        if(native!=SN_RX_NONE){
+            if(kind!=SN_RX_NONE&&kind!=native){reject(rejected,@"conflicting-content-type");return;}
+            kind=native;kindSource=nativeSource;
+        }
         BOOL candidate=eid||sender||content||declared||contentDeclared;
         if(!candidate&&shapes.count<8)[shapes addObject:shape(obj)];
         if(candidate) {
@@ -209,16 +259,16 @@ static void collect(id obj,NSString *inheritedConversation,NSString *hint,NSMuta
             else if(!sender)reason=@"missing-sender";
             else if(!conversation)reason=@"missing-conversation";
             else if(!eid)reason=@"missing-message-id";
-            if(reason){reject(rejected,reason);if(shapes.count<8){[shapes addObject:shape(obj)];if(descriptor&&shapes.count<8)[shapes addObject:shape(descriptor)];if(content&&shapes.count<8)[shapes addObject:shape(content)];}}
+            if(reason){reject(rejected,reason);if(shapes.count<8){[shapes addObject:shape(obj)];if(descriptor&&shapes.count<8)[shapes addObject:shape(descriptor)];if(content&&shapes.count<8)[shapes addObject:shape(content)];if(metadata&&shapes.count<8)[shapes addObject:shape(metadata)];}}
             else {
                 NSString *type=kind==SN_RX_SNAP?@"snap":@"message";
                 NSString *key=[@[conversation,sender,eid] componentsJoinedByString:@"|"];
                 if(![eventKeys containsObject:key]) {
-                    NSMutableDictionary *event=[@{@"kind":type,@"uid":sender,@"conversation":conversation,@"event":eid} mutableCopy];
+                    NSMutableDictionary *event=[@{@"kind":type,@"uid":sender,@"conversation":conversation,@"event":eid,@"kindSource":kindSource} mutableCopy];
                     NSDictionary *u=SNUserRecord(senderObject,sender);
                     NSString *name=u[@"name"] ?: SNName(rxFirst(obj,@[@"senderDisplayName",@"senderUsername"]));if(name)event[@"name"]=name;
-                    id ts=rxFirst(metadata,@[@"creationTimestamp",@"createdAt",@"serverTimestamp",@"timestamp"])
-                        ?: rxFirst(obj,@[@"creationTimestamp",@"createdAt",@"sentAt",@"serverTimestamp",@"timestamp"]);
+                    id ts=rxFirst(metadata,@[@"creationTimestamp",@"creationTimestampMs",@"messageCreationTimestamp",@"createdAt",@"createdAtMs",@"serverTimestamp",@"serverTimestampMs",@"timestamp"])
+                        ?: rxFirst(obj,@[@"creationTimestamp",@"creationTimestampMs",@"messageCreationTimestamp",@"createdAt",@"createdAtMs",@"sentAt",@"serverTimestamp",@"timestamp"]);
                     if([ts isKindOfClass:NSDate.class])event[@"timestamp"]=@([ts timeIntervalSince1970]);
                     else if([ts isKindOfClass:NSNumber.class]){
                         double seconds=sn_receive_seconds([ts doubleValue]);
@@ -228,6 +278,20 @@ static void collect(id obj,NSString *inheritedConversation,NSString *hint,NSMuta
                     id hasOutgoing=SNRead(obj,@"hasIsOutgoing") ?: SNRead(metadata,@"hasIsOutgoing");
                     if([hasOutgoing isKindOfClass:NSNumber.class]&&![hasOutgoing boolValue])outgoing=nil;
                     if(rxTrue(obj,@[@"isIncoming"])||rxTrue(metadata,@[@"isIncoming"])||([outgoing isKindOfClass:NSNumber.class]&&![outgoing boolValue]))event[@"incoming"]=@YES;
+                    id isSender=SNRead(obj,@"isSender") ?: SNRead(metadata,@"isSender");
+                    id hasSender=SNRead(obj,@"hasIsSender") ?: SNRead(metadata,@"hasIsSender");
+                    if([hasSender isKindOfClass:NSNumber.class]&&![hasSender boolValue])isSender=nil;
+                    if([isSender isKindOfClass:NSNumber.class]){
+                        if([isSender boolValue]){reject(rejected,@"outgoing");return;}
+                        event[@"incoming"]=@YES;
+                    }
+                    /* A decoded type can still fail the snapshot date or
+                       direction gate. Keep only field/selector metadata for
+                       that diagnosis, never the timestamp, IDs or body. */
+                    if((!event[@"timestamp"]||!event[@"incoming"])&&shapes.count<8){
+                        [shapes addObject:shape(obj)];
+                        if(metadata&&shapes.count<8)[shapes addObject:shape(metadata)];
+                    }
                     [eventKeys addObject:key];[out addObject:[event copy]];
                 }
             }
@@ -250,6 +314,20 @@ NSDictionary *SNDecodeReceived(NSArray *arguments,NSString *conversation,NSStrin
     NSMutableDictionary *detached=[NSMutableDictionary dictionary];
     for(NSString *cid in identities)detached[cid]=[identities[cid] allObjects];
     return @{@"events":[events copy],@"rejected":[rejected copy],@"shapes":[shapes copy],@"identities":[detached copy]};
+}
+NSDictionary *SNDecodeReceiveCallback(NSString *className,NSString *selector,NSArray *arguments) {
+    NSString *cid=SNCallbackConversation(selector,arguments);NSArray *payloads=arguments;
+    if([className isEqualToString:@"SCArroyoConversationDataUpdateAnnouncer"]&&
+       [selector isEqualToString:@"onConversationUpdated:conversation:updatedMessages:removedMessages:"]) {
+        if(arguments.count!=4)return @{@"events":@[],@"identities":@{},@"shapes":@[],@"rejected":@{@"callback-arity":@1}};
+        cid=SNIdentifier(arguments[0]) ?: cid;
+        /* arg 1 is a whole conversation; arg 3 contains deletions. Only the
+           actual updatedMessages collection is a candidate for reception. */
+        payloads=@[arguments[2]];
+    }
+    SNReceiveKind kind=sn_receive_hint(selector.UTF8String);
+    NSDictionary *batch=SNDecodeReceived(payloads,cid,kind==SN_RX_SNAP?@"snap":kind==SN_RX_MESSAGE?@"message":nil);
+    return batch;
 }
 NSArray<NSDictionary *> *SNReceivedRecords(id obj,NSString *hint) {
     return SNDecodeReceived(obj?@[obj]:@[],nil,hint)[@"events"];
@@ -295,7 +373,15 @@ NSArray<NSDictionary *> *SNReceivedRecords(id obj,NSString *hint) {
             if(!known&&seen.count<2048)[seen addObject:key];
             if((!known&&(!initial||firstLive))||newlyDecoded) {
                 double start=firstLive?self.monitoringStart:[state[@"start"] doubleValue]-1;
-                if(fresh&&ts.doubleValue>=start)[out addObject:e];
+                if(fresh&&ts.doubleValue>=start){
+                    if([e[@"directionSource"] isEqualToString:@"unknown"]){if(waiting.count<256)waiting[key]=@(fmin(wall,ts.doubleValue));continue;}
+                    if(!e[@"incoming"]||[e[@"incoming"] boolValue])[out addObject:e];
+                }
+            }
+            /* A first live batch with unresolved direction is retained until
+               a later observation supplies evidence, not treated as history. */
+            if(initial&&self.monitoringStart>0&&fresh&&ts.doubleValue>=self.monitoringStart&&[e[@"directionSource"] isEqualToString:@"unknown"]){
+                if(waiting.count<256)waiting[key]=@(fmin(wall,ts.doubleValue));continue;
             }
             [waiting removeObjectForKey:key];
         }

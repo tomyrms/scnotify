@@ -1,63 +1,37 @@
-# SnapNotify 4.0.0-rc3 — réception et notifications internes
+# SnapNotify 4.0.0-rc4 — correctif ciblé du récepteur natif
 
-Correctif pour ta propre installation de Snapchat. Base : `tomyrms/scnotify`, commit `d718a6b4de438362453f8b3467d9d41d3618cc91`. Les appels et la machine à états de présence ne sont pas réécrits.
+**Sources à compiler, sans IPA ni `.dylib` précompilée.** Les tests C/Python ont été exécutés ici. Les nouveaux tests Foundation et la compilation iOS rc4 n'ont pas pu être lancés dans cette session ; ils doivent réussir sur le runner Mac avant installation. Ne pas utiliser un résultat de CI rc3 pour valider rc4.
 
-**Cette version a été compilée pour iOS arm64 et testée sur le runner macOS. Elle n'a pas été installée ni testée sur un iPhone pendant sa préparation.** Le retour utilisateur « appels et saisie fonctionnent » concerne la version précédente, pas rc3.
+## Pourquoi cette correction
 
-## Utiliser la bibliothèque déjà compilée
+Les trois diagnostics rc3 fournis montrent le vrai récepteur `SCArroyoConversationDataUpdateAnnouncer/onConversationUpdated:conversation:updatedMessages:removedMessages:` appelé 15 fois, mais zéro événement décodé : `unknown-content-type`. Son objet `SCNMessagingMessage` contient un `SCNMessagingMessageContent.contentType` numérique (`1` dans la dernière forme exportée), pas un enum symbolique GPB. Les rejets apparaissent aussi en arrière-plan. Cela confirme un blocage du décodeur ; ce n'est pas la preuve que chacun des callbacks représente un nouveau message différent.
 
-[Artefact SnapNotify-rc3-validated](https://github.com/tomyrms/scnotify/actions/runs/37843432418/artifacts/11578248481) — [exécution CI et journaux](https://github.com/tomyrms/scnotify/actions/runs/37843432418). Une connexion GitHub peut être demandée. La conservation configurée est de 14 jours ; ensuite, reconstruire depuis les sources de ce ZIP.
+Le correctif utilise d'abord les prédicats natifs du message (`isTextMessage`, `isChatMediaMessage`, etc.). Le repli numérique `0 → snap`, `1 → chat` est strictement limité au modèle `SCNMessagingMessage` / `SCNMessagingMessageContent` et à Snapchat **14.17.1**, la version du journal. La valeur d'un enum arbitraire ne déclenche jamais une notification. Cette correspondance limitée est corroborée par une source publique rétro-conçue, mais son fonctionnement sur ton appareil doit encore être vérifié.
 
-Avec GitHub CLI connecté à ton compte :
+## Changements
 
-```sh
-gh run download 37843432418 --repo tomyrms/scnotify --name SnapNotify-rc3-validated --dir rc3-artifact
-```
+- Traitement distinct des messages mis à jour, de l'historique complet et des éléments supprimés dans le callback Arroyo à quatre arguments.
+- Exclusion du récepteur analytique `SCNativeBlizzardLoggerDelegateImpl` : ses objets de métriques ne sont pas des messages.
+- Lecture de `SCNMessagingUUID.toString`, des métadonnées de création et du sens entrant. Le sens peut provenir du compte local, d'un indicateur explicite de l'hôte ou du même participant distant déjà identifié dans la même conversation.
+- Prise en charge des retours booléens `B` et `c` des hooks, notamment le présentateur de notifications refusé par rc3. La valeur originale de retour est préservée.
+- Diagnostics des filtres de date/direction et de la connaissance du compte local, sans contenu de message exporté.
 
-La bibliothèque se trouve dans `out/SnapNotify.dylib` dans l'artefact. Sa somme de contrôle se trouve dans `out/SHA256SUMS.txt`. `out/SOURCE_HASHES.json` décrit les fichiers exacts utilisés pour les tests et la compilation. Ces 26 empreintes ont été comparées avec les sources de cette archive : elles correspondent toutes.
+Les chemins des appels, de la saisie/entrouverture et de l'audio expérimental sont conservés. Aucun entitlement APNs, BGTask, faux réveil ou polling n'est ajouté. L'option `ExperimentalKeepAlive` existante reste inchangée et ne constitue pas une garantie d'exécution permanente.
 
-Ce ZIP contient les **sources**, pas un IPA signé ni une copie du binaire GitHub. La branche `chatgpt/rc3-notification-validation` est une branche technique de validation : son workflow applique un patch vérifié avant de compiler. Ne pas prendre les fichiers non patchés de cette branche pour les sources rc3 ; utiliser cette archive complète. `main` n'a pas été modifiée par cette livraison.
+## Compiler puis installer
 
-## Installer
+1. Copier **tous les fichiers** de ce projet dans le dépôt, y compris `Sources`, `Core`, `tests`, `scripts` et `.github`. Ne pas copier uniquement `Tweak.m`.
+2. Lancer le workflow **SnapNotify tests and build**. Attendre la réussite des tests portables, des **quatre** programmes Foundation et de la compilation iOS arm64.
+3. Récupérer l'artefact **SnapNotify-v4-dylib** de cette nouvelle exécution, et non celui de rc3. Il contient `SnapNotify.dylib` et `SHA256SUMS.txt`.
+4. Remplacer l'ancienne bibliothèque dans le processus d'injection/signature habituel et réinstaller. Ne pas empiler deux versions du tweak. Les réglages existants dans `Documents/SnapNotifyConfig.plist` restent prioritaires.
+5. Ouvrir Snapchat et vérifier `READY version=4.0.0-rc4 host=14.17.1` dans le journal.
 
-Remplacer l'ancienne `SnapNotify.dylib` dans le processus d'injection/signature habituel, sans empiler deux versions. L'IPA Snapchat original n'étant pas fourni dans cette demande, aucun IPA n'a été reconditionné ici. Conserver les extensions et les réglages de signature existants ; aucun ajout automatique de droit APNs ou de tâche BGTaskScheduler n'est effectué.
+Sur un Mac avec Xcode : `make test`, `make test-macos`, puis `make`. Le Makefile garde aussi le chemin Theos existant.
 
-Ouvrir l'application et vérifier `READY version=4.0.0-rc3` dans `snapnotify.log`. Les anciens paramètres de `Documents/SnapNotifyConfig.plist` restent prioritaires. L'exemple fourni n'est pas une instruction d'écraser une configuration existante.
+## Vérification sur l'appareil
 
-## Ce qui change
+Ouvrir une fois le chat avec le compte de test, puis laisser Snapchat en arrière-plan sans fermer sa carte. Envoyer un chat après la saisie, puis deux snaps distincts. Les compteurs `decodedMessages` / `decodedSnaps` doivent progresser et le journal doit montrer `NOTIF-ACCEPTED type=message` / `type=snap`. L'acceptation de la requête par iOS ne prouve pas, à elle seule, qu'une bannière a été vue.
 
-Le récepteur observe les objets réellement enregistrés avec `registerHandler:handler:queue:`, ainsi que les récepteurs Hermod/sync déjà identifiés dans les anciens logs. Un nom de canal ne devient pas une notification : seules les données structurées reconnues sont traitées. Les paquets opaques restent diagnostiqués.
+Les trois fichiers de diagnostic restent `snapnotify.log`, `snapnotify_status.json` et `snapnotify_receive_schema.json`. Les motifs après décodage sont maintenant visibles, notamment `snapshot-missing-time` ou `snapshot-direction-unknown` : aucun horodatage ou expéditeur n'est inventé pour contourner ces contrôles.
 
-Un pont de notifications internes récupère le texte déjà préparé par Snapchat sur des chemins explicites de présentation. Il ne nécessite pas un UUID de conversation et un identifiant de message quand l'hôte a déjà construit un titre et un corps de notification. Le callback original reste appelé ; la branche de notification système n'est pas interceptée comme une nouvelle réception.
-
-Le premier lot d'une conversation peut désormais notifier un message **entrant, daté et créé après le début de l'observation**. Un nouveau message apparu après la référence initiale peut aussi être notifié lorsqu'il devient décodable. L'ancien historique reste silencieux. Les champs d'enum optionnels absents ne sont plus confondus avec une valeur numérique inconnue.
-
-Détails : [changements](docs/CHANGEMENTS_RC3.md), [vérification du document DeepSeek](docs/VERIFICATION_DEEPSEEK_FR.md), [tests effectués](docs/TESTS_EFFECTUES.md), [essai iPhone](docs/VALIDATION_IPHONE.md).
-
-## Réglages
-
-`NativeNotificationBridge=true` active le nouveau relais de notifications internes. Il reprend du texte de notification déjà fourni par l'hôte ; cela peut inclure un aperçu de message. Le contenu n'est pas écrit dans les journaux SnapNotify, mais il peut être affiché par iOS selon les réglages d'aperçu de l'utilisateur.
-
-Ce relais de secours n'est pas une classification chat/snap : une notification interne dépourvue de type ne permet pas une sélection fine par catégorie. Il est désactivé lorsque les notifications de messages **et** de snaps sont désactivées. Pour exclure entièrement cette voie, définir `NativeNotificationBridge=false`.
-
-`ExperimentalKeepAlive=true` reste la valeur par défaut de la base utilisée. Il s'agit du mécanisme existant, pas d'une garantie de fonctionnement après suspension/fermeture forcée. En cas de gêne audio ou d'autonomie, mettre cette option à `false`. [Limites d'exécution iOS](https://developer.apple.com/forums/thread/685525).
-
-## Reconstruire
-
-Sur un Mac équipé de Xcode :
-
-```sh
-make test
-make test-macos
-make
-```
-
-Le Makefile prend également en charge Theos. Sur GitHub, remplacer **tout le projet**, notamment `Sources`, `Core`, `scripts`, `tests` et `.github`, puis lancer le workflow `SnapNotify tests and build`. L'artefact de ce workflow normal reste nommé `SnapNotify-v4-dylib`.
-
-## Limites connues
-
-L'analyse statique des IPA WhatsApp rapportée par DeepSeek n'a pas été reproduite : les IPA/profils originaux ne sont pas joints. Les derniers logs de l'appareil fournis sont ceux de v3 ; ils ne montrent pas un essai de réception rc3. Les adaptateurs restent dépendants des objets exposés par la version de Snapchat installée.
-
-Le relais interne ne peut pas inventer une notification que Snapchat ne construit jamais, ni décoder un paquet chiffré opaque. Sans identifiant partagé entre deux chemins, une déduplication parfaite entre notification interne et réception structurée n'est pas garantie. Deux notifications internes identiques sans identifiant dans une seconde peuvent être regroupées. Les protections de volume restent bornées (notamment 2 048 identifiants retenus par conversation dans le suivi des instantanés).
-
-Les rapports de versions précédentes restent dans `docs/history/rc2/` ; leurs résultats et limitations ne sont pas le rapport de validation rc3.
+Détails : [correctif et limites](docs/CORRECTION_RC4.md), [tests réellement exécutés](docs/TESTS_EFFECTUES.md), [sources](docs/SOURCES_RC4.md). Les documents sous `docs/history` décrivent les anciennes versions, pas cette livraison.

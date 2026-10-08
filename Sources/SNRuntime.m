@@ -62,7 +62,7 @@ static NSString *identifierDepth(id value, unsigned depth) {
     else if ([value isKindOfClass:NSData.class] && [value length]==16) {
         s=[[[NSUUID alloc] initWithUUIDBytes:[value bytes]] UUIDString];
     } else {
-        for(NSString *key in @[@"UUIDString",@"uuidString",@"stringValue",@"uuid",@"value",@"id"]) {
+        for(NSString *key in @[@"UUIDString",@"uuidString",@"stringValue",@"toString",@"uuid",@"value",@"id"]) {
             id child=SNRead(value,key);if([key isEqual:@"id"] && ![child isKindOfClass:NSData.class] && ![child isKindOfClass:NSUUID.class])continue;if(child && child!=value){NSString *u=identifierDepth(child,depth+1);if(u)return u;}
         }
     }
@@ -202,8 +202,9 @@ BOOL SNInstallHook(Class cls, SEL sel, SNHookObserver observer) {
         unsigned argc=method_getNumberOfArguments(m);if(argc<2||argc>6)return NO;argc-=2;
         char *ret=method_copyReturnType(m);const char *r=unqualified(ret);
         BOOL isVoid=r&&r[0]=='v'&&r[1]==0;
-        BOOL isObject=r&&r[0]=='@'&&r[1]!='?';free(ret);
-        if(!isVoid&&!isObject)return NO;
+        BOOL isObject=r&&r[0]=='@'&&r[1]!='?';
+        char booleanType=(r&&r[1]==0&&(r[0]=='B'||r[0]=='c'))?r[0]:0;free(ret);
+        if(!isVoid&&!isObject&&!booleanType)return NO;
         for(unsigned i=0;i<argc;i++) {
             char *raw=method_copyArgumentType(m,i+2);const char *t=unqualified(raw);
             BOOL ok=t&&t[0]=='@';free(raw);if(!ok)return NO;
@@ -216,6 +217,16 @@ BOOL SNInstallHook(Class cls, SEL sel, SNHookObserver observer) {
             else if(argc==2) replacement=imp_implementationWithBlock(^(id self,id a,id b){((void(*)(id,SEL,id,id))original)(self,sel,a,b);SNInspect(^{observe(self,@[a?:NSNull.null,b?:NSNull.null],nil);});});
             else if(argc==3) replacement=imp_implementationWithBlock(^(id self,id a,id b,id c){((void(*)(id,SEL,id,id,id))original)(self,sel,a,b,c);SNInspect(^{observe(self,@[a?:NSNull.null,b?:NSNull.null,c?:NSNull.null],nil);});});
             else if(argc==4) replacement=imp_implementationWithBlock(^(id self,id a,id b,id c,id d){((void(*)(id,SEL,id,id,id,id))original)(self,sel,a,b,c,d);SNInspect(^{observe(self,@[a?:NSNull.null,b?:NSNull.null,c?:NSNull.null,d?:NSNull.null],nil);});});
+        } else if(booleanType) {
+            /* B is C _Bool; c is signed char (BOOL on some runtimes). Keep
+               the original ABI and return value, including NO. No void cast. */
+#define SN_BOOL_WRAPPERS(T) \
+            if(argc==0) replacement=imp_implementationWithBlock(^T(id self){T v=((T(*)(id,SEL))original)(self,sel);SNInspect(^{observe(self,@[],@(v));});return v;}); \
+            else if(argc==1) replacement=imp_implementationWithBlock(^T(id self,id a){T v=((T(*)(id,SEL,id))original)(self,sel,a);SNInspect(^{observe(self,@[a?:NSNull.null],@(v));});return v;}); \
+            else if(argc==2) replacement=imp_implementationWithBlock(^T(id self,id a,id b){T v=((T(*)(id,SEL,id,id))original)(self,sel,a,b);SNInspect(^{observe(self,@[a?:NSNull.null,b?:NSNull.null],@(v));});return v;}); \
+            else return NO;
+            if(booleanType=='B'){SN_BOOL_WRAPPERS(_Bool)}else{SN_BOOL_WRAPPERS(signed char)}
+#undef SN_BOOL_WRAPPERS
         } else {
             if(argc==0) replacement=imp_implementationWithBlock(^id(id self){id v=((id(*)(id,SEL))original)(self,sel);SNInspect(^{observe(self,@[],v);});return v;});
             else if(argc==1) replacement=imp_implementationWithBlock(^id(id self,id a){id v=((id(*)(id,SEL,id))original)(self,sel,a);SNInspect(^{observe(self,@[a?:NSNull.null],v);});return v;});

@@ -37,6 +37,7 @@ static bool component(const char *selector, char out[128]) {
 }
 SNReceiveSource sn_receive_source(const char *cls,const char *selector) {
     if(!cls||!selector)return SN_SOURCE_NONE;
+    if(!strcmp(cls,"SCNativeBlizzardLoggerDelegateImpl"))return SN_SOURCE_NONE;
     /* App classes only, never Foundation/UIKit notification plumbing. */
     if(strncmp(cls,"SC",2)&&strncmp(cls,"SOJU",4))return SN_SOURCE_NONE;
     const char *const contextual[]={"conversation:didReceiveMessage:","conversation:didReceiveMessages:","conversationId:didReceiveMessage:","conversationId:didReceiveMessages:",NULL};
@@ -69,4 +70,14 @@ double sn_receive_seconds(double t) {
 }
 bool sn_receive_time_valid(double t,double now) {
     return isfinite(t)&&isfinite(now)&&t>0&&now>0&&now-t<=300&&t-now<=60;
+}
+
+SNReceiveKind sn_receive_native_content_kind(const char *cls,const char *version,int64_t raw) {
+    if(!cls||!version||strcmp(cls,"SCNMessagingMessageContent")||strcmp(version,"14.17.1"))return SN_RX_NONE;
+    /* Public content enum reference: SNAP=0, CHAT=1 (see SOURCES_RC4.md).
+       Other numeric types are intentionally NOT enabled by this compatibility
+       path; their native semantic predicates can still recognize them. */
+    if(raw==0)return SN_RX_SNAP;
+    if(raw==1)return SN_RX_MESSAGE;
+    return SN_RX_NONE;
 }

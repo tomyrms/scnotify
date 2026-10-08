@@ -1,4 +1,4 @@
-// SnapNotify 4.0.0-rc3 — explicit event adapters, not notifications from hook names.
+// SnapNotify 4.0.0-rc4 — explicit event adapters, not notifications from hook names.
 #import <Foundation/Foundation.h>
 #import <UIKit/UIKit.h>
 #import <UserNotifications/UserNotifications.h>
@@ -13,7 +13,7 @@
 #include <stdarg.h>
 #include <math.h>
 
-static NSString * const SNVersion=@"4.0.0-rc3";
+static NSString * const SNVersion=@"4.0.0-rc4";
 static dispatch_queue_t worker, logQueue;
 static NSMutableDictionary *users, *presence, *pendingEvents, *issuedRequests;
 static NSDictionary *config;
@@ -114,7 +114,7 @@ static void loadConfig(void) {
     for(id key in defaults[@"Aliases"]){if(aliases.count>=2048)break;NSString *uid=SNIdentifier(key),*name=SNName(defaults[@"Aliases"][key]);if(uid&&name)aliases[uid]=name;}
     defaults[@"Aliases"]=[aliases copy];
     if([defaults[@"TypingInactiveStates"] count]>256)defaults[@"TypingInactiveStates"]=@[];
-    config=[defaults copy];SNSetReceiveTypeMappings(config[@"ReceiveTypeMappings"]);atomic_store(&experiments,enabled(@"Enabled")&&enabled(@"ExperimentalKeepAlive"));
+    config=[defaults copy];SNSetReceiveTypeMappings(config[@"ReceiveTypeMappings"]);SNSetReceiveHostVersion(NSBundle.mainBundle.infoDictionary[@"CFBundleShortVersionString"]?:@"");atomic_store(&experiments,enabled(@"Enabled")&&enabled(@"ExperimentalKeepAlive"));
 }
 static NSString *cachePath(void) {return [support stringByAppendingPathComponent:@"identities-v4.plist"];}
 static void saveCache(void) {
@@ -362,10 +362,15 @@ static void consumeReceiveBatch(NSDictionary *batch,NSString *source,SNReceiveSo
     if(mode==SN_SOURCE_SNAPSHOT){
         NSMutableArray *directional=[NSMutableArray array];
         for(NSDictionary *record in decoded){
-            NSMutableDictionary *r=[record mutableCopy];
-            if(account.length&&![account isEqual:r[@"uid"]])r[@"incoming"]=@YES;
-            if(account.length&&[account isEqual:r[@"uid"]])r[@"incoming"]=@NO;
-            [directional addObject:[r copy]];
+            /* Remote typing/peeking participants are independently identified
+               as remote by Snapchat. Use the same conversation + sender, not
+               mere temporal proximity or somebody else's presence event. */
+            NSString *typing=[@[@"typing",record[@"conversation"],record[@"uid"]] componentsJoinedByString:@"|"];
+            NSString *peeking=[@[@"peek",record[@"conversation"],record[@"uid"]] componentsJoinedByString:@"|"];
+            NSDictionary *r=SNResolveReceiveDirection(record,account,presence[typing]!=nil||presence[peeking]!=nil);
+            if(!r[@"timestamp"])reasons[@"snapshot-missing-time"]=@([reasons[@"snapshot-missing-time"] unsignedIntegerValue]+1);
+            if(!r[@"incoming"])reasons[@"snapshot-direction-unknown"]=@([reasons[@"snapshot-direction-unknown"] unsignedIntegerValue]+1);
+            [directional addObject:r];
         }
         NSMutableDictionary *snapshot=[batch mutableCopy];snapshot[@"events"]=directional;
         eligible=[receiveTracker newEventsInBatch:snapshot wallTime:NSDate.date.timeIntervalSince1970];
@@ -381,7 +386,7 @@ static void consumeReceiveBatch(NSDictionary *batch,NSString *source,SNReceiveSo
     double now=nowTime();
     if(events.count||now-[metrics[@"lastLog"] doubleValue]>=10){
         metrics[@"lastLog"]=@(now);
-        logLine(@"RECEIVE source=%@ mode=%@ decoded=%lu eligible=%lu rejected=%@",source,mode==SN_SOURCE_SNAPSHOT?@"snapshot":@"live",(unsigned long)decoded.count,(unsigned long)events.count,batch[@"rejected"]);
+        logLine(@"RECEIVE source=%@ mode=%@ decoded=%lu eligible=%lu rejectedTotal=%@",source,mode==SN_SOURCE_SNAPSHOT?@"snapshot":@"live",(unsigned long)decoded.count,(unsigned long)events.count,reasons);
     }
     consumeReceived(events);
 }
@@ -389,10 +394,7 @@ static void observeReceived(NSString *className,NSString *selector,NSArray *argu
     if(atomic_fetch_add(&receiveInflight,1)>=64){atomic_fetch_sub(&receiveInflight,1);atomic_fetch_add(&receiveDrops,1);return;}
     @try {
         BOOL foreground=atomic_load(&appState)==UIApplicationStateActive;
-        NSString *cid=SNCallbackConversation(selector,arguments);
-        SNReceiveKind kind=sn_receive_hint(selector.UTF8String);
-        NSString *hint=kind==SN_RX_SNAP?@"snap":kind==SN_RX_MESSAGE?@"message":nil;
-        NSDictionary *batch=SNDecodeReceived(arguments,cid,hint);
+        NSDictionary *batch=SNDecodeReceiveCallback(className,selector,arguments);
         NSString *source=[NSString stringWithFormat:@"%@/%@",className,selector];
         dispatch_async(worker,^{
             @try{@autoreleasepool{consumeReceiveBatch(batch,source,mode,foreground);}}
@@ -590,12 +592,15 @@ static void scan(void) {
             });
             if(userModel&&[identityFields containsObject:name])attach(cls,name,^(id self,NSArray *args,id result){(void)args;(void)result;NSDictionary *u=SNUserRecord(self,nil);if(u)dispatch_async(worker,^{remember(@[u]);});});
             if([@[@"currentUserId",@"loggedInUserId"] containsObject:name])attach(cls,name,^(id self,NSArray *args,id result){(void)self;(void)args;NSString *uid=SNIdentifier(result);if(uid)dispatch_async(worker,^{setAccount(uid);});});
+            if([cn isEqualToString:@"SCMessageChatViewModel"]&&[@[@"message",@"setMessage:",@"senderId",@"isOutgoing",@"isFromMe"] containsObject:name])
+                attach(cls,name,^(id self,__unused NSArray *args,__unused id result){NSString *local=SNLocalAccountIdentifier(self);if(local)dispatch_async(worker,^{setAccount(local);});});
             SNReceiveSource mode=sn_receive_source(cn.UTF8String,name.UTF8String);
             if(mode!=SN_SOURCE_NONE){
                 NSString *key=[NSString stringWithFormat:@"%@/%@",cn,name];
                 if(!inventory[key]&&inventory.count<512){
                     BOOL installed=attach(cls,name,^(id self,NSArray *args,id result){
-                        (void)self;(void)result;
+                        (void)result;
+                        NSString *local=SNLocalAccountIdentifier(self);if(local)dispatch_async(worker,^{setAccount(local);});
                         if([name hasPrefix:@"presentInAppNotification"]&&args.count)observeHostNotice(args.firstObject);
                         else observeReceived(cn,name,args,mode);
                     });
@@ -620,7 +625,7 @@ static void writeStatus(void) {
         [issuedRequests removeObjectForKey:oldest];
     }
     for(NSString *key in [pendingEvents allKeys])if(now-[pendingEvents[key][@"created"] doubleValue]>15){sn_ledger_cancel(&ledger,[pendingEvents[key][@"ticket"] unsignedLongLongValue]);[pendingEvents removeObjectForKey:key];}
-    NSDictionary *status=@{@"version":SNVersion,@"state":stateLabel(),@"knownUsers":@(users.count),@"nameHits":@(nameHits),@"nameMisses":@(nameMisses),@"wirePackets":@(wireCount),@"unsupportedWirePackets":@(malformedCount),@"packetDrops":@(atomic_load(&packetDrops)),@"notificationRequestsAccepted":@(postedCount),@"secondsSinceWire":lastWire?@(now-lastWire):@(-1),@"apnsRegisteredThisRun":@(nativePushRegistered),@"apnsDeliveryCallbacks":@(apnsCallbacks),@"nativeNoticeCandidates":@(nativeNoticeCandidates),@"nativeNoticesAccepted":@(nativeNoticeAccepted),@"experimentalKeepAlive":@(atomic_load(&experiments)),@"onDeviceValidationRequired":@YES,@"receiveCallbacks":@(receivedCallbacks),@"decodedMessages":@(decodedMessages),@"decodedSnaps":@(decodedSnaps),@"snapshotRecordsSuppressed":@(snapshotSuppressed),@"receiveQueueDrops":@(atomic_load(&receiveDrops))};
+    NSDictionary *status=@{@"version":SNVersion,@"state":stateLabel(),@"knownUsers":@(users.count),@"nameHits":@(nameHits),@"nameMisses":@(nameMisses),@"wirePackets":@(wireCount),@"unsupportedWirePackets":@(malformedCount),@"packetDrops":@(atomic_load(&packetDrops)),@"notificationRequestsAccepted":@(postedCount),@"secondsSinceWire":lastWire?@(now-lastWire):@(-1),@"apnsRegisteredThisRun":@(nativePushRegistered),@"apnsDeliveryCallbacks":@(apnsCallbacks),@"nativeNoticeCandidates":@(nativeNoticeCandidates),@"nativeNoticesAccepted":@(nativeNoticeAccepted),@"experimentalKeepAlive":@(atomic_load(&experiments)),@"onDeviceValidationRequired":@YES,@"receiveCallbacks":@(receivedCallbacks),@"decodedMessages":@(decodedMessages),@"decodedSnaps":@(decodedSnaps),@"snapshotRecordsSuppressed":@(snapshotSuppressed),@"receiveQueueDrops":@(atomic_load(&receiveDrops)),@"localAccountKnown":@(account.length>0)};
     NSData *json=[NSJSONSerialization dataWithJSONObject:status options:NSJSONWritingPrettyPrinted error:NULL];
     [json writeToFile:[documents stringByAppendingPathComponent:@"snapnotify_status.json"] options:NSDataWritingAtomic|NSDataWritingFileProtectionCompleteUntilFirstUserAuthentication error:NULL];
     NSDictionary *schema=@{@"version":SNVersion,@"hooks":receiveHooks?:@[],@"sources":[receiveSources copy],@"containsMessageBodies":@NO,@"transportSources":[transportSources copy]};
