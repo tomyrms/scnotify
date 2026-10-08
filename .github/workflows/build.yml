@@ -37,8 +37,9 @@ jobs:
       - name: Collect artifacts
         run: |
           mkdir -p out
-          find .theos -name '*.dylib' -print -exec cp {} out/ \;
+          find .theos -name '*.dylib' -not -path '*dSYM*' -print -exec cp {} out/ \;
           ls -la out
+          file out/*.dylib
 
       - name: Upload dylib
         uses: actions/upload-artifact@v4
