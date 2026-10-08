@@ -181,10 +181,9 @@ static NSString *eventKey(NSDictionary *event) {
 static NSString *bodyFor(NSDictionary *event,NSString *name) {
     NSString *who=name ?: [NSString stringWithFormat:@"Contact %@",shortID(event[@"uid"])];
     NSString *kind=event[@"kind"];
-    /* The presence callback also covers composing a voice note. Its raw
-       numeric state is not a verified text/voice discriminator, so use a
-       truthful shared label until a distinct semantic signal is available. */
-    if([kind isEqual:@"typing"])return [who stringByAppendingString:@" prépare un message…"];
+    /* Label requested by the user. The raw numeric presence state is not a
+       verified text/voice discriminator, so it also shows while typing text. */
+    if([kind isEqual:@"typing"])return [who stringByAppendingString:@" est en train de faire un vocal…"];
     if([kind isEqual:@"peek"])return [who stringByAppendingString:@" entrouvre la conversation"];
     if([kind isEqual:@"snap"])return [who stringByAppendingString:@" t’a envoyé un snap"];
     if([kind isEqual:@"message"]){
