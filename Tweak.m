@@ -191,6 +191,7 @@ static void sck_hook_all(Class c) {
     if (!ms) return;
     for (unsigned j = 0; j < mc; j++) {
         const char *sn = sel_getName(method_getName(ms[j]));
+        if (strcmp(sn, "dealloc") == 0 || strcmp(sn, ".cxx_destruct") == 0 || strcmp(sn, ".cxx_construct") == 0 || strcmp(sn, "initialize") == 0) continue;
         int colons = 0;
         for (const char *p = sn; *p; p++) if (*p == ':') colons++;
         if (colons > 3) continue;
@@ -233,7 +234,8 @@ static void sck_scan(void) {
             Class c = list[i];
             if (c == nil) continue;
             const char *cn = class_getName(c);
-            if (cn && (strstr(cn, "Typing") || strstr(cn, "CallState") || strstr(cn, "CallObserver") || strstr(cn, "CallLauncher") || strstr(cn, "SCCallLogSyncer"))) {
+            BOOL isSnapClass = cn && (strncmp(cn, "SC", 2) == 0 || strstr(cn, "Snapchat") != NULL);
+            if (isSnapClass && (strstr(cn, "Typing") || strstr(cn, "CallState") || strstr(cn, "CallLauncher") || strstr(cn, "SCCallLogSyncer"))) {
                 sck_hook_all(c);
                 continue;
             }
@@ -280,7 +282,7 @@ static void sck_setup(void) {
         sck_scan();
         sck_ensure_audio();
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 2 * NSEC_PER_SEC), dispatch_get_main_queue(), ^{
-            sck_notify(@"boot", [NSString stringWithFormat:@"SnapNotify v1.2 loaded (%lu hooks)", (unsigned long)gOrig.count]);
+            sck_notify(@"boot", [NSString stringWithFormat:@"SnapNotify v1.3 loaded (%lu hooks)", (unsigned long)gOrig.count]);
         });
     }];
     gTimer = [NSTimer scheduledTimerWithTimeInterval:20.0 repeats:YES block:^(NSTimer *t) { sck_ensure_audio(); }];
