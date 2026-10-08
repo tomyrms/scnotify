@@ -1,6 +1,5 @@
-// SnapNotify v1 — keep-alive + local notification bridge for Snapchat (diagnostic)
-// Pure ObjC runtime swizzling (no substrate/Logos needed).
-// Writes log to <app docs>/snapnotify.log and posts throttled local notifications on hits.
+// SnapNotify v2.0 — keep-alive + local notification bridge for Snapchat
+// Pure ObjC runtime swizzling (no substrate/Logos). Thread-safe, throttled, rotation-safe log.
 
 #import <Foundation/Foundation.h>
 #import <UIKit/UIKit.h>
@@ -9,15 +8,63 @@
 #import <objc/runtime.h>
 #include <stdarg.h>
 #include <stdlib.h>
+#include <string.h>
 
 static AVAudioPlayer *gPlayer = nil;
 static NSMutableDictionary *gOrig = nil;
 static NSMutableDictionary *gThrottle = nil;
+static NSLock *gLock = nil;
 static NSString *gLogPath = nil;
 static NSTimer *gTimer = nil;
 static _Thread_local BOOL t_inhit = NO;
 
-#pragma mark - logging
+static void sck_log(NSString *fmt, ...);
+
+#pragma mark - helpers
+
+static NSString *sck_app_state(void) {
+    return ([[UIApplication sharedApplication] applicationState] == UIApplicationStateBackground) ? @"BG" : @"FG";
+}
+
+static BOOL sck_is_call_event(NSString *s) {
+    NSString *low = [s lowercaseString];
+    return [low containsString:@"call"];
+}
+
+static BOOL sck_is_typing_event(NSString *s) {
+    return [[s lowercaseString] containsString:@"typing"];
+}
+
+static NSString *sck_try_user(id obj) {
+    if (!obj || ![obj isKindOfClass:[NSObject class]]) return @"";
+    NSArray *keys = @[@"username", @"senderUsername", @"displayName", @"senderDisplayName", @"name", @"title"];
+    for (NSString *k in keys) {
+        @try {
+            if ([obj respondsToSelector:NSSelectorFromString(k)]) {
+                id v = [obj valueForKey:k];
+                if ([v isKindOfClass:[NSString class]] && [(NSString *)v length] > 0 && [(NSString *)v length] < 40) return v;
+            }
+        } @catch (NSException *e) {}
+    }
+    return @"";
+}
+
+static NSString *sck_label_for(NSString *cls, NSString *sel) {
+    NSString *all = [[cls stringByAppendingString:@":"] stringByAppendingString:sel];
+    NSString *low = [all lowercaseString];
+    NSString *who = nil;
+    if ([low containsString:@"typing"]) return @"écrit...";
+    if ([low containsString:@"call"]) return @"t'appelle";
+    if ([low containsString:@"receivedsnap"]) return @"t'a envoyé un snap";
+    if ([low containsString:@"snapstate"]) return @"activité snap";
+    if ([low containsString:@"snapupdate"]) return @"activité snap";
+    if ([low containsString:@"messageupdate"] || [low containsString:@"conversationmessage"]) return @"activité chat";
+    if ([low containsString:@"chatmessage"] || [low containsString:@"chatconversation"]) return @"activité chat";
+    (void)who;
+    return nil;
+}
+
+#pragma mark - logging (thread-safe, rotation at 1 MB)
 
 static void sck_log(NSString *fmt, ...) {
     va_list ap; va_start(ap, fmt);
@@ -25,37 +72,77 @@ static void sck_log(NSString *fmt, ...) {
     va_end(ap);
     NSLog(@"[SnapNotify] %@", msg);
     static NSDateFormatter *df = nil;
-    if (!df) { df = [NSDateFormatter new]; df.dateFormat = @"HH:mm:ss.SSS"; }
-    NSString *line = [NSString stringWithFormat:@"[%@] %@\n", [df stringFromDate:[NSDate date]], msg];
-    if (!gLogPath) {
-        NSString *docs = [NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES) firstObject];
-        gLogPath = [docs stringByAppendingPathComponent:@"snapnotify.log"];
-    }
-    NSFileHandle *fh = [NSFileHandle fileHandleForWritingAtPath:gLogPath];
+    if (!df) { df = [NSDateFormatter new]; df.dateFormat = @"HH:mm:ss"; }
+    NSString *line = [NSString stringWithFormat:@"[%@] [%@] %@\n", [df stringFromDate:[NSDate date]], sck_app_state(), msg];
     NSData *d = [line dataUsingEncoding:NSUTF8StringEncoding];
-    if (!fh) { [d writeToFile:gLogPath atomically:YES]; }
-    else { @try { [fh seekToEndOfFile]; [fh writeData:d]; [fh closeFile]; } @catch (NSException *e) {} }
+    [gLock lock];
+    @try {
+        if (!gLogPath) {
+            NSString *docs = [NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES) firstObject];
+            gLogPath = [docs stringByAppendingPathComponent:@"snapnotify.log"];
+        }
+        NSFileManager *fm = [NSFileManager defaultManager];
+        NSDictionary *attrs = [fm attributesOfItemAtPath:gLogPath error:nil];
+        if (attrs && [attrs fileSize] > 1024 * 1024) {
+            [fm removeItemAtPath:gLogPath error:nil];
+        }
+        NSFileHandle *fh = [NSFileHandle fileHandleForWritingAtPath:gLogPath];
+        if (!fh) { [d writeToFile:gLogPath atomically:YES]; }
+        else { [fh seekToEndOfFile]; [fh writeData:d]; [fh closeFile]; }
+    } @catch (NSException *e) {
+        NSLog(@"[SnapNotify] log exc %@", e);
+    }
+    [gLock unlock];
 }
 
-#pragma mark - local notification
+#pragma mark - local notification (throttled, thread-safe)
 
-static void sck_notify(NSString *key, NSString *body) {
+static void sck_notify_raw(NSString *key, NSString *title, NSString *body, BOOL silent) {
     if (t_inhit) return;
     t_inhit = YES;
     @try {
+        [gLock lock];
         NSDate *last = gThrottle[key];
-        if (last && [[NSDate date] timeIntervalSinceDate:last] < 45.0) { t_inhit = NO; return; }
-        gThrottle[key] = [NSDate date];
+        BOOL skip = last && [[NSDate date] timeIntervalSinceDate:last] < 45.0;
+        if (!skip) gThrottle[key] = [NSDate date];
+        [gLock unlock];
+        if (skip) { t_inhit = NO; return; }
         UNMutableNotificationContent *c = [UNMutableNotificationContent new];
-        c.title = @"SnapNotify";
+        c.title = title;
         c.body = body;
-        c.sound = [UNNotificationSound defaultSound];
+        if (!silent) c.sound = [UNNotificationSound defaultSound];
         UNNotificationRequest *r = [UNNotificationRequest requestWithIdentifier:[[NSUUID UUID] UUIDString] content:c trigger:nil];
         [[UNUserNotificationCenter currentNotificationCenter] addNotificationRequest:r withCompletionHandler:^(NSError *e) {
             if (e) sck_log(@"notify err %@", e.localizedDescription);
         }];
     } @catch (NSException *e) { sck_log(@"notify exc %@", e); }
     t_inhit = NO;
+}
+
+static void sck_notify_event(NSString *cls, NSString *sel, id a) {
+    NSString *label = sck_label_for(cls, sel);
+    NSString *lowsel = [[cls stringByAppendingString:sel] lowercaseString];
+    BOOL isEvent = (label != nil);
+    BOOL isCall = [lowsel containsString:@"call"];
+    BOOL isTyping = [lowsel containsString:@"typing"];
+    if (!isEvent) {
+        isEvent = [lowsel containsString:@"snap"] || [lowsel containsString:@"chat"] || [lowsel containsString:@"message"] || [lowsel containsString:@"conversation"] || [lowsel containsString:@"receive"] || [lowsel containsString:@"incoming"];
+    }
+    if (!isEvent) return;
+    BOOL active = ([[UIApplication sharedApplication] applicationState] == UIApplicationStateActive);
+    if (active && !isCall) return;
+    NSString *who = sck_try_user(a);
+    NSString *body;
+    if (isTyping) {
+        body = who.length ? [NSString stringWithFormat:@"%@ %@", who, @"est en train d'écrire..."] : @"quelqu'un est en train d'écrire...";
+    } else if (isCall) {
+        body = who.length ? [NSString stringWithFormat:@"%@ t'appelle !", who] : @"Appel entrant !";
+    } else if (label) {
+        body = who.length ? [NSString stringWithFormat:@"%@ : %@", who, label] : label;
+    } else {
+        body = [NSString stringWithFormat:@"activité (%@)", sel];
+    }
+    sck_notify_raw([NSString stringWithFormat:@"%@.%@", cls, sel], @"Snapchat", body, NO);
 }
 
 #pragma mark - silent audio keep-alive
@@ -92,7 +179,7 @@ static void sck_ensure_audio(void) {
             }
             if (gPlayer && !gPlayer.isPlaying) {
                 BOOL ok = [gPlayer play];
-                sck_log(@"keepalive play=%d err=%@", ok, err);
+                if (!ok) sck_log(@"keepalive play failed err=%@", err);
             }
         } @catch (NSException *e) { sck_log(@"audio exc %@", e); }
     });
@@ -132,37 +219,30 @@ static BOOL sck_enc_ok(Method m, int objArgs) {
     return ats == objArgs + 2;
 }
 
-static void sck_hit(id self, SEL _cmd, id a, int n) {
+static void sck_hit(id self, SEL _cmd, id a) {
     if (t_inhit) return;
     NSString *sel = NSStringFromSelector(_cmd);
     NSString *cls = NSStringFromClass(object_getClass(self));
     if ([sel hasPrefix:@"postNotificationName:"]) {
         if (![a isKindOfClass:[NSString class]]) return;
         NSString *low = [a lowercaseString];
-        if ([low containsString:@"managed"] || [low containsString:@"context"] || [low containsString:@"window"] || [low containsString:@"audiosession"] || [low containsString:@"keyboard"] || [low containsString:@"keypath"] || [low containsString:@"external"] || [low containsString:@"screen"] || [low containsString:@"scene"] || [low containsString:@"layout"] || [low hasPrefix:@"ns"] || [low hasPrefix:@"_ns"] || [low hasPrefix:@"_ui"] || [low hasPrefix:@"av"] || [low hasPrefix:@"kb"]) return;
+        if ([low containsString:@"managed"] || [low containsString:@"context"] || [low containsString:@"window"] || [low containsString:@"audiosession"] || [low containsString:@"keyboard"] || [low containsString:@"keypath"] || [low containsString:@"external"] || [low containsString:@"screen"] || [low containsString:@"scene"] || [low containsString:@"layout"] || [low hasPrefix:@"ns"] || [low hasPrefix:@"_ns"] || [low hasPrefix:@"_ui"] || [low hasPrefix:@"av"] || [low hasPrefix:@"un"] || [low hasPrefix:@"_un"]) return;
         BOOL interesting = [low containsString:@"snap"] || [low containsString:@"chat"] || [low containsString:@"message"] || [low containsString:@"conversation"] || [low containsString:@"incoming"] || [low containsString:@"receive"] || [low containsString:@"typing"] || [low containsString:@"presence"];
         if (!interesting) return;
         sck_log(@"NOTIFPOST %@", a);
-        sck_notify([@"post" stringByAppendingString:a], [NSString stringWithFormat:@"post: %@", a]);
+        sck_notify_raw([@"post" stringByAppendingString:a], @"Snapchat", [NSString stringWithFormat:@"activité (%@)", a], NO);
         return;
     }
-    NSString *info = @"";
-    if ([a isKindOfClass:[NSDictionary class]]) {
-        NSArray *keys = [(NSDictionary *)a allKeys];
-        if (keys.count) info = [NSString stringWithFormat:@" keys=%@", [keys componentsJoinedByString:@","]];
-    } else if (a) {
-        info = [NSString stringWithFormat:@" <%@>", NSStringFromClass(object_getClass(a))];
-    }
-    NSString *appState = ([[UIApplication sharedApplication] applicationState] == UIApplicationStateBackground) ? @"BG" : @"FG";
-    NSString *msg = [NSString stringWithFormat:@"[%@] -[%@ %@]%@", appState, cls, sel, info];
-    sck_log(@"HIT %@", msg);
-    sck_notify([NSString stringWithFormat:@"%@.%@", cls, sel], msg);
+    @try {
+        sck_log(@"HIT [%@] -[%@ %@]", sck_app_state(), cls, sel);
+        sck_notify_event(cls, sel, a);
+    } @catch (NSException *e) { sck_log(@"hit exc %@", e); }
 }
 
-static void sck_repl0(id self, SEL _cmd) { sck_hit(self, _cmd, nil, 0); IMP o = sck_orig(self, _cmd); if (o) ((void (*)(id, SEL))o)(self, _cmd); }
-static void sck_repl1(id self, SEL _cmd, id a) { sck_hit(self, _cmd, a, 1); IMP o = sck_orig(self, _cmd); if (o) ((void (*)(id, SEL, id))o)(self, _cmd, a); }
-static void sck_repl2(id self, SEL _cmd, id a, id b) { sck_hit(self, _cmd, a, 2); IMP o = sck_orig(self, _cmd); if (o) ((void (*)(id, SEL, id, id))o)(self, _cmd, a, b); }
-static void sck_repl3(id self, SEL _cmd, id a, id b, id c) { sck_hit(self, _cmd, a, 3); IMP o = sck_orig(self, _cmd); if (o) ((void (*)(id, SEL, id, id, id))o)(self, _cmd, a, b, c); }
+static void sck_repl0(id self, SEL _cmd) { sck_hit(self, _cmd, nil); IMP o = sck_orig(self, _cmd); if (o) ((void (*)(id, SEL))o)(self, _cmd); }
+static void sck_repl1(id self, SEL _cmd, id a) { sck_hit(self, _cmd, a); IMP o = sck_orig(self, _cmd); if (o) ((void (*)(id, SEL, id))o)(self, _cmd, a); }
+static void sck_repl2(id self, SEL _cmd, id a, id b) { sck_hit(self, _cmd, a); IMP o = sck_orig(self, _cmd); if (o) ((void (*)(id, SEL, id, id))o)(self, _cmd, a, b); }
+static void sck_repl3(id self, SEL _cmd, id a, id b, id c) { sck_hit(self, _cmd, a); IMP o = sck_orig(self, _cmd); if (o) ((void (*)(id, SEL, id, id, id))o)(self, _cmd, a, b, c); }
 
 static void sck_attach(Class c, Method m) {
     SEL sel = method_getName(m);
@@ -170,18 +250,23 @@ static void sck_attach(Class c, Method m) {
     int colons = 0;
     for (const char *p = sn; *p; p++) if (*p == ':') colons++;
     NSString *key = [NSString stringWithFormat:@"%s|%s", class_getName(c), sn];
-    if (gOrig[key]) return;
-    if (!sck_enc_ok(m, colons)) { sck_log(@"skip(enc) -[%s %s]", class_getName(c), sn); return; }
+    [gLock lock];
+    BOOL done = (gOrig[key] != nil);
+    [gLock unlock];
+    if (done) return;
+    if (!sck_enc_ok(m, colons)) return;
     IMP newImp = NULL;
     switch (colons) {
         case 0: newImp = (IMP)sck_repl0; break;
         case 1: newImp = (IMP)sck_repl1; break;
         case 2: newImp = (IMP)sck_repl2; break;
         case 3: newImp = (IMP)sck_repl3; break;
-        default: sck_log(@"skip(arity %d) -[%s %s]", colons, class_getName(c), sn); return;
+        default: return;
     }
     IMP old = method_setImplementation(m, newImp);
+    [gLock lock];
     gOrig[key] = [NSValue valueWithPointer:(void *)old];
+    [gLock unlock];
     sck_log(@"swizzled -[%s %s]", class_getName(c), sn);
 }
 
@@ -269,8 +354,6 @@ static void sck_scan(void) {
 #pragma mark - setup
 
 static void sck_setup(void) {
-    gOrig = [NSMutableDictionary new];
-    gThrottle = [NSMutableDictionary new];
     NSNotificationCenter *nc = [NSNotificationCenter defaultCenter];
     [nc addObserverForName:UIApplicationDidEnterBackgroundNotification object:nil queue:[NSOperationQueue mainQueue] usingBlock:^(NSNotification *note) { sck_log(@"app -> background"); sck_ensure_audio(); }];
     [nc addObserverForName:UIApplicationDidBecomeActiveNotification object:nil queue:[NSOperationQueue mainQueue] usingBlock:^(NSNotification *note) { sck_log(@"app -> active"); sck_ensure_audio(); }];
@@ -278,11 +361,21 @@ static void sck_setup(void) {
         sck_log(@"audio interrupt");
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 2 * NSEC_PER_SEC), dispatch_get_main_queue(), ^{ sck_ensure_audio(); });
     }];
+    [nc addObserverForName:AVAudioSessionMediaServicesWereResetNotification object:nil queue:[NSOperationQueue mainQueue] usingBlock:^(NSNotification *note) {
+        sck_log(@"audio services reset");
+        gPlayer = nil;
+        sck_ensure_audio();
+    }];
     [nc addObserverForName:UIApplicationDidFinishLaunchingNotification object:nil queue:[NSOperationQueue mainQueue] usingBlock:^(NSNotification *note) {
         sck_scan();
         sck_ensure_audio();
+        [[UNUserNotificationCenter currentNotificationCenter] getNotificationSettingsWithCompletionHandler:^(UNNotificationSettings *settings) {
+            if (settings.authorizationStatus != UNAuthorizationStatusAuthorized) {
+                sck_log(@"WARNING: notification permission not granted (status %ld)", (long)settings.authorizationStatus);
+            }
+        }];
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 2 * NSEC_PER_SEC), dispatch_get_main_queue(), ^{
-            sck_notify(@"boot", [NSString stringWithFormat:@"SnapNotify v1.3 loaded (%lu hooks)", (unsigned long)gOrig.count]);
+            sck_notify_raw(@"boot", @"Snapchat", [NSString stringWithFormat:@"SnapNotify v2.0 chargé (%lu hooks)", (unsigned long)gOrig.count], YES);
         });
     }];
     gTimer = [NSTimer scheduledTimerWithTimeInterval:20.0 repeats:YES block:^(NSTimer *t) { sck_ensure_audio(); }];
@@ -293,6 +386,9 @@ static void sck_setup(void) {
 
 __attribute__((constructor)) static void sck_init(void) {
     @autoreleasepool {
+        gLock = [NSLock new];
+        gOrig = [NSMutableDictionary new];
+        gThrottle = [NSMutableDictionary new];
         sck_scan();
         dispatch_async(dispatch_get_main_queue(), ^{ sck_setup(); });
     }
