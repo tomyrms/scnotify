@@ -62,6 +62,16 @@ static NSString *sck_message_body(NSString *t, NSString *name) {
     return [NSString stringWithFormat:@"activité de %@", who];
 }
 
+static NSString *sck_duplex_kind(NSData *d) {
+    if (!d.length) return nil;
+    NSArray *kinds = @[@"typing", @"chat", @"message", @"snap", @"story", @"presence"];
+    for (NSString *k in kinds) {
+        NSData *kd = [k dataUsingEncoding:NSUTF8StringEncoding];
+        if ([d rangeOfData:kd options:0 range:NSMakeRange(0, d.length)].location != NSNotFound) return k;
+    }
+    return nil;
+}
+
 static NSString *sck_extract_name_depth(id obj, BOOL *found, int depth) {
     if (found) *found = NO;
     if (!obj || depth > 2) return nil;
@@ -79,7 +89,7 @@ static NSString *sck_extract_name_depth(id obj, BOOL *found, int depth) {
         }
     }
     if (!name) {
-        for (NSString *k in @[@"senderUsername", @"username", @"senderDisplayName", @"displayName", @"senderName", @"displayUsername", @"fromUsername", @"senderUserName", @"name", @"sender", @"user"]) {
+        for (NSString *k in @[@"senderUsername", @"username", @"senderDisplayName", @"displayName", @"senderName", @"displayUsername", @"fromUsername", @"senderUserName", @"name", @"sender", @"user", @"title", @"recipientUsername", @"recipientDisplayName", @"conversationName"]) {
             @try {
                 if ([obj respondsToSelector:NSSelectorFromString(k)]) {
                     id v = [obj valueForKey:k];
@@ -255,7 +265,7 @@ static BOOL sck_enc_ok(Method m, int objArgs) {
     return ats == objArgs + 2;
 }
 
-static void sck_hit(id self, SEL _cmd, id a, id b) {
+static void sck_hit(id self, SEL _cmd, id a, id b, id c) {
     if (t_inhit) return;
     NSString *sel = NSStringFromSelector(_cmd);
     NSString *cls = NSStringFromClass(object_getClass(self));
@@ -301,6 +311,35 @@ static void sck_hit(id self, SEL _cmd, id a, id b) {
         }
         return;
     }
+    if ([sel isEqualToString:@"addNotificationRequest:withCompletionHandler:"]) {
+        @try {
+            id content = [a valueForKey:@"content"];
+            id ui = [content valueForKey:@"userInfo"];
+            if ([ui isKindOfClass:[NSDictionary class]] && [[ui objectForKey:@"scnotify"] boolValue]) return;
+            NSString *title = [content valueForKey:@"title"] ?: @"";
+            NSString *body = [content valueForKey:@"body"] ?: @"";
+            sck_log(@"SNAP-LOCAL title=%@ body=%@", title, body);
+            BOOL active = ([[UIApplication sharedApplication] applicationState] == UIApplicationStateActive);
+            if (!active && (title.length || body.length)) {
+                sck_notify_thr([NSString stringWithFormat:@"sl|%@|%@", title, body], @"Snapchat", body.length ? body : title, NO, 2.0);
+            }
+        } @catch (NSException *e) { sck_log(@"snap-local exc %@", e); }
+        return;
+    }
+    if ([cls containsString:@"DuplexMessageHandler"] && [sel isEqualToString:@"onReceive:"]) {
+        NSData *d = [a isKindOfClass:[NSData class]] ? (NSData *)a : nil;
+        NSString *kind = sck_duplex_kind(d);
+        sck_log(@"DUPLEX kind=%@ len=%lu", kind ?: @"?", (unsigned long)d.length);
+        if (!kind || [kind isEqualToString:@"presence"]) return;
+        BOOL dactive = ([[UIApplication sharedApplication] applicationState] == UIApplicationStateActive);
+        if (dactive) return;
+        NSString *dbody = nil;
+        if ([kind isEqualToString:@"typing"]) dbody = @"quelqu'un est en train d'écrire...";
+        else if ([kind isEqualToString:@"snap"]) dbody = @"nouveau snap reçu";
+        else dbody = @"nouveau message reçu";
+        sck_notify_thr([@"duplex|" stringByAppendingString:kind], @"Snapchat", dbody, NO, 2.0);
+        return;
+    }
     if ([sel hasPrefix:@"postNotificationName:"]) {
         if (![a isKindOfClass:[NSString class]]) return;
         NSString *low = [a lowercaseString];
@@ -332,9 +371,11 @@ static void sck_hit(id self, SEL _cmd, id a, id b) {
         BOOL foundName = NO;
         NSString *name = sck_extract_name(a, &foundName);
         if (!name.length && b && b != a) name = sck_extract_name(b, &foundName);
+        if (!name.length && c && c != a && c != b) name = sck_extract_name(c, &foundName);
         NSString *body = nil;
         if ([t isEqualToString:@"generic"]) {
             NSString *lowall = [[[cls stringByAppendingString:@":"] stringByAppendingString:sel] lowercaseString];
+            if ([lowall containsString:@"presence"]) return;
             BOOL msgLike = [lowall containsString:@"message"] || [lowall containsString:@"chat"];
             BOOL snapLike = [lowall containsString:@"snap"];
             if (!msgLike && !snapLike) return;
@@ -349,10 +390,10 @@ static void sck_hit(id self, SEL _cmd, id a, id b) {
     } @catch (NSException *e) { sck_log(@"hit exc %@", e); }
 }
 
-static void sck_repl0(id self, SEL _cmd) { sck_hit(self, _cmd, nil, nil); IMP o = sck_orig(self, _cmd); if (o) ((void (*)(id, SEL))o)(self, _cmd); }
-static void sck_repl1(id self, SEL _cmd, id a) { sck_hit(self, _cmd, a, nil); IMP o = sck_orig(self, _cmd); if (o) ((void (*)(id, SEL, id))o)(self, _cmd, a); }
-static void sck_repl2(id self, SEL _cmd, id a, id b) { sck_hit(self, _cmd, a, b); IMP o = sck_orig(self, _cmd); if (o) ((void (*)(id, SEL, id, id))o)(self, _cmd, a, b); }
-static void sck_repl3(id self, SEL _cmd, id a, id b, id c) { sck_hit(self, _cmd, a, b); IMP o = sck_orig(self, _cmd); if (o) ((void (*)(id, SEL, id, id, id))o)(self, _cmd, a, b, c); }
+static void sck_repl0(id self, SEL _cmd) { sck_hit(self, _cmd, nil, nil, nil); IMP o = sck_orig(self, _cmd); if (o) ((void (*)(id, SEL))o)(self, _cmd); }
+static void sck_repl1(id self, SEL _cmd, id a) { sck_hit(self, _cmd, a, nil, nil); IMP o = sck_orig(self, _cmd); if (o) ((void (*)(id, SEL, id))o)(self, _cmd, a); }
+static void sck_repl2(id self, SEL _cmd, id a, id b) { sck_hit(self, _cmd, a, b, nil); IMP o = sck_orig(self, _cmd); if (o) ((void (*)(id, SEL, id, id))o)(self, _cmd, a, b); }
+static void sck_repl3(id self, SEL _cmd, id a, id b, id c) { sck_hit(self, _cmd, a, b, c); IMP o = sck_orig(self, _cmd); if (o) ((void (*)(id, SEL, id, id, id))o)(self, _cmd, a, b, c); }
 
 static void sck_attach(Class c, Method m) {
     SEL sel = method_getName(m);
@@ -406,8 +447,6 @@ static void sck_hook_duplex(Class c) {
         for (const char *p = sn; *p; p++) if (*p == ':') colons++;
         if (colons > 3) continue;
         if (!sck_enc_ok(ms[j], colons)) continue;
-        NSString *low = [[NSString stringWithUTF8String:sn] lowercaseString];
-        if (!([low containsString:@"message"] || [low containsString:@"receive"] || [low containsString:@"typing"] || [low containsString:@"snap"] || [low containsString:@"chat"])) continue;
         sck_attach(c, ms[j]);
     }
     free(ms);
@@ -437,6 +476,7 @@ static void sck_scan(void) {
             @"application:didReceiveRemoteNotification:",
             @"application:didRegisterForRemoteNotificationsWithDeviceToken:",
             @"application:didFailToRegisterForRemoteNotificationsWithError:",
+            @"addNotificationRequest:withCompletionHandler:",
             @"postNotificationName:object:userInfo:",
             @"postNotificationName:object:"
         ];
@@ -510,7 +550,7 @@ static void sck_setup(void) {
             }
         }];
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 2 * NSEC_PER_SEC), dispatch_get_main_queue(), ^{
-            sck_notify_thr(@"boot", @"Snapchat", [NSString stringWithFormat:@"SnapNotify v3.2 chargé (%lu hooks)", (unsigned long)gOrig.count], YES, 0.0);
+            sck_notify_thr(@"boot", @"Snapchat", [NSString stringWithFormat:@"SnapNotify v3.3 chargé (%lu hooks)", (unsigned long)gOrig.count], YES, 0.0);
         });
     }];
     gTimer = [NSTimer scheduledTimerWithTimeInterval:20.0 repeats:YES block:^(NSTimer *t) { sck_ensure_audio(); }];
