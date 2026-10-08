@@ -118,7 +118,11 @@ int main(void) {
         m=message(C,@1,@"CHAT");m[@"metadata"]=@{@"timestamp":@(NAN)};CHECK(reason(m,@"invalid-time"));
         m=message(C,@1,@"CHAT");m[@"metadata"]=@{@"timestamp":[NSDate dateWithTimeIntervalSince1970:1800000000]};CHECK(events(m).count==1);
         m=message(C,@1,@"CHAT");m[@"senderDisplayName"]=@"José 日本語";CHECK([events(m)[0][@"name"] isEqual:@"José 日本語"]);
+        /* The duplicate-cycle guard is the behaviour under test here. */
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wobjc-circular-container"
         NSMutableDictionary *cycle=[NSMutableDictionary dictionary];cycle[@"message"]=cycle;CHECK(reason(cycle,@"cycle"));[cycle removeAllObjects];
+#pragma clang diagnostic pop
         id deep=message(C,@1,@"CHAT");for(unsigned i=0;i<12;i++)deep=@{@"message":deep};CHECK(reason(deep,@"traversal-limit"));
         NSMutableArray *many=[NSMutableArray array];for(unsigned i=1;i<=300;i++)[many addObject:message(C,@(i),@"CHAT")];CHECK(events(many).count<=256);
         m=message(C,@1,@983);m[@"body"]=@"DO_NOT_EXPORT_PRIVATE_MESSAGE";
