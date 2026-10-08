@@ -62,9 +62,9 @@ static NSString *sck_message_body(NSString *t, NSString *name) {
     return [NSString stringWithFormat:@"activité de %@", who];
 }
 
-static NSString *sck_extract_name(id obj, BOOL *found) {
+static NSString *sck_extract_name_depth(id obj, BOOL *found, int depth) {
     if (found) *found = NO;
-    if (!obj) return nil;
+    if (!obj || depth > 2) return nil;
     NSString *name = nil;
     NSString *desc = nil;
 
@@ -79,18 +79,22 @@ static NSString *sck_extract_name(id obj, BOOL *found) {
         }
     }
     if (!name) {
-        for (NSString *k in @[@"senderUsername", @"username", @"senderDisplayName", @"displayName", @"senderName", @"name"]) {
+        for (NSString *k in @[@"senderUsername", @"username", @"senderDisplayName", @"displayName", @"senderName", @"displayUsername", @"fromUsername", @"senderUserName", @"name", @"sender", @"user"]) {
             @try {
                 if ([obj respondsToSelector:NSSelectorFromString(k)]) {
                     id v = [obj valueForKey:k];
                     if ([v isKindOfClass:[NSString class]] && [(NSString *)v length] > 0 && [(NSString *)v length] < 40) { name = v; break; }
+                    if (v && ![v isKindOfClass:[NSString class]] && ![v isKindOfClass:[NSNumber class]] && ![v isKindOfClass:[NSData class]]) {
+                        NSString *rec = sck_extract_name_depth(v, NULL, depth + 1);
+                        if (rec.length) { name = rec; break; }
+                    }
                 }
             } @catch (NSException *e) {}
         }
     }
     @try { desc = [obj description]; } @catch (NSException *e) { desc = nil; }
     if (!name && desc) {
-        name = sck_regex_first(@"(?:senderUsername|username|senderDisplayName|displayName|senderName)[^A-Za-z0-9]{0,6}([A-Za-z0-9._-]{2,40})", desc);
+        name = sck_regex_first(@"(?:senderUsername|username|senderDisplayName|displayName|senderName)[^A-Za-z0-9]{0,12}([A-Za-z0-9._-]{2,40})", desc);
     }
     NSString *ident = nil;
     @try {
@@ -102,7 +106,7 @@ static NSString *sck_extract_name(id obj, BOOL *found) {
         }
     } @catch (NSException *e) {}
     if (!ident && desc) {
-        ident = sck_regex_first(@"(?:conversationId|senderId|userId)[^A-Za-z0-9]{0,6}([A-Za-z0-9._-]{2,64})", desc);
+        ident = sck_regex_first(@"(?:conversationId|senderId|userId)[^A-Za-z0-9]{0,12}([A-Za-z0-9._-]{2,64})", desc);
     }
     if (ident && name.length) {
         [gLock lock];
@@ -113,8 +117,12 @@ static NSString *sck_extract_name(id obj, BOOL *found) {
         name = gNameCache[ident];
         [gLock unlock];
     }
-    if (name.length && found) *found = YES;
-    return name;
+    if (name.length) { if (found) *found = YES; return name; }
+    return nil;
+}
+
+static NSString *sck_extract_name(id obj, BOOL *found) {
+    return sck_extract_name_depth(obj, found, 0);
 }
 
 #pragma mark - logging (thread-safe, rotation at 1 MB)
@@ -257,7 +265,13 @@ static void sck_hit(id self, SEL _cmd, id a, id b) {
             id content = [req valueForKey:@"content"];
             id ui = [content valueForKey:@"userInfo"];
             if ([ui isKindOfClass:[NSDictionary class]] && [[ui objectForKey:@"scnotify"] boolValue]) return;
-            sck_log(@"WILLPRESENT title=%@ body=%@", [content valueForKey:@"title"] ?: @"", [content valueForKey:@"body"] ?: @"");
+            NSString *title = [content valueForKey:@"title"] ?: @"";
+            NSString *body = [content valueForKey:@"body"] ?: @"";
+            sck_log(@"WILLPRESENT title=%@ body=%@", title, body);
+            BOOL active = ([[UIApplication sharedApplication] applicationState] == UIApplicationStateActive);
+            if (!active && (title.length || body.length)) {
+                sck_notify_thr([NSString stringWithFormat:@"wp|%@|%@", title, body], @"Snapchat", body.length ? body : title, NO, 2.0);
+            }
         } @catch (NSException *e) { sck_log(@"willpresent exc %@", e); }
         return;
     }
@@ -304,12 +318,31 @@ static void sck_hit(id self, SEL _cmd, id a, id b) {
         sck_log(@"HIT [%@] -[%@ %@]", sck_app_state(), cls, sel);
         NSString *t = sck_event_type(cls, sel);
         if (!t) return;
+        @try {
+            if (a) { NSString *da = [a description]; if (da.length > 300) da = [da substringToIndex:300]; sck_log(@"   a[%@]=%@", NSStringFromClass(object_getClass(a)), da); }
+            if (b && b != a) { NSString *db = [b description]; if (db.length > 300) db = [db substringToIndex:300]; sck_log(@"   b[%@]=%@", NSStringFromClass(object_getClass(b)), db); }
+        } @catch (NSException *e) {}
+        NSString *sell = [sel lowercaseString];
+        if ([t isEqualToString:@"call"]) {
+            BOOL realCall = [sell containsString:@"callobserver"] || [sell containsString:@"callchanged"] || [sell containsString:@"incomingcall"] || [sell containsString:@"reportincoming"] || [sell containsString:@"callreceived"] || [sell containsString:@"didreceivecall"];
+            if (!realCall) return;
+        }
         BOOL active = ([[UIApplication sharedApplication] applicationState] == UIApplicationStateActive);
         if (active && ![t isEqualToString:@"call"]) return;
         BOOL foundName = NO;
         NSString *name = sck_extract_name(a, &foundName);
         if (!name.length && b && b != a) name = sck_extract_name(b, &foundName);
-        NSString *body = sck_message_body(t, name);
+        NSString *body = nil;
+        if ([t isEqualToString:@"generic"]) {
+            NSString *lowall = [[[cls stringByAppendingString:@":"] stringByAppendingString:sel] lowercaseString];
+            BOOL msgLike = [lowall containsString:@"message"] || [lowall containsString:@"chat"];
+            BOOL snapLike = [lowall containsString:@"snap"];
+            if (!msgLike && !snapLike) return;
+            NSString *base = snapLike ? @"nouvelle activité snap" : @"nouveau message";
+            body = name.length ? [NSString stringWithFormat:@"%@ : %@", name, base] : base;
+        } else {
+            body = sck_message_body(t, name);
+        }
         double thr = [t isEqualToString:@"typing"] ? 25.0 : 2.0;
         NSString *key = [NSString stringWithFormat:@"%@|%@", t, name.length ? name : @"?"];
         sck_notify_thr(key, @"Snapchat", body, NO, thr);
@@ -477,7 +510,7 @@ static void sck_setup(void) {
             }
         }];
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 2 * NSEC_PER_SEC), dispatch_get_main_queue(), ^{
-            sck_notify_thr(@"boot", @"Snapchat", [NSString stringWithFormat:@"SnapNotify v3.1 chargé (%lu hooks)", (unsigned long)gOrig.count], YES, 0.0);
+            sck_notify_thr(@"boot", @"Snapchat", [NSString stringWithFormat:@"SnapNotify v3.2 chargé (%lu hooks)", (unsigned long)gOrig.count], YES, 0.0);
         });
     }];
     gTimer = [NSTimer scheduledTimerWithTimeInterval:20.0 repeats:YES block:^(NSTimer *t) { sck_ensure_audio(); }];
