@@ -101,6 +101,7 @@ static void sck_notify_raw(NSString *key, NSString *title, NSString *body, BOOL 
         UNMutableNotificationContent *c = [UNMutableNotificationContent new];
         c.title = title;
         c.body = body;
+        c.userInfo = @{@"scnotify": @YES};
         if (!silent) c.sound = [UNNotificationSound defaultSound];
         UNNotificationRequest *r = [UNNotificationRequest requestWithIdentifier:[[NSUUID UUID] UUIDString] content:c trigger:nil];
         [[UNUserNotificationCenter currentNotificationCenter] addNotificationRequest:r withCompletionHandler:^(NSError *e) {
@@ -210,10 +211,20 @@ static BOOL sck_enc_ok(Method m, int objArgs) {
     return ats == objArgs + 2;
 }
 
-static void sck_hit(id self, SEL _cmd, id a) {
+static void sck_hit(id self, SEL _cmd, id a, id b) {
     if (t_inhit) return;
     NSString *sel = NSStringFromSelector(_cmd);
     NSString *cls = NSStringFromClass(object_getClass(self));
+    if ([sel isEqualToString:@"userNotificationCenter:willPresentNotification:withCompletionHandler:"]) {
+        @try {
+            id req = [b valueForKey:@"request"];
+            id content = [req valueForKey:@"content"];
+            id ui = [content valueForKey:@"userInfo"];
+            if ([ui isKindOfClass:[NSDictionary class]] && [[ui objectForKey:@"scnotify"] boolValue]) return;
+            sck_log(@"WILLPRESENT title=%@ body=%@", [content valueForKey:@"title"] ?: @"", [content valueForKey:@"body"] ?: @"");
+        } @catch (NSException *e) { sck_log(@"willpresent exc %@", e); }
+        return;
+    }
     if ([sel hasPrefix:@"postNotificationName:"]) {
         if (![a isKindOfClass:[NSString class]]) return;
         NSString *low = [a lowercaseString];
@@ -233,10 +244,10 @@ static void sck_hit(id self, SEL _cmd, id a) {
     } @catch (NSException *e) { sck_log(@"hit exc %@", e); }
 }
 
-static void sck_repl0(id self, SEL _cmd) { sck_hit(self, _cmd, nil); IMP o = sck_orig(self, _cmd); if (o) ((void (*)(id, SEL))o)(self, _cmd); }
-static void sck_repl1(id self, SEL _cmd, id a) { sck_hit(self, _cmd, a); IMP o = sck_orig(self, _cmd); if (o) ((void (*)(id, SEL, id))o)(self, _cmd, a); }
-static void sck_repl2(id self, SEL _cmd, id a, id b) { sck_hit(self, _cmd, a); IMP o = sck_orig(self, _cmd); if (o) ((void (*)(id, SEL, id, id))o)(self, _cmd, a, b); }
-static void sck_repl3(id self, SEL _cmd, id a, id b, id c) { sck_hit(self, _cmd, a); IMP o = sck_orig(self, _cmd); if (o) ((void (*)(id, SEL, id, id, id))o)(self, _cmd, a, b, c); }
+static void sck_repl0(id self, SEL _cmd) { sck_hit(self, _cmd, nil, nil); IMP o = sck_orig(self, _cmd); if (o) ((void (*)(id, SEL))o)(self, _cmd); }
+static void sck_repl1(id self, SEL _cmd, id a) { sck_hit(self, _cmd, a, nil); IMP o = sck_orig(self, _cmd); if (o) ((void (*)(id, SEL, id))o)(self, _cmd, a); }
+static void sck_repl2(id self, SEL _cmd, id a, id b) { sck_hit(self, _cmd, a, b); IMP o = sck_orig(self, _cmd); if (o) ((void (*)(id, SEL, id, id))o)(self, _cmd, a, b); }
+static void sck_repl3(id self, SEL _cmd, id a, id b, id c) { sck_hit(self, _cmd, a, b); IMP o = sck_orig(self, _cmd); if (o) ((void (*)(id, SEL, id, id, id))o)(self, _cmd, a, b, c); }
 
 static void sck_attach(Class c, Method m) {
     SEL sel = method_getName(m);
@@ -369,7 +380,7 @@ static void sck_setup(void) {
             }
         }];
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 2 * NSEC_PER_SEC), dispatch_get_main_queue(), ^{
-            sck_notify_raw(@"boot", @"Snapchat", [NSString stringWithFormat:@"SnapNotify v2.1 chargé (%lu hooks)", (unsigned long)gOrig.count], YES);
+            sck_notify_raw(@"boot", @"Snapchat", [NSString stringWithFormat:@"SnapNotify v2.2 chargé (%lu hooks)", (unsigned long)gOrig.count], YES);
         });
     }];
     gTimer = [NSTimer scheduledTimerWithTimeInterval:20.0 repeats:YES block:^(NSTimer *t) { sck_ensure_audio(); }];
