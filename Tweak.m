@@ -1,17 +1,19 @@
-// SnapNotify 4.0.0-rc2 — explicit event adapters, not notifications from hook names.
+// SnapNotify 4.0.0-rc3 — explicit event adapters, not notifications from hook names.
 #import <Foundation/Foundation.h>
 #import <UIKit/UIKit.h>
 #import <UserNotifications/UserNotifications.h>
 #import <AVFoundation/AVFoundation.h>
 #import "Sources/SNRuntime.h"
 #import "Sources/SNReceive.h"
+#import "Sources/SNHostNotice.h"
+#import <CommonCrypto/CommonDigest.h>
 #import "Core/SNCore.h"
 #include <stdatomic.h>
 #include <time.h>
 #include <stdarg.h>
 #include <math.h>
 
-static NSString * const SNVersion=@"4.0.0-rc2";
+static NSString * const SNVersion=@"4.0.0-rc3";
 static dispatch_queue_t worker, logQueue;
 static NSMutableDictionary *users, *presence, *pendingEvents, *issuedRequests;
 static NSDictionary *config;
@@ -20,7 +22,11 @@ static SNReceiveTracker *receiveTracker;
 static NSMutableDictionary *receiveSources;
 static NSArray *receiveHooks;
 static NSUInteger receivedCallbacks, decodedMessages, decodedSnaps, snapshotSuppressed;
-static atomic_uint receiveInflight;
+static NSUInteger nativeNoticeCandidates, nativeNoticeAccepted, apnsCallbacks;
+static char transportTopicKey;
+static NSMutableDictionary *transportSources;
+static void consumeReceiveBatch(NSDictionary *,NSString *,SNReceiveSource,BOOL);
+static atomic_uint receiveInflight, transportInflight;
 static atomic_ulong receiveDrops;
 static NSString *account, *session, *documents, *support;
 static SNLedger ledger;
@@ -90,7 +96,7 @@ static void loadConfig(void) {
     NSMutableDictionary *defaults=[@{
         @"Enabled":@YES,@"TypingNotifications":@YES,@"SnapNotifications":@YES,
         @"MessageNotifications":@YES,@"CallNotifications":@YES,@"PeekingNotifications":@YES,
-        @"NotifyInForeground":@NO,@"ExperimentalKeepAlive":@YES,
+        @"NotifyInForeground":@NO,@"ExperimentalKeepAlive":@YES,@"NativeNotificationBridge":@YES,
         @"DiagnosticsIncludeIdentifiers":@NO,@"TypingIdleSeconds":@8.0,
         @"TypingRestartGapSeconds":@1.5,@"NameWaitSeconds":@0.8,
         @"Aliases":@{},@"SelfUserID":@"",@"TypingInactiveStates":@[],@"ReceiveTypeMappings":@{}
@@ -263,7 +269,11 @@ static void consumePacket(NSData *packet) {
             logLine(@"WIRE topic=presence bytes=%lu",(unsigned long)r.payload.size);
         } else {
             logLine(@"WIRE-UNSUPPORTED topic=%s bytes=%lu",r.topic,(unsigned long)r.payload.size);
-            /* sync_trigger is not a snap. No fallback 'activity' notifications. */
+            /* No notification from a topic name alone. Decode only structured
+               records already present in this received payload. */
+            NSData *bytes=[NSData dataWithBytes:r.payload.data length:r.payload.size];
+            id object=SNTransportJSON(bytes);
+            if(object){NSDictionary *batch=SNDecodeReceived(@[object],nil,nil);consumeReceiveBatch(batch,[@"wire/" stringByAppendingString:@(r.topic)],SN_SOURCE_SNAPSHOT,atomic_load(&appState)==UIApplicationStateActive);}
         }
     }
 }
@@ -350,7 +360,15 @@ static void consumeReceiveBatch(NSDictionary *batch,NSString *source,SNReceiveSo
     for(NSDictionary *e in decoded){if([e[@"kind"] isEqual:@"snap"])decodedSnaps++;else decodedMessages++;}
     NSArray *eligible=decoded;
     if(mode==SN_SOURCE_SNAPSHOT){
-        eligible=[receiveTracker newEventsInBatch:batch wallTime:NSDate.date.timeIntervalSince1970];
+        NSMutableArray *directional=[NSMutableArray array];
+        for(NSDictionary *record in decoded){
+            NSMutableDictionary *r=[record mutableCopy];
+            if(account.length&&![account isEqual:r[@"uid"]])r[@"incoming"]=@YES;
+            if(account.length&&[account isEqual:r[@"uid"]])r[@"incoming"]=@NO;
+            [directional addObject:[r copy]];
+        }
+        NSMutableDictionary *snapshot=[batch mutableCopy];snapshot[@"events"]=directional;
+        eligible=[receiveTracker newEventsInBatch:snapshot wallTime:NSDate.date.timeIntervalSince1970];
         snapshotSuppressed+=decoded.count-eligible.count;
     }
     NSMutableArray *events=[NSMutableArray array];
@@ -382,6 +400,77 @@ static void observeReceived(NSString *className,NSString *selector,NSArray *argu
             @finally{atomic_fetch_sub(&receiveInflight,1);}
         });
     } @catch(NSException *e){atomic_fetch_sub(&receiveInflight,1);logLine(@"RECEIVE-ERROR exception=%@",e.name);}
+}
+
+
+/* Native in-app banners are an independent semantic source. A legitimate
+   host-generated notice need not expose a conversation UUID or message ID.
+   Never call this with arbitrary network text, UI labels or user chat bodies. */
+static void consumeNativeNotice(NSDictionary *notice, BOOL foreground) {
+    nativeNoticeCandidates++;
+    if(!enabled(@"Enabled")||!enabled(@"NativeNotificationBridge")||(!enabled(@"MessageNotifications")&&!enabled(@"SnapNotifications"))||
+       isForegroundSuppressed()||(foreground&&!enabled(@"NotifyInForeground")))return;
+    NSArray *parts=@[notice[@"id"]?:@"",notice[@"title"],notice[@"body"]];
+    NSData *encoded=[NSJSONSerialization dataWithJSONObject:parts options:0 error:NULL];if(!encoded)return;
+    unsigned char digest[CC_SHA256_DIGEST_LENGTH];CC_SHA256(encoded.bytes,(CC_LONG)encoded.length,digest);
+    NSMutableString *key=[NSMutableString stringWithString:@"host-notice|"];
+    for(unsigned i=0;i<CC_SHA256_DIGEST_LENGTH;i++)[key appendFormat:@"%02x",digest[i]];
+    uint64_t ticket=sn_ledger_reserve(&ledger,key.UTF8String,nowTime(),15);if(!ticket)return;
+    uint64_t generation=queueGeneration;
+    UNMutableNotificationContent *content=[UNMutableNotificationContent new];
+    content.title=notice[@"title"];content.body=notice[@"body"];content.sound=UNNotificationSound.defaultSound;
+    content.threadIdentifier=@"snapnotify.native";
+    content.userInfo=@{@"scnotify":@YES,@"version":SNVersion,@"kind":@"native"};
+    NSString *rid=[NSString stringWithFormat:@"snapnotify.%@.native.%llu",session,(unsigned long long)ticket];
+    issuedRequests[rid]=@(nowTime());
+    logLine(@"NATIVE-NOTICE-REQUEST stableID=%d text-redacted=1",notice[@"id"]!=nil);
+    [[UNUserNotificationCenter currentNotificationCenter] addNotificationRequest:[UNNotificationRequest requestWithIdentifier:rid content:content trigger:nil] withCompletionHandler:^(NSError *error){
+        dispatch_async(worker,^{
+            if(generation!=queueGeneration){[[UNUserNotificationCenter currentNotificationCenter] removePendingNotificationRequestsWithIdentifiers:@[rid]];[[UNUserNotificationCenter currentNotificationCenter] removeDeliveredNotificationsWithIdentifiers:@[rid]];return;}
+            if(error){sn_ledger_cancel(&ledger,ticket);logLine(@"NATIVE-NOTICE-FAILED domain=%@ code=%ld",error.domain,(long)error.code);}
+            else{sn_ledger_commit(&ledger,ticket,nowTime(),notice[@"id"]?300:1);nativeNoticeAccepted++;postedCount++;logLine(@"NATIVE-NOTICE-ACCEPTED");}
+        });
+    }];
+}
+static void observeHostNotice(id payload) {
+    if(atomic_fetch_add(&receiveInflight,1)>=64){atomic_fetch_sub(&receiveInflight,1);atomic_fetch_add(&receiveDrops,1);return;}
+    @try {
+        BOOL foreground=atomic_load(&appState)==UIApplicationStateActive;
+        NSDictionary *batch=SNDecodeReceived(payload?@[payload]:@[],nil,nil);
+        NSDictionary *notice=[batch[@"events"] count]?nil:SNHostNotice(payload);
+        dispatch_async(worker,^{
+            @try{
+                consumeReceiveBatch(batch,@"host/inAppNotification",SN_SOURCE_LIVE,foreground);
+                if(notice)consumeNativeNotice(notice,foreground);
+            }@catch(NSException *error){logLine(@"NATIVE-NOTICE-ERROR exception=%@",error.name);}
+            @finally{atomic_fetch_sub(&receiveInflight,1);}
+        });
+    }@catch(__unused NSException *e){atomic_fetch_sub(&receiveInflight,1);}
+}
+static void observeTransport(id receiver,id payload) {
+    if(atomic_fetch_add(&transportInflight,1)>=64){atomic_fetch_sub(&transportInflight,1);atomic_fetch_add(&packetDrops,1);return;}
+    NSString *topic=objc_getAssociatedObject(receiver,&transportTopicKey)?:@"unregistered";
+    NSString *source=[NSString stringWithFormat:@"%@/%@",NSStringFromClass(object_getClass(receiver)),topic];
+    dispatch_async(worker,^{@try{if(transportSources[source]||transportSources.count<128)transportSources[source]=@([transportSources[source] unsignedIntegerValue]+1);}@finally{atomic_fetch_sub(&transportInflight,1);}});
+    id json=SNTransportJSON(payload);
+    if(json)observeReceived(NSStringFromClass(object_getClass(receiver)),@"onReceive:",@[json],SN_SOURCE_SNAPSHOT);
+    else if([payload isKindOfClass:NSData.class])enqueuePacket(payload);
+    else if(payload&&payload!=NSNull.null)observeReceived(NSStringFromClass(object_getClass(receiver)),@"onReceive:",@[payload],SN_SOURCE_SNAPSHOT);
+}
+static void observeHandlerRegistration(NSArray *args) {
+    if(args.count<2||![args[0] isKindOfClass:NSString.class]||[args[0] length]>64)return;
+    id handler=args[1];if(handler==NSNull.null)return;
+    objc_setAssociatedObject(handler,&transportTopicKey,[args[0] copy],OBJC_ASSOCIATION_COPY_NONATOMIC);
+    /* Follow the registered receiver, including an inherited implementation;
+       do not guess that every channel uses one of two hard-coded classes. */
+    for(Class cls=object_getClass(handler);cls;cls=class_getSuperclass(cls)) {
+        unsigned count=0;Method *list=class_copyMethodList(cls,&count);BOOL owns=NO;
+        for(unsigned i=0;i<count;i++)if(method_getName(list[i])==NSSelectorFromString(@"onReceive:")){owns=YES;break;}free(list);
+        if(!owns)continue;
+        BOOL installed=SNInstallHook(cls,NSSelectorFromString(@"onReceive:"),^(id self,NSArray *a,__unused id result){observeTransport(self,a.firstObject);});
+        logLine(@"TRANSPORT-REGISTER class=%@ topic=%@ installedNow=%d",NSStringFromClass(cls),args[0],installed);
+        break;
+    }
 }
 
 #pragma mark - Optional background experiment (main thread only)
@@ -463,7 +552,12 @@ static void scan(void) {
         Class cls=classes[i];NSString *cn=NSStringFromClass(cls);
         BOOL snap=[cn hasPrefix:@"SC"]||[cn hasPrefix:@"SOJU"];
         if(!snap)continue;
-        if([@[@"SCCDuplexMessageHandler",@"SCNDuplexMessageHandlerCppProxy"] containsObject:cn])attach(cls,@"onReceive:",^(id self,NSArray *a,id r){(void)self;(void)r;enqueuePacket(a.firstObject);});
+        if([@[@"SCCDuplexMessageHandler",@"SCNDuplexMessageHandlerCppProxy"] containsObject:cn])attach(cls,@"onReceive:",^(id self,NSArray *a,id r){(void)r;observeTransport(self,a.firstObject);});
+        if([cn isEqual:@"SCNDuplexDuplexClientCppProxy"])attach(cls,@"registerHandler:handler:queue:",^(__unused id self,NSArray *a,__unused id r){observeHandlerRegistration(a);});
+        /* These actual receiver classes also cover registrations that happened
+           before the tweak's scan. Registration discovery covers other classes. */
+        if([@[@"SCHermodDuplexServiceImplementation",@"SCDuplexSyncTriggerServiceImpl"] containsObject:cn])attach(cls,@"onReceive:",^(id self,NSArray *a,__unused id r){observeTransport(self,a.firstObject);});
+        if([cn isEqual:@"SCNotificationDisplayModel"]&&SNInstallNoticeChoice(cls,^(id payload){observeHostNotice(payload);})){hookCount++;logLine(@"HOOK native-notice-choice installed=1");}
         if([cn isEqual:@"SCCallStateProvider"]){
             attach(cls,@"updateWithPresencePlatformActiveConversationsInfo:",^(id self,NSArray *a,id r){(void)self;(void)r;NSArray *snapshot=SNPresenceRecords(a.firstObject);dispatch_async(worker,^{consumePresence(snapshot);});});
             attach(cls,@"sessionWrapper:updatedState:",^(id self,NSArray *a,id r){
@@ -480,6 +574,7 @@ static void scan(void) {
         }
         if([@[@"SCAppDelegate",@"SCMainAppDelegate",@"SCPushNotificationDelegate"] containsObject:cn]){
             installForegroundPresentation(cls);
+            for(NSString *sel in @[@"application:didReceiveRemoteNotification:",@"application:didReceiveRemoteNotification:fetchCompletionHandler:"])attach(cls,sel,^(__unused id self,__unused NSArray *a,__unused id r){dispatch_async(worker,^{apnsCallbacks++;logLine(@"APNS-RECEIVED payload-redacted=1");});});
             attach(cls,@"application:didFailToRegisterForRemoteNotificationsWithError:",^(id self,NSArray *a,id r){(void)self;(void)r;NSError *e=a.count>1&&[a[1] isKindOfClass:NSError.class]?a[1]:nil;logLine(@"APNS-FAILED domain=%@ code=%ld",e.domain,(long)e.code);dispatch_async(worker,^{nativePushRegistered=NO;});});
             attach(cls,@"application:didRegisterForRemoteNotificationsWithDeviceToken:",^(id self,NSArray *a,id r){(void)self;(void)a;(void)r;logLine(@"APNS-REGISTERED token-redacted=1");dispatch_async(worker,^{nativePushRegistered=YES;});});
         }
@@ -500,7 +595,9 @@ static void scan(void) {
                 NSString *key=[NSString stringWithFormat:@"%@/%@",cn,name];
                 if(!inventory[key]&&inventory.count<512){
                     BOOL installed=attach(cls,name,^(id self,NSArray *args,id result){
-                        (void)self;(void)result;observeReceived(cn,name,args,mode);
+                        (void)self;(void)result;
+                        if([name hasPrefix:@"presentInAppNotification"]&&args.count)observeHostNotice(args.firstObject);
+                        else observeReceived(cn,name,args,mode);
                     });
                     const char *encoding=method_getTypeEncoding(methods[m]);
                     inventory[key]=@{@"class":cn,@"selector":name,@"encoding":encoding?@(encoding):@"?",@"installed":@(installed),@"mode":mode==SN_SOURCE_LIVE?@"live":@"snapshot"};
@@ -523,10 +620,10 @@ static void writeStatus(void) {
         [issuedRequests removeObjectForKey:oldest];
     }
     for(NSString *key in [pendingEvents allKeys])if(now-[pendingEvents[key][@"created"] doubleValue]>15){sn_ledger_cancel(&ledger,[pendingEvents[key][@"ticket"] unsignedLongLongValue]);[pendingEvents removeObjectForKey:key];}
-    NSDictionary *status=@{@"version":SNVersion,@"state":stateLabel(),@"knownUsers":@(users.count),@"nameHits":@(nameHits),@"nameMisses":@(nameMisses),@"wirePackets":@(wireCount),@"unsupportedWirePackets":@(malformedCount),@"packetDrops":@(atomic_load(&packetDrops)),@"notificationRequestsAccepted":@(postedCount),@"secondsSinceWire":lastWire?@(now-lastWire):@(-1),@"apnsRegisteredThisRun":@(nativePushRegistered),@"experimentalKeepAlive":@(atomic_load(&experiments)),@"onDeviceValidationRequired":@YES,@"receiveCallbacks":@(receivedCallbacks),@"decodedMessages":@(decodedMessages),@"decodedSnaps":@(decodedSnaps),@"snapshotRecordsSuppressed":@(snapshotSuppressed),@"receiveQueueDrops":@(atomic_load(&receiveDrops))};
+    NSDictionary *status=@{@"version":SNVersion,@"state":stateLabel(),@"knownUsers":@(users.count),@"nameHits":@(nameHits),@"nameMisses":@(nameMisses),@"wirePackets":@(wireCount),@"unsupportedWirePackets":@(malformedCount),@"packetDrops":@(atomic_load(&packetDrops)),@"notificationRequestsAccepted":@(postedCount),@"secondsSinceWire":lastWire?@(now-lastWire):@(-1),@"apnsRegisteredThisRun":@(nativePushRegistered),@"apnsDeliveryCallbacks":@(apnsCallbacks),@"nativeNoticeCandidates":@(nativeNoticeCandidates),@"nativeNoticesAccepted":@(nativeNoticeAccepted),@"experimentalKeepAlive":@(atomic_load(&experiments)),@"onDeviceValidationRequired":@YES,@"receiveCallbacks":@(receivedCallbacks),@"decodedMessages":@(decodedMessages),@"decodedSnaps":@(decodedSnaps),@"snapshotRecordsSuppressed":@(snapshotSuppressed),@"receiveQueueDrops":@(atomic_load(&receiveDrops))};
     NSData *json=[NSJSONSerialization dataWithJSONObject:status options:NSJSONWritingPrettyPrinted error:NULL];
     [json writeToFile:[documents stringByAppendingPathComponent:@"snapnotify_status.json"] options:NSDataWritingAtomic|NSDataWritingFileProtectionCompleteUntilFirstUserAuthentication error:NULL];
-    NSDictionary *schema=@{@"version":SNVersion,@"hooks":receiveHooks?:@[],@"sources":[receiveSources copy],@"containsMessageBodies":@NO};
+    NSDictionary *schema=@{@"version":SNVersion,@"hooks":receiveHooks?:@[],@"sources":[receiveSources copy],@"containsMessageBodies":@NO,@"transportSources":[transportSources copy]};
     NSData *schemaJSON=[NSJSONSerialization dataWithJSONObject:schema options:NSJSONWritingPrettyPrinted error:NULL];
     [schemaJSON writeToFile:[documents stringByAppendingPathComponent:@"snapnotify_receive_schema.json"] options:NSDataWritingAtomic|NSDataWritingFileProtectionCompleteUntilFirstUserAuthentication error:NULL];
     logLine(@"HEALTH wire=%lu accepted=%lu users=%lu lastWire=%.1fs",(unsigned long)wireCount,(unsigned long)postedCount,(unsigned long)users.count,lastWire?now-lastWire:-1);
@@ -570,7 +667,7 @@ __attribute__((constructor)) static void start(void) {
         worker=dispatch_queue_create("ch.snapnotify.events",dispatch_queue_attr_make_with_autorelease_frequency(DISPATCH_QUEUE_SERIAL,DISPATCH_AUTORELEASE_FREQUENCY_WORK_ITEM));
         logQueue=dispatch_queue_create("ch.snapnotify.log",DISPATCH_QUEUE_SERIAL);
         users=[NSMutableDictionary dictionary];presence=[NSMutableDictionary dictionary];pendingEvents=[NSMutableDictionary dictionary];issuedRequests=[NSMutableDictionary dictionary];
-        receiveTracker=[SNReceiveTracker new];receiveSources=[NSMutableDictionary dictionary];receiveHooks=@[];
+        receiveTracker=[[SNReceiveTracker alloc] initWithMonitoringStart:NSDate.date.timeIntervalSince1970];transportSources=[NSMutableDictionary dictionary];receiveSources=[NSMutableDictionary dictionary];receiveHooks=@[];
         session=NSUUID.UUID.UUIDString;queueGeneration=1;
         documents=[NSSearchPathForDirectoriesInDomains(NSDocumentDirectory,NSUserDomainMask,YES) firstObject];
         support=[[NSSearchPathForDirectoriesInDomains(NSApplicationSupportDirectory,NSUserDomainMask,YES) firstObject] stringByAppendingPathComponent:@"SnapNotify"];

@@ -100,6 +100,9 @@ static NSString *enumName(id object, NSString *field, NSNumber *number) {
     return nil;
 }
 static SNReceiveKind kindForField(id object, NSString *field, BOOL *present) {
+    NSString *hasKey=[@"has" stringByAppendingString:[field stringByReplacingCharactersInRange:NSMakeRange(0,1) withString:[[field substringToIndex:1] uppercaseString]]];
+    id has=SNRead(object,hasKey);
+    if([has isKindOfClass:NSNumber.class]&&![has boolValue])return SN_RX_NONE;
     id value=SNRead(object,field);if(!value||value==NSNull.null)return SN_RX_NONE;*present=YES;
     NSString *symbol=[value isKindOfClass:NSString.class]?value:nil;
     if([value isKindOfClass:NSNumber.class]) {
@@ -166,7 +169,7 @@ static void collect(id obj,NSString *inheritedConversation,NSString *hint,NSMuta
         id descriptor=rxDescriptor(obj);
         id senderObject=rxFirst(obj,@[@"sender",@"fromUser"]);
         NSString *sender=SNIdentifier(rxFirst(obj,@[@"senderId",@"senderUserId",@"fromUserId",@"senderID"]))
-            ?: SNIdentifier(rxFirst(metadata,@[@"senderId",@"senderUserId"])) ?: SNIdentifier(senderObject)
+            ?: SNIdentifier(rxFirst(metadata,@[@"senderId",@"senderUserId"])) ?: SNIdentifier(rxFirst(descriptor,@[@"senderId",@"senderUserId"])) ?: SNIdentifier(senderObject)
             ?: SNIdentifier(rxFirst(senderObject,@[@"userId",@"userID",@"snapchatUserId"]));
         NSString *eid=SNMessageIdentifier(rxFirst(obj,@[@"messageId",@"messageID",@"serverMessageId",@"snapId",@"snapID",@"clientMessageId"]))
             ?: SNMessageIdentifier(rxFirst(descriptor,@[@"messageId",@"messageID",@"serverMessageId"]));
@@ -221,14 +224,17 @@ static void collect(id obj,NSString *inheritedConversation,NSString *hint,NSMuta
                         double seconds=sn_receive_seconds([ts doubleValue]);
                         if(!isfinite(seconds)){reject(rejected,@"invalid-time");return;}event[@"timestamp"]=@(seconds);
                     }
-                    if(rxTrue(obj,@[@"isIncoming"])||rxTrue(metadata,@[@"isIncoming"]))event[@"incoming"]=@YES;
+                    id outgoing=SNRead(obj,@"isOutgoing") ?: SNRead(metadata,@"isOutgoing");
+                    id hasOutgoing=SNRead(obj,@"hasIsOutgoing") ?: SNRead(metadata,@"hasIsOutgoing");
+                    if([hasOutgoing isKindOfClass:NSNumber.class]&&![hasOutgoing boolValue])outgoing=nil;
+                    if(rxTrue(obj,@[@"isIncoming"])||rxTrue(metadata,@[@"isIncoming"])||([outgoing isKindOfClass:NSNumber.class]&&![outgoing boolValue]))event[@"incoming"]=@YES;
                     [eventKeys addObject:key];[out addObject:[event copy]];
                 }
             }
         }
         /* Traverse only structural envelopes, never message text or raw blobs.
            Inherit conversation context, not sender IDs or message IDs. */
-        for(NSString *key in @[@"message",@"snap",@"receivedSnap",@"receivedMessage",@"messages",@"receivedMessages",@"newMessages",@"addedMessages",@"insertedMessages",@"snaps",@"updates",@"update",@"items",@"entries",@"conversation",@"conversations",@"conversationViewModel",@"viewModel",@"messageData",@"payload",@"notification",@"inAppNotification",@"userInfo"]){
+        for(NSString *key in @[@"message",@"snap",@"receivedSnap",@"receivedMessage",@"messages",@"receivedMessages",@"newMessages",@"addedMessages",@"insertedMessages",@"snaps",@"updates",@"update",@"items",@"entries",@"conversation",@"conversations",@"conversationViewModel",@"viewModel",@"messageData",@"latestMessage",@"lastMessage",@"messageList",@"messagesArray",@"snapsArray",@"payload",@"notification",@"inAppNotification",@"userInfo"]){
             if(!*budget)break;id child=SNRead(obj,key);if(child)collect(child,conversation,hint,out,rejected,shapes,path,eventKeys,identities,depth+1,budget);
         }
     } @finally {[path removeObject:obj];}
@@ -251,10 +257,12 @@ NSArray<NSDictionary *> *SNReceivedRecords(id obj,NSString *hint) {
 
 @interface SNReceiveTracker ()
 @property(nonatomic,strong) NSMutableDictionary<NSString *,NSMutableDictionary *> *conversations;
+@property(nonatomic) NSTimeInterval monitoringStart;
 @end
 @implementation SNReceiveTracker
-- (instancetype)init {self=[super init];if(self)_conversations=[NSMutableDictionary dictionary];return self;}
-- (void)reset {[self.conversations removeAllObjects];}
+- (instancetype)init {return [self initWithMonitoringStart:0];}
+- (instancetype)initWithMonitoringStart:(NSTimeInterval)start {self=[super init];if(self){_conversations=[NSMutableDictionary dictionary];_monitoringStart=isfinite(start)&&start>0?start:0;}return self;}
+- (void)reset {[self.conversations removeAllObjects];if(self.monitoringStart>0)self.monitoringStart=NSDate.date.timeIntervalSince1970;}
 - (NSArray<NSDictionary *> *)newEventsInSnapshot:(NSArray<NSDictionary *> *)events wallTime:(NSTimeInterval)wall {
     NSMutableDictionary *identities=[NSMutableDictionary dictionary];
     for(NSDictionary *e in events){NSString *cid=e[@"conversation"];if(!cid||!e[@"event"])continue;if(!identities[cid])identities[cid]=[NSMutableArray array];[identities[cid] addObject:e[@"event"]];}
@@ -274,14 +282,30 @@ NSArray<NSDictionary *> *SNReceivedRecords(id obj,NSString *hint) {
             state=[@{@"seen":[NSMutableSet set],@"start":@(wall),@"last":@(wall)} mutableCopy];self.conversations[cid]=state;
         }
         NSMutableSet *seen=state[@"seen"];
-        /* Compare against the previous snapshot, then add *all* identities,
-           including messages whose type/sender was not yet decoded. */
+        NSMutableDictionary *waiting=state[@"waiting"];
+        if(!waiting){waiting=[NSMutableDictionary dictionary];state[@"waiting"]=waiting;}
+        NSMutableSet *decodedIDs=[NSMutableSet set];
         for(NSDictionary *e in groups[cid]) {
-            NSString *key=e[@"event"];if(!key||[seen containsObject:key]||seen.count>=2048)continue;
-            [seen addObject:key];NSNumber *ts=e[@"timestamp"];
-            if(!initial&&ts&&sn_receive_time_valid(ts.doubleValue,wall)&&ts.doubleValue>=[state[@"start"] doubleValue]-1)[out addObject:e];
+            NSString *key=e[@"event"];if(!key)continue;[decodedIDs addObject:key];
+            BOOL known=[seen containsObject:key];if(!known&&seen.count>=2048)continue;NSNumber *firstSeen=waiting[key];
+            NSNumber *ts=e[@"timestamp"];
+            BOOL fresh=ts&&sn_receive_time_valid(ts.doubleValue,wall);
+            BOOL firstLive=initial&&self.monitoringStart>0&&[e[@"incoming"] boolValue]&&fresh&&ts.doubleValue>=self.monitoringStart;
+            BOOL newlyDecoded=known&&firstSeen&&fresh&&ts.doubleValue>=firstSeen.doubleValue-1;
+            if(!known&&seen.count<2048)[seen addObject:key];
+            if((!known&&(!initial||firstLive))||newlyDecoded) {
+                double start=firstLive?self.monitoringStart:[state[@"start"] doubleValue]-1;
+                if(fresh&&ts.doubleValue>=start)[out addObject:e];
+            }
+            [waiting removeObjectForKey:key];
         }
-        for(NSString *eid in identities[cid]){if(seen.count>=2048)break;[seen addObject:eid];}
+        /* Remember first sighting only for unknown records appearing AFTER a
+           baseline; delayed decoding of old baseline history stays silent. */
+        for(NSString *eid in identities[cid]){
+            if(![seen containsObject:eid]&&!initial&&![decodedIDs containsObject:eid]&&waiting.count<256)waiting[eid]=@(wall);
+            if(seen.count<2048)[seen addObject:eid];
+        }
+        for(NSString *eid in [waiting allKeys])if(wall-[waiting[eid] doubleValue]>300)[waiting removeObjectForKey:eid];
         state[@"last"]=@(wall);
     }
     return [out copy];

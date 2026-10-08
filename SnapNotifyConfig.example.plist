@@ -34,5 +34,7 @@
 	<string></string>
 	<key>TypingInactiveStates</key>
 	<array/>
+	<key>NativeNotificationBridge</key>
+	<true/>
 </dict>
 </plist>

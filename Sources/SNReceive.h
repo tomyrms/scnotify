@@ -13,6 +13,8 @@ NSDictionary *SNDecodeReceived(NSArray *arguments, NSString * _Nullable conversa
 /* Snapshot observers are not receive callbacks. The first image seeds a
    baseline; only subsequent new IDs with fresh creation times can notify. */
 @interface SNReceiveTracker : NSObject
+/* A positive start permits first-batch incoming records created after start. */
+- (instancetype)initWithMonitoringStart:(NSTimeInterval)start;
 - (NSArray<NSDictionary *> *)newEventsInSnapshot:(NSArray<NSDictionary *> *)events wallTime:(NSTimeInterval)wall;
 - (NSArray<NSDictionary *> *)newEventsInBatch:(NSDictionary *)batch wallTime:(NSTimeInterval)wall;
 - (void)reset;

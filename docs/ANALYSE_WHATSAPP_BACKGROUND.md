@@ -96,7 +96,7 @@ Dans `SharedModules.framework` (le vrai cœur réseau, 70 Mo, 116 dépendances) 
 Quand iOS suspend l'app (≈30 s après le passage en arrière-plan), le socket meurt. WhatsApp compte alors sur :
 
 - **Pushs silencieux** (`content-available`) : `didReceiveRemoteNotification:fetchCompletionHandler:`, `silentPushNotifCode`, `silentPushNotifRegCode:iosDeviceRegistrationUUID:…` — le push réveille l'app quelques secondes, elle se reconnecte et télécharge le delta.
-- **Pushs visibles** : le popup lui-même est poussé par Meta (avec la content-extension `NotificationExtension` qui déchiffre le contenu E2E si besoin), pendant que l'app se réveille pour synchroniser.
+- **Pushs visibles** : le popup lui-même est poussé par Meta (avec la service-extension `ServiceExtension` qui déchiffre/modifie le contenu E2E avant livraison), pendant que l'app se réveille pour synchroniser.
 - **VoIP PushKit** (appels) : `PKPushRegistry`, `PKPushCredentials`, `PKPushPayload`, `PKPushTypeVoIP`, `parse_voip_push_payload`, `hasValidVOIPToken`, entitlement `pushkit.unrestricted-voip` — les pushs VoIP ont un statut privilégié (réveil quasi garanti, exécution immédiate).
 - **Background fetch / BGTask (filet de sécurité)** : `performFetchWithCompletionHandler:`, `WABackgroundAppRefreshTask`, `WABackgroundFetchTask`, `BGAppRefreshTaskRequest`, `BGProcessingTaskRequest`, `earliestBeginDate`, `requestForBackgroundAppRefreshTask:` + framework `BackgroundTasks` lié. iOS réveille périodiquement l'app (opportuniste, minutes→heures) même sans push ; l'app en profite pour se reconnecter et rattraper.
 
@@ -180,7 +180,7 @@ Tout est faisable dans le tweak actuel, sur le modèle exact de WhatsApp :
    - laisser la reconnexion duplex se faire (le socket Snapchat se rétablit seul dès que le process tourne) ;
    - **déclencher la synchro delta** : le binaire Snapchat contient `performDeltaSync` et les classes `SCDeltaSync*` (déjà repérées) — à retrouver à l'exécution pour appeler la méthode (c'est le même rôle que la reprise WhatsApp) ;
    - laisser les hooks de réception (SNReceive) décoder ce qui arrive, poster les notifications (ledger déjà en place), puis **re-planifier** la tâche suivante + `setTaskCompleted`.
-4. **Fallback legacy** : hooker `application:performFetchWithCompletionHandler:` pour les réveils « fetch » classiques.
+4. **Un seul mécanisme de fetch à la fois** : la seule présence de `BGTaskSchedulerPermittedIdentifiers` désactive le background fetch legacy (`application:performFetchWithCompletionHandler:`) sur iOS 13+. Choisir BGTaskScheduler (points 2–3) — ne pas combiner les deux.
 5. **Limites honnêtes** : iOS accorde ces réveils de façon opportuniste (délai variable de quelques minutes à quelques heures, selon ton usage). Ce n'est **pas** de l'instantané comme un push — mais ça remplace le « jamais » par « rattrapage régulier », exactement le filet de sécurité de WhatsApp. Si l'utilisateur force-quit l'app, iOS peut suspendre ces tâches.
 6. **Conserver** le keep-alive audio actuel (mode expérimental) : c'est la période où l'app reste éveillée et reçoit en temps réel (typing instantané).
 
@@ -207,7 +207,7 @@ Tout est faisable dans le tweak actuel, sur le modèle exact de WhatsApp :
 `WANotificationsMain`, `WANotificationsShared`, `WANotificationSuppression`, `WAMessageNotificationBehavior`, `UNUserNotificationCenter`, `addNotificationRequest:withCompletionHandler:`
 
 ### 7.5 Extensions
-`NotificationExtension` = `com.apple.usernotifications.content-extension` (déchiffre le contenu des pushs) ; `ServiceExtension` = `com.apple.usernotifications.service` (télécharge les médias des pushs).
+`ServiceExtension` = `com.apple.usernotifications.service` (déchiffre/modifie la notification **avant** sa livraison — c'est le chemin du contenu E2E) ; `NotificationExtension` = `com.apple.usernotifications.content-extension` (interface personnalisée pour l'affichage de la notification déjà livrée).
 
 ### 7.6 Fichiers analysés
 - `wgold34/Payload/WhatsApp.app` (extraction de `WGold_3.4.ipa`)
