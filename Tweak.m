@@ -207,7 +207,7 @@ static void sck_scan(void) {
         NSSet *tset = [NSSet setWithArray:targets];
         int n = objc_getClassList(NULL, 0);
         if (n <= 0) return;
-        Class *list = malloc(sizeof(Class) * n);
+        __unsafe_unretained Class *list = (__unsafe_unretained Class *)malloc(sizeof(Class) * n);
         if (!list) return;
         n = objc_getClassList(list, n);
         for (int i = 0; i < n; i++) {
