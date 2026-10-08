@@ -1,0 +1,65 @@
+{
+  "Tweak.m": {
+    "before_sha256": "6518a7e686170449526d8b25c8ded7cb9b9952bea494d2829dcac2ad431711d5",
+    "after_sha256": "aecd9a8f9a8d17321aa0dd339ff9fbc9fdfa43932bd1741bae044124bc3dcab1",
+    "replacements": [
+      [0,1,"// SnapNotify 4.0.0-rc5.1 — explicit event adapters, not notifications from hook names.\n"],
+      [8,9,"#import \"Sources/SNDeliveryQueue.h\"\n"],
+      [17,18,"static NSString * const SNVersion=@\"4.0.0-rc5.1\";\n"],
+      [40,42,"static SNDeliveryQueue *contentDelivery;\nstatic NSDictionary *contentDeliveryStats;\nstatic void configureDelivery(void);\n"],
+      [43,48,""],
+      [147,148,""],
+      [149,150,"        queueGeneration++;\n"],
+      [151,153,"        [contentDelivery clearWithCompletion:^(NSArray *identifiers){\n            [[UNUserNotificationCenter currentNotificationCenter] removePendingNotificationRequestsWithIdentifiers:identifiers];\n            [[UNUserNotificationCenter currentNotificationCenter] removeDeliveredNotificationsWithIdentifiers:identifiers];\n        }];\n        NSArray *owned=issuedRequests.allKeys;\n"],
+      [166,167,"    configureDelivery();cacheDirty=users.count>0;logLine(@\"ACCOUNT-CHANGED account=%@ cache=%lu\",shortID(uid),(unsigned long)users.count);\n"],
+      [207,243,"static void configureDelivery(void) {\n    [contentDelivery configureScopes:deliveryScopes()\n                            session:[@\"session/\" stringByAppendingString:session]\n                            account:account enabled:enabled(@\"Enabled\")\n                            spacing:setting(@\"NotificationSpacingSeconds\",0.4,0.05,2)];\n}\nstatic void scheduleOutbox(double delay) {\n    (void)delay;[contentDelivery requestDrain];\n}\n/* Submitter is called on the isolated storage lane. Return immediately to it;\n   resolve names and configuration on worker, without asking the host to wait. */\nstatic void submitContent(NSDictionary *event,NSString *rid,void (^completion)(NSError *)) {\n    dispatch_async(worker,^{\n        if(!contentEnabled(event)||![deliveryScopes() containsObject:event[@\"deliveryScope\"]]){\n            completion([NSError errorWithDomain:SNDeliveryBlockedErrorDomain code:1 userInfo:nil]);return;\n        }\n        uint64_t generation=queueGeneration;\n        UNMutableNotificationContent *content=[UNMutableNotificationContent new];\n        content.title=@\"Snapchat\";content.body=bodyFor(event,resolveName(event[@\"uid\"]));\n        content.sound=UNNotificationSound.defaultSound;\n        content.threadIdentifier=[@\"snapnotify.\" stringByAppendingString:event[@\"conversation\"]];\n        content.userInfo=@{@\"scnotify\":@YES,@\"version\":SNVersion,@\"kind\":event[@\"kind\"],@\"subtype\":event[@\"subtype\"]?:@\"snap\"};\n        UNNotificationRequest *request=[UNNotificationRequest requestWithIdentifier:rid content:content trigger:nil];\n        issuedRequests[rid]=@(nowTime());\n        logLine(@\"OUTBOX-REQUEST type=%@ subtype=%@\",event[@\"kind\"],event[@\"subtype\"]?:@\"snap\");\n        [[UNUserNotificationCenter currentNotificationCenter] addNotificationRequest:request withCompletionHandler:^(NSError *error){\n            dispatch_async(worker,^{\n                if(generation!=queueGeneration){\n                    [[UNUserNotificationCenter currentNotificationCenter] removePendingNotificationRequestsWithIdentifiers:@[rid]];\n                    [[UNUserNotificationCenter currentNotificationCenter] removeDeliveredNotificationsWithIdentifiers:@[rid]];\n                    completion([NSError errorWithDomain:SNDeliveryBlockedErrorDomain code:2 userInfo:nil]);return;\n                }\n                if(error&&[error.domain isEqual:UNErrorDomain]&&error.code==UNErrorCodeNotificationsNotAllowed)\n                    completion([NSError errorWithDomain:SNDeliveryBlockedErrorDomain code:error.code userInfo:nil]);\n                else completion(error);\n            });\n        }];\n"],
+      [245,250,"static void startContentDelivery(void) {\n    contentDelivery=[[SNDeliveryQueue alloc] initWithDirectory:[support stringByAppendingPathComponent:@\"outbox-v5\"]\n        submitter:^(NSDictionary *event,NSString *rid,void (^completion)(NSError *)){submitContent(event,rid,completion);}\n        reporter:^(NSString *stage,NSDictionary *details){\n            dispatch_async(worker,^{\n                if([stage isEqual:@\"accepted\"]){\n                    postedCount++;\n                    logLine(@\"NOTIF-ACCEPTED type=%@ subtype=%@ path=outbox\",details[@\"kind\"],details[@\"subtype\"]);\n                }else logLine(@\"DELIVERY stage=%@ details=%@\",stage,details);\n            });\n        }];\n    configureDelivery();[contentDelivery resumeBlocked];\n"],
+      [304,305,""],
+      [307,310,"        [contentDelivery enqueueEvent:[queued copy] scope:account?:[@\"session/\" stringByAppendingString:session]];\n"],
+      [473,482,"    unsigned pending=atomic_fetch_add(&receiveInflight,1)+1;\n    if(pending>64)atomic_fetch_add(&receiveBackpressure,1);\n    /* Hook callers may hold Snapchat or runtime locks. Never wait for worker,\n       even under a burst. Work contains detached data, not host objects. */\n    SNEnqueueObservedWork(worker,^{\n        @try{work();}@finally{atomic_fetch_sub(&receiveInflight,1);}\n    });\n"],
+      [736,739,"    status[@\"outbox\"]=contentDeliveryStats?:@{@\"loading\":@YES};\n    status[@\"receiveBackpressureWaits\"]=@0;\n    status[@\"receiveAsyncPressureEvents\"]=@(atomic_load(&receiveBackpressure));\n    status[@\"receiveWorkPending\"]=@(atomic_load(&receiveInflight));\n    [contentDelivery statisticsWithCompletion:^(NSDictionary *snapshot){\n        dispatch_async(worker,^{contentDeliveryStats=snapshot;});\n    }];\n"],
+      [764,765,"        logLine(@\"LIFECYCLE active\");scan();dispatch_async(worker,^{loadConfig();NSString *uid=SNIdentifier(config[@\"SelfUserID\"]);if(uid)setAccount(uid);configureDelivery();[contentDelivery resumeBlocked];scheduleOutbox(0);writeStatus();});\n"],
+      [776,776,"        atomic_store(&appState,UIApplication.sharedApplication.applicationState);\n"],
+      [793,793,"    if(UIApplication.sharedApplication.applicationState==UIApplicationStateBackground){\n        atomic_store(&appState,UIApplicationStateBackground);\n        backgroundStartedWall=NSDate.date.timeIntervalSince1970;startExperiment();recordBackgroundHealth();\n    }\n"],
+      [795,796,"static void bootstrap(void) {\n"],
+      [803,804,""],
+      [811,812,""],
+      [813,815,"        logLine(@\"BOOTSTRAP-BEGIN version=%@\",SNVersion);\n        dispatch_async(worker,^{\n            loadConfig();NSString *uid=SNIdentifier(config[@\"SelfUserID\"]);if(uid)setAccount(uid);\n            startContentDelivery();\n            dispatch_async(dispatch_get_main_queue(),^{setup();});\n        });\n"],
+      [817,817,"\n/* Do not initialize Objective-C services, read the outbox or synchronously\n   dispatch work while the loader is running this library's constructor. */\n__attribute__((constructor)) static void start(void) {\n    dispatch_async(dispatch_get_main_queue(),^{bootstrap();});\n}\n"]
+    ]
+  },
+  "Sources/SNOutbox.m": {
+    "before_sha256":"712ce51d76661839ddb4c70d98576fe4b1bba5296a03cfe77cb3b0fa7dd632e4",
+    "after_sha256":"ddfe289081289ea4213b29573aeb2f3f52a6b3e26470b6dbcc8ecddb74b19d0a",
+    "replacements":[
+      [30,30,"    if(!self.directory.length){self.ioFailures++;return NO;}\n"],
+      [35,35,"}\n- (instancetype)initInMemory {\n    self=[super init];if(self){_records=[NSMutableDictionary dictionary];_ioFailures=1;}return self;\n"],
+      [50,51,"        NSDictionary *r=[NSDictionary dictionaryWithContentsOfFile:p];\n        if(![r isKindOfClass:NSDictionary.class]){self.invalidFiles++;continue;}\n        NSDictionary *e=safeEvent(r[@\"event\"]);\n"],
+      [66,67,"        if(!self.directory.length||![NSFileManager.defaultManager fileExistsAtPath:[self path:key]]||[NSFileManager.defaultManager removeItemAtPath:[self path:key] error:NULL])[self.records removeObjectForKey:key];else self.ioFailures++;\n"],
+      [125,126,"    for(NSString *rid in ids)if(self.directory.length&&[NSFileManager.defaultManager fileExistsAtPath:[self path:rid]]&&![NSFileManager.defaultManager removeItemAtPath:[self path:rid] error:NULL])self.ioFailures++;\n"]
+    ]
+  },
+  "Sources/SNOutbox.h": {
+    "before_sha256":"d4aa4113f4c4d193f0596c8b690aed6f01857daf38f1da0f10515fe785dd7a19",
+    "after_sha256":"a627a90c475e739a15792d900fbaf021a5a9dc44394f334db49e789f50b59b34",
+    "replacements":[[6,6,"- (instancetype)initInMemory;\n"]]
+  },
+  "Makefile": {
+    "before_sha256":"be56fcee9a2470edc24594438ef742ca6ee8333e2158cd75075a81dbc4d96376",
+    "after_sha256":"f00b437996abeb948e6e3f9f6ef35c221a1e115d80c48897816417dde679d272",
+    "replacements":[[9,10,"SnapNotify_FILES = Tweak.m Sources/SNRuntime.m Sources/SNReceive.m Sources/SNHostNotice.m Sources/SNContent.m Sources/SNOutbox.m Sources/SNDeliveryQueue.m Core/SNCore.c Core/SNReceivePolicy.c\n"]]
+  },
+  "scripts/build-macos.sh": {
+    "before_sha256":"cc9dd3aa0cc40497efdfd4f6522ff6bf64d24661af3784d3113103cc3ef15d7b",
+    "after_sha256":"66d852bcb2097d41ef0e74391bde5748f8f416bf83a596c58bcf9829eb320883",
+    "replacements":[
+      [19,19,"\"$cc\" \"${flags[@]}\" -fobjc-arc -fblocks -c Sources/SNDeliveryQueue.m -o build/SNDeliveryQueue.o\n"],
+      [21,22,"  build/SNCore.o build/SNReceivePolicy.o build/SNRuntime.o build/SNReceive.o build/SNHostNotice.o build/SNContent.o build/SNOutbox.o build/SNDeliveryQueue.o build/Tweak.o \\\n"]
+    ]
+  },
+  "scripts/test-macos.sh": {
+    "before_sha256":"491d8af2f925754adf5309e49c6b3ef4955a7645578a414e16632fb8dd53976a",
+    "after_sha256":"5635c0cf64d4b98c19d1e7851b50ccf629559999cfa391404a8f47ae26fed927",
+    "replacements":[[39,39,"\n# Real production delivery scheduler under a blocked storage lane, continuous\n# input and a host lock. This is not a reimplementation of the queue logic.\nxcrun clang -std=gnu11 -fobjc-arc -fblocks -Wall -Wextra -Werror \\\n  -Wno-deprecated-declarations -framework Foundation -framework CoreFoundation \\\n  Sources/SNRuntime.m Sources/SNReceive.m Sources/SNContent.m Sources/SNOutbox.m Sources/SNDeliveryQueue.m \\\n  tests/TestDeliveryQueue.m \"$build/core.o\" \"$build/policy.o\" -o \"$build/test_delivery_queue\"\n\"$build/test_delivery_queue\"\n"]]
+  }
+}
