@@ -1,5 +1,6 @@
-// SnapNotify v2.0 — keep-alive + local notification bridge for Snapchat
-// Pure ObjC runtime swizzling (no substrate/Logos). Thread-safe, throttled, rotation-safe log.
+// SnapNotify v3.0 — keep-alive + local notification bridge for Snapchat
+// Adds: sender name extraction (KVC + protobuf description scan + userId cache),
+// per-type throttling, cross-hook dedup, Duplex realtime hooks.
 
 #import <Foundation/Foundation.h>
 #import <UIKit/UIKit.h>
@@ -13,12 +14,14 @@
 static AVAudioPlayer *gPlayer = nil;
 static NSMutableDictionary *gOrig = nil;
 static NSMutableDictionary *gThrottle = nil;
+static NSMutableDictionary *gNameCache = nil;
 static NSLock *gLock = nil;
 static NSString *gLogPath = nil;
 static NSTimer *gTimer = nil;
 static _Thread_local BOOL t_inhit = NO;
 
 static void sck_log(NSString *fmt, ...);
+static NSString *sck_extract_name(id obj, BOOL *found);
 
 #pragma mark - helpers
 
@@ -26,33 +29,92 @@ static NSString *sck_app_state(void) {
     return ([[UIApplication sharedApplication] applicationState] == UIApplicationStateBackground) ? @"BG" : @"FG";
 }
 
-static NSString *sck_try_user(id obj) {
-    if (!obj || ![obj isKindOfClass:[NSObject class]]) return @"";
-    NSArray *keys = @[@"username", @"senderUsername", @"displayName", @"senderDisplayName", @"name", @"title"];
-    for (NSString *k in keys) {
-        @try {
-            if ([obj respondsToSelector:NSSelectorFromString(k)]) {
-                id v = [obj valueForKey:k];
-                if ([v isKindOfClass:[NSString class]] && [(NSString *)v length] > 0 && [(NSString *)v length] < 40) return v;
-            }
-        } @catch (NSException *e) {}
-    }
-    return @"";
+static NSString *sck_regex_first(NSString *pattern, NSString *text) {
+    if (!pattern || !text || text.length < 4) return nil;
+    NSError *err = nil;
+    NSRegularExpression *re = [NSRegularExpression regularExpressionWithPattern:pattern options:NSRegularExpressionCaseInsensitive error:&err];
+    if (!re) return nil;
+    NSTextCheckingResult *m = [re firstMatchInString:text options:0 range:NSMakeRange(0, text.length)];
+    if (!m || m.numberOfRanges < 2) return nil;
+    NSRange r = [m rangeAtIndex:1];
+    if (r.location == NSNotFound || r.length == 0) return nil;
+    return [text substringWithRange:r];
 }
 
-static NSString *sck_label_for(NSString *cls, NSString *sel) {
-    NSString *all = [[cls stringByAppendingString:@":"] stringByAppendingString:sel];
-    NSString *low = [all lowercaseString];
-    NSString *clslow = [cls lowercaseString];
-    NSString *sellov = [sel lowercaseString];
-    if ([low containsString:@"typing"]) return @"écrit...";
-    if ([clslow containsString:@"sccall"] || [sellov containsString:@"callobserver"] || [sellov containsString:@"incomingcall"] || [sellov containsString:@"reportincoming"] || [sellov containsString:@"calldid"]) return @"t'appelle";
-    if ([low containsString:@"receivedsnap"]) return @"t'a envoyé un snap";
-    if ([low containsString:@"snapstate"]) return @"activité snap";
-    if ([low containsString:@"snapupdate"]) return @"activité snap";
-    if ([low containsString:@"messageupdate"] || [low containsString:@"conversationmessage"]) return @"activité chat";
-    if ([low containsString:@"chatmessage"] || [low containsString:@"chatconversation"]) return @"activité chat";
+static NSString *sck_event_type(NSString *cls, NSString *sel) {
+    NSString *low = [[[cls stringByAppendingString:@":"] stringByAppendingString:sel] lowercaseString];
+    if ([low containsString:@"typing"]) return @"typing";
+    if ([low containsString:@"sccall"] || [low containsString:@"callobserver"] || [low containsString:@"incomingcall"] || [low containsString:@"reportincoming"]) return @"call";
+    if ([low containsString:@"receivedsnap"]) return @"snap";
+    if ([low containsString:@"snapstate"] || [low containsString:@"snapupdate"] || [low containsString:@"snapdelta"]) return @"snapstate";
+    if ([low containsString:@"chatmessage"] || [low containsString:@"conversationmessage"] || [low containsString:@"messageupdate"] || [low containsString:@"chatconversation"] || [low containsString:@"chatormessage"] || [low containsString:@"receivedchat"]) return @"message";
+    if ([low containsString:@"message"] || [low containsString:@"conversation"] || [low containsString:@"receive"] || [low containsString:@"incoming"] || [low containsString:@"presence"]) return @"generic";
     return nil;
+}
+
+static NSString *sck_message_body(NSString *t, NSString *name) {
+    NSString *who = (name.length ? name : @"Quelqu'un");
+    if ([t isEqualToString:@"typing"]) return [NSString stringWithFormat:@"%@ est en train d'écrire...", who];
+    if ([t isEqualToString:@"call"]) return (name.length ? [NSString stringWithFormat:@"%@ t'appelle !", name] : @"Appel entrant !");
+    if ([t isEqualToString:@"snap"]) return [NSString stringWithFormat:@"%@ t'a envoyé un snap", who];
+    if ([t isEqualToString:@"snapstate"]) return [NSString stringWithFormat:@"%@ a vu/ouvert ton snap", who];
+    if ([t isEqualToString:@"message"]) return [NSString stringWithFormat:@"%@ t'a envoyé un message", who];
+    return [NSString stringWithFormat:@"activité de %@", who];
+}
+
+static NSString *sck_extract_name(id obj, BOOL *found) {
+    if (found) *found = NO;
+    if (!obj) return nil;
+    NSString *name = nil;
+    NSString *desc = nil;
+
+    if ([obj isKindOfClass:[NSDictionary class]]) {
+        NSDictionary *d = (NSDictionary *)obj;
+        for (id k in d) {
+            if (![k isKindOfClass:[NSString class]]) continue;
+            NSString *lk = [k lowercaseString];
+            id v = d[k];
+            if (![v isKindOfClass:[NSString class]]) continue;
+            if ([lk containsString:@"username"] || [lk containsString:@"displayname"] || ([lk containsString:@"name"] && ![lk containsString:@"filename"])) { name = v; break; }
+        }
+    }
+    if (!name) {
+        for (NSString *k in @[@"senderUsername", @"username", @"senderDisplayName", @"displayName", @"senderName", @"name"]) {
+            @try {
+                if ([obj respondsToSelector:NSSelectorFromString(k)]) {
+                    id v = [obj valueForKey:k];
+                    if ([v isKindOfClass:[NSString class]] && [(NSString *)v length] > 0 && [(NSString *)v length] < 40) { name = v; break; }
+                }
+            } @catch (NSException *e) {}
+        }
+    }
+    @try { desc = [obj description]; } @catch (NSException *e) { desc = nil; }
+    if (!name && desc) {
+        name = sck_regex_first(@"(?:senderUsername|username|senderDisplayName|displayName|senderName)[^A-Za-z0-9]{0,6}([A-Za-z0-9._-]{2,40})", desc);
+    }
+    NSString *ident = nil;
+    @try {
+        for (NSString *k in @[@"conversationId", @"senderId", @"userId"]) {
+            if ([obj respondsToSelector:NSSelectorFromString(k)]) {
+                id v = [obj valueForKey:k];
+                if ([v isKindOfClass:[NSString class]] && [(NSString *)v length] > 0 && [(NSString *)v length] < 64) { ident = v; break; }
+            }
+        }
+    } @catch (NSException *e) {}
+    if (!ident && desc) {
+        ident = sck_regex_first(@"(?:conversationId|senderId|userId)[^A-Za-z0-9]{0,6}([A-Za-z0-9._-]{2,64})", desc);
+    }
+    if (ident && name.length) {
+        [gLock lock];
+        gNameCache[ident] = name;
+        [gLock unlock];
+    } else if (!name && ident) {
+        [gLock lock];
+        name = gNameCache[ident];
+        [gLock unlock];
+    }
+    if (name.length && found) *found = YES;
+    return name;
 }
 
 #pragma mark - logging (thread-safe, rotation at 1 MB)
@@ -86,15 +148,15 @@ static void sck_log(NSString *fmt, ...) {
     [gLock unlock];
 }
 
-#pragma mark - local notification (throttled, thread-safe)
+#pragma mark - local notification (typed throttle, thread-safe)
 
-static void sck_notify_raw(NSString *key, NSString *title, NSString *body, BOOL silent) {
+static void sck_notify_thr(NSString *key, NSString *title, NSString *body, BOOL silent, double secs) {
     if (t_inhit) return;
     t_inhit = YES;
     @try {
         [gLock lock];
         NSDate *last = gThrottle[key];
-        BOOL skip = last && [[NSDate date] timeIntervalSinceDate:last] < 45.0;
+        BOOL skip = last && [[NSDate date] timeIntervalSinceDate:last] < secs;
         if (!skip) gThrottle[key] = [NSDate date];
         [gLock unlock];
         if (skip) { t_inhit = NO; return; }
@@ -109,32 +171,6 @@ static void sck_notify_raw(NSString *key, NSString *title, NSString *body, BOOL 
         }];
     } @catch (NSException *e) { sck_log(@"notify exc %@", e); }
     t_inhit = NO;
-}
-
-static void sck_notify_event(NSString *cls, NSString *sel, id a) {
-    NSString *label = sck_label_for(cls, sel);
-    NSString *lowsel = [[cls stringByAppendingString:sel] lowercaseString];
-    BOOL isEvent = (label != nil);
-    BOOL isCall = [lowsel containsString:@"sccall"] || [lowsel containsString:@"callobserver"] || [lowsel containsString:@"incomingcall"] || [lowsel containsString:@"reportincoming"];
-    BOOL isTyping = [lowsel containsString:@"typing"];
-    if (!isEvent) {
-        isEvent = [lowsel containsString:@"snap"] || [lowsel containsString:@"chat"] || [lowsel containsString:@"message"] || [lowsel containsString:@"conversation"] || [lowsel containsString:@"receive"] || [lowsel containsString:@"incoming"];
-    }
-    if (!isEvent) return;
-    BOOL active = ([[UIApplication sharedApplication] applicationState] == UIApplicationStateActive);
-    if (active && !isCall) return;
-    NSString *who = sck_try_user(a);
-    NSString *body;
-    if (isTyping) {
-        body = who.length ? [NSString stringWithFormat:@"%@ %@", who, @"est en train d'écrire..."] : @"quelqu'un est en train d'écrire...";
-    } else if (isCall) {
-        body = who.length ? [NSString stringWithFormat:@"%@ t'appelle !", who] : @"Appel entrant !";
-    } else if (label) {
-        body = who.length ? [NSString stringWithFormat:@"%@ : %@", who, label] : label;
-    } else {
-        body = [NSString stringWithFormat:@"activité (%@)", sel];
-    }
-    sck_notify_raw([NSString stringWithFormat:@"%@.%@", cls, sel], @"Snapchat", body, NO);
 }
 
 #pragma mark - silent audio keep-alive
@@ -235,12 +271,22 @@ static void sck_hit(id self, SEL _cmd, id a, id b) {
         BOOL interesting = [core containsString:@"typing"] || [core containsString:@"message"] || [core containsString:@"conversation"] || [core containsString:@"receive"] || [core containsString:@"incoming"] || [core containsString:@"call"] || [core containsString:@"presence"];
         if (!interesting) return;
         sck_log(@"NOTIFPOST %@", a);
-        sck_notify_raw([@"post" stringByAppendingString:a], @"Snapchat", [NSString stringWithFormat:@"activité (%@)", a], NO);
+        sck_notify_thr([@"post" stringByAppendingString:a], @"Snapchat", [NSString stringWithFormat:@"activité (%@)", a], NO, 10.0);
         return;
     }
     @try {
         sck_log(@"HIT [%@] -[%@ %@]", sck_app_state(), cls, sel);
-        sck_notify_event(cls, sel, a);
+        NSString *t = sck_event_type(cls, sel);
+        if (!t) return;
+        BOOL active = ([[UIApplication sharedApplication] applicationState] == UIApplicationStateActive);
+        if (active && ![t isEqualToString:@"call"]) return;
+        BOOL foundName = NO;
+        NSString *name = sck_extract_name(a, &foundName);
+        if (!name.length && b && b != a) name = sck_extract_name(b, &foundName);
+        NSString *body = sck_message_body(t, name);
+        double thr = [t isEqualToString:@"typing"] ? 60.0 : ([t isEqualToString:@"call"] ? 3.0 : 8.0);
+        NSString *key = [NSString stringWithFormat:@"%@|%@", t, name.length ? name : @"?"];
+        sck_notify_thr(key, @"Snapchat", body, NO, thr);
     } @catch (NSException *e) { sck_log(@"hit exc %@", e); }
 }
 
@@ -291,6 +337,23 @@ static void sck_hook_all(Class c) {
     free(ms);
 }
 
+static void sck_hook_duplex(Class c) {
+    unsigned mc = 0;
+    Method *ms = class_copyMethodList(c, &mc);
+    if (!ms) return;
+    for (unsigned j = 0; j < mc; j++) {
+        const char *sn = sel_getName(method_getName(ms[j]));
+        int colons = 0;
+        for (const char *p = sn; *p; p++) if (*p == ':') colons++;
+        if (colons > 3) continue;
+        if (!sck_enc_ok(ms[j], colons)) continue;
+        NSString *low = [[NSString stringWithUTF8String:sn] lowercaseString];
+        if (!([low containsString:@"message"] || [low containsString:@"receive"] || [low containsString:@"typing"] || [low containsString:@"snap"] || [low containsString:@"chat"])) continue;
+        sck_attach(c, ms[j]);
+    }
+    free(ms);
+}
+
 static void sck_scan(void) {
     @try {
         static NSArray *targets = nil;
@@ -327,6 +390,10 @@ static void sck_scan(void) {
             BOOL isSnapClass = cn && (strncmp(cn, "SC", 2) == 0 || strstr(cn, "Snapchat") != NULL);
             if (isSnapClass && (strstr(cn, "Typing") || strstr(cn, "CallState") || strstr(cn, "CallLauncher") || strstr(cn, "SCCallLogSyncer"))) {
                 sck_hook_all(c);
+                continue;
+            }
+            if (isSnapClass && strstr(cn, "Duplex")) {
+                sck_hook_duplex(c);
                 continue;
             }
             unsigned mc = 0;
@@ -380,7 +447,7 @@ static void sck_setup(void) {
             }
         }];
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 2 * NSEC_PER_SEC), dispatch_get_main_queue(), ^{
-            sck_notify_raw(@"boot", @"Snapchat", [NSString stringWithFormat:@"SnapNotify v2.2 chargé (%lu hooks)", (unsigned long)gOrig.count], YES);
+            sck_notify_thr(@"boot", @"Snapchat", [NSString stringWithFormat:@"SnapNotify v3.0 chargé (%lu hooks)", (unsigned long)gOrig.count], YES, 0.0);
         });
     }];
     gTimer = [NSTimer scheduledTimerWithTimeInterval:20.0 repeats:YES block:^(NSTimer *t) { sck_ensure_audio(); }];
@@ -394,6 +461,7 @@ __attribute__((constructor)) static void sck_init(void) {
         gLock = [NSLock new];
         gOrig = [NSMutableDictionary new];
         gThrottle = [NSMutableDictionary new];
+        gNameCache = [NSMutableDictionary new];
         sck_scan();
         dispatch_async(dispatch_get_main_queue(), ^{ sck_setup(); });
     }
