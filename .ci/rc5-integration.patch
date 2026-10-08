@@ -1,0 +1,373 @@
+diff --git a/Core/SNReceivePolicy.c b/Core/SNReceivePolicy.c
+--- a/Core/SNReceivePolicy.c
++++ b/Core/SNReceivePolicy.c
+@@ -26 +26 @@
+-    const char *const chats[]={"CHAT","TEXT","CHAT_MESSAGE","RECEIVED_CHAT","RECEIVED_CHAT_MESSAGE","MESSAGE_RECEIVED","EXTERNAL_MEDIA","NOTE","AUDIO_NOTE","STICKER","SHARE","LOCATION",NULL};
++    const char *const chats[]={"CHAT","TEXT","CHAT_MESSAGE","RECEIVED_CHAT","RECEIVED_CHAT_MESSAGE","MESSAGE_RECEIVED","EXTERNAL_MEDIA","NOTE","AUDIO_NOTE","VOICE_NOTE","STICKER","SHARE","LOCATION",NULL};
+diff --git a/Makefile b/Makefile
+--- a/Makefile
++++ b/Makefile
+@@ -10 +10 @@
+-SnapNotify_FILES = Tweak.m Sources/SNRuntime.m Sources/SNReceive.m Sources/SNHostNotice.m Core/SNCore.c Core/SNReceivePolicy.c
++SnapNotify_FILES = Tweak.m Sources/SNRuntime.m Sources/SNReceive.m Sources/SNHostNotice.m Sources/SNContent.m Sources/SNOutbox.m Core/SNCore.c Core/SNReceivePolicy.c
+diff --git a/Sources/SNReceive.h b/Sources/SNReceive.h
+--- a/Sources/SNReceive.h
++++ b/Sources/SNReceive.h
+@@ -9,0 +10 @@
++void SNEnumerateReceiveBatches(NSString *className, NSString *selector, NSArray *arguments, void (^visit)(NSDictionary *batch));
+diff --git a/Sources/SNReceive.m b/Sources/SNReceive.m
+--- a/Sources/SNReceive.m
++++ b/Sources/SNReceive.m
+@@ -2,0 +3 @@
++#import "SNContent.h"
+@@ -74 +75 @@
+-    BOOL chat=rxTrue(object,@[@"isTextMessage",@"isChatMediaMessage",@"isVoiceNote",@"isStickerMessage",@"isContentShareMessage",@"isStoryReplyMessage"]);
++    BOOL chat=rxTrue(object,@[@"isTextMessage",@"isChatMediaMessage",@"isVoiceNote",@"isStickerMessage",@"isContentShareMessage",@"isStoryReplyMessage",@"isSingleImageChatMedia",@"isSingleImageOrVideoChatMedia",@"isBitmojiSticker",@"isBloopMessage",@"isSpotlightStoryShareMessage",@"isSpotlightCommentShareMessage",@"isBitmojiUserShare"]);
+@@ -267,0 +269 @@
++                    if(kind==SN_RX_MESSAGE)event[@"subtype"]=SNContentSubtype(obj,content);
+@@ -331,0 +334,17 @@
++void SNEnumerateReceiveBatches(NSString *className,NSString *selector,NSArray *arguments,void (^visit)(NSDictionary *)) {
++    if(!visit)return;
++    NSUInteger index=NSNotFound;
++    if([className isEqual:@"SCArroyoConversationDataUpdateAnnouncer"]&&[selector isEqual:@"onConversationUpdated:conversation:updatedMessages:removedMessages:"]&&arguments.count==4)index=2;
++    else if([selector isEqual:@"didReceiveMessages:"]||[selector isEqual:@"onMessagesReceived:"]||[selector isEqual:@"onNewMessages:"])index=0;
++    else if([selector isEqual:@"conversation:didReceiveMessages:"]||[selector isEqual:@"conversationId:didReceiveMessages:"])index=1;
++    id list=index<arguments.count?arguments[index]:nil;
++    if([list isKindOfClass:NSSet.class])list=[list allObjects];
++    if(![list isKindOfClass:NSArray.class]||[list count]<=128){visit(SNDecodeReceiveCallback(className,selector,arguments));return;}
++    for(NSUInteger offset=0;offset<[list count];offset+=128){
++        @autoreleasepool {
++            NSMutableArray *args=[arguments mutableCopy];
++            args[index]=[list subarrayWithRange:NSMakeRange(offset,MIN((NSUInteger)128,[list count]-offset))];
++            visit(SNDecodeReceiveCallback(className,selector,args));
++        }
++    }
++}
+@@ -360,3 +379,3 @@
+-            state=[@{@"seen":[NSMutableSet set],@"start":@(wall),@"last":@(wall)} mutableCopy];self.conversations[cid]=state;
+-        }
+-        NSMutableSet *seen=state[@"seen"];
++            state=[@{@"seen":[NSMutableOrderedSet orderedSet],@"start":@(wall),@"last":@(wall)} mutableCopy];self.conversations[cid]=state;
++        }
++        NSMutableOrderedSet *seen=state[@"seen"];
+@@ -368 +387,3 @@
+-            BOOL known=[seen containsObject:key];if(!known&&seen.count>=2048)continue;NSNumber *firstSeen=waiting[key];
++            BOOL known=[seen containsObject:key];
++            if(!known&&seen.count>=8192){NSString *old=seen.firstObject;[seen removeObjectAtIndex:0];[waiting removeObjectForKey:old];}
++            NSNumber *firstSeen=waiting[key];
+@@ -373 +394 @@
+-            if(!known&&seen.count<2048)[seen addObject:key];
++            if(!known)[seen addObject:key];
+@@ -392 +413 @@
+-            if(seen.count<2048)[seen addObject:eid];
++            if(![seen containsObject:eid]){if(seen.count>=8192){NSString *old=seen.firstObject;[seen removeObjectAtIndex:0];[waiting removeObjectForKey:old];}[seen addObject:eid];}
+diff --git a/Tweak.m b/Tweak.m
+--- a/Tweak.m
++++ b/Tweak.m
+@@ -1 +1 @@
+-// SnapNotify 4.0.0-rc4 — explicit event adapters, not notifications from hook names.
++// SnapNotify 4.0.0-rc5 — explicit event adapters, not notifications from hook names.
+@@ -7,0 +8,2 @@
++#import "Sources/SNContent.h"
++#import "Sources/SNOutbox.h"
+@@ -16 +18 @@
+-static NSString * const SNVersion=@"4.0.0-rc4";
++static NSString * const SNVersion=@"4.0.0-rc5";
+@@ -38,0 +41,14 @@
++static char workerKey;
++static SNOutbox *outbox;
++static SNRemoteParticipants *remoteParticipants;
++static BOOL outboxBusy=NO;
++static double outboxNextSubmissionAt=0;
++static NSString *outboxActiveID;
++static NSUInteger outboxActiveAttempt, outboxAcceptedThisRun, outboxTimeouts;
++static uint64_t outboxScheduleToken;
++static atomic_ulong receiveBackpressure;
++static NSDictionary *backgroundHealth;
++static double backgroundStartedWall=0,lastHeartbeatWall=0,maxHeartbeatGap=0;
++static NSUInteger heartbeatGaps=0,audioRecoveryAttempts=0;
++static BOOL backgroundNeedsUserResume=NO;
++static void scheduleOutbox(double delay);
+@@ -98,0 +115,2 @@
++        @"VoiceNotifications":@YES,@"MediaNotifications":@YES,@"StickerNotifications":@YES,@"ShareNotifications":@YES,
++        @"NotificationSpacingSeconds":@0.4,
+@@ -129,0 +148 @@
++    if(!switching)[outbox bindSessionScope:[@"session/" stringByAppendingString:session] toAccount:account];
+@@ -131,2 +150,4 @@
+-        queueGeneration++;
+-        NSArray *owned=issuedRequests.allKeys;
++        queueGeneration++;outboxScheduleToken++;outboxBusy=NO;outboxActiveID=nil;
++        [remoteParticipants reset];
++        NSArray *outboxIDs=[outbox clear];
++        NSArray *owned=[issuedRequests.allKeys arrayByAddingObjectsFromArray:outboxIDs?:@[]];
+@@ -173,6 +194 @@
+-    NSString *kind=event[@"kind"];
+-    if([kind isEqual:@"typing"])return [who stringByAppendingString:@" est en train d’écrire…"];
+-    if([kind isEqual:@"peek"])return [who stringByAppendingString:@" entrouvre la conversation"];
+-    if([kind isEqual:@"snap"])return [who stringByAppendingString:@" t’a envoyé un snap"];
+-    if([kind isEqual:@"message"])return [who stringByAppendingString:@" t’a envoyé un message"];
+-    return [who stringByAppendingString:[event[@"video"] boolValue]?@" t’appelle en vidéo":@" t’appelle"];
++    return SNNotificationBody(event,who);
+@@ -180,0 +197,55 @@
++/* Chats/snaps use a durable outbox; calls and presence keep their immediate
++   path. No 15-second pending expiry, no global sender throttle for content. */
++static NSSet *deliveryScopes(void) {
++    NSString *transient=[@"session/" stringByAppendingString:session];
++    return account.length?[NSSet setWithArray:@[transient,account]]:[NSSet setWithObject:transient];
++}
++static BOOL contentEnabled(NSDictionary *event) {
++    if(!eventEnabled(event[@"kind"]))return NO;
++    NSDictionary *flags=@{@"voice":@"VoiceNotifications",@"photo":@"MediaNotifications",@"media":@"MediaNotifications",@"sticker":@"StickerNotifications",@"share":@"ShareNotifications",@"story_reply":@"ShareNotifications",@"location":@"ShareNotifications"};
++    NSString *key=flags[event[@"subtype"]?:@""];return !key||enabled(key);
++}
++static void drainOutbox(void) {
++    if(outboxBusy||!enabled(@"Enabled"))return;
++    double wall=NSDate.date.timeIntervalSince1970;
++    NSDictionary *item=[outbox nextReadyInScopes:deliveryScopes() atTime:wall];
++    if(!item){if([[outbox statisticsForScopes:deliveryScopes()][@"pending"] unsignedIntegerValue])scheduleOutbox(1);return;}
++    NSString *rid=item[@"id"];NSDictionary *event=item[@"event"];NSUInteger attempt=[item[@"attempt"] unsignedIntegerValue];
++    if(!contentEnabled(event)){
++        [outbox finishIdentifier:rid attempt:attempt success:NO blocked:YES atTime:wall];
++        logLine(@"OUTBOX-BLOCKED reason=disabled subtype=%@",event[@"subtype"]?:event[@"kind"]);scheduleOutbox(0);return;
++    }
++    outboxBusy=YES;outboxActiveID=rid;outboxActiveAttempt=attempt;uint64_t generation=queueGeneration;
++    UNMutableNotificationContent *content=[UNMutableNotificationContent new];
++    content.title=@"Snapchat";content.body=bodyFor(event,resolveName(event[@"uid"]));content.sound=UNNotificationSound.defaultSound;
++    content.threadIdentifier=[@"snapnotify." stringByAppendingString:event[@"conversation"]];
++    content.userInfo=@{@"scnotify":@YES,@"version":SNVersion,@"kind":event[@"kind"],@"subtype":event[@"subtype"]?:@"snap"};
++    issuedRequests[rid]=@(nowTime());
++    logLine(@"OUTBOX-REQUEST type=%@ subtype=%@ attempt=%lu",event[@"kind"],event[@"subtype"]?:@"snap",(unsigned long)attempt);
++    [[UNUserNotificationCenter currentNotificationCenter] addNotificationRequest:[UNNotificationRequest requestWithIdentifier:rid content:content trigger:nil] withCompletionHandler:^(NSError *error){
++        dispatch_async(worker,^{
++            if(generation!=queueGeneration){[[UNUserNotificationCenter currentNotificationCenter] removePendingNotificationRequestsWithIdentifiers:@[rid]];[[UNUserNotificationCenter currentNotificationCenter] removeDeliveredNotificationsWithIdentifiers:@[rid]];return;}
++            if(![outboxActiveID isEqual:rid]||outboxActiveAttempt!=attempt)return;
++            BOOL denied=error&&[error.domain isEqual:UNErrorDomain]&&error.code==UNErrorCodeNotificationsNotAllowed;
++            BOOL finished=[outbox finishIdentifier:rid attempt:attempt success:error==nil blocked:denied atTime:NSDate.date.timeIntervalSince1970];
++            outboxBusy=NO;outboxActiveID=nil;
++            if(finished&&!error){postedCount++;outboxAcceptedThisRun++;logLine(@"NOTIF-ACCEPTED type=%@ subtype=%@ path=outbox",event[@"kind"],event[@"subtype"]?:@"snap");}
++            else if(error)logLine(@"OUTBOX-FAILED domain=%@ code=%ld retained=1",error.domain,(long)error.code);
++            outboxNextSubmissionAt=nowTime()+setting(@"NotificationSpacingSeconds",0.4,0.05,2);
++            scheduleOutbox(0);
++        });
++    }];
++    /* A missing completion cannot block every later message indefinitely.
++       Retry uses the SAME per-message identifier, never a replacement ID. */
++    dispatch_after(dispatch_time(DISPATCH_TIME_NOW,15*NSEC_PER_SEC),worker,^{
++        if(generation!=queueGeneration||![outboxActiveID isEqual:rid]||outboxActiveAttempt!=attempt)return;
++        [outbox finishIdentifier:rid attempt:attempt success:NO blocked:NO atTime:NSDate.date.timeIntervalSince1970];
++        outboxBusy=NO;outboxActiveID=nil;outboxTimeouts++;logLine(@"OUTBOX-COMPLETION-TIMEOUT retained=1");scheduleOutbox(0);
++    });
++}
++static void scheduleOutbox(double delay) {
++    if(outboxBusy)return;
++    delay=fmax(delay,outboxNextSubmissionAt-nowTime());
++    uint64_t token=++outboxScheduleToken;
++    dispatch_after(dispatch_time(DISPATCH_TIME_NOW,(int64_t)(delay*NSEC_PER_SEC)),worker,^{if(token==outboxScheduleToken)drainOutbox();});
++}
+@@ -231,0 +303,10 @@
++    if([kind isEqual:@"message"]||[kind isEqual:@"snap"]){
++        if(!contentEnabled(event)||isForegroundSuppressed()||([event[@"observedInForeground"] boolValue]&&!enabled(@"NotifyInForeground")))return;
++        NSError *error=nil;
++        NSMutableDictionary *queued=[event mutableCopy];
++        queued[@"nameWait"]=(SNName(config[@"Aliases"][uid])||SNName(users[uid][@"name"]))?@0:@(setting(@"NameWaitSeconds",0.8,0,2));
++        NSString *rid=[outbox enqueueEvent:queued scope:account?:[@"session/" stringByAppendingString:session] atTime:NSDate.date.timeIntervalSince1970 error:&error];
++        if(error)logLine(@"OUTBOX-STORAGE code=%ld retainedInMemory=%d",(long)error.code,rid!=nil);
++        if(rid)scheduleOutbox(0);
++        return;
++    }
+@@ -310,0 +392 @@
++                [remoteParticipants observeUser:uid conversation:cid atTime:now];
+@@ -368,3 +450 @@
+-            NSString *typing=[@[@"typing",record[@"conversation"],record[@"uid"]] componentsJoinedByString:@"|"];
+-            NSString *peeking=[@[@"peek",record[@"conversation"],record[@"uid"]] componentsJoinedByString:@"|"];
+-            NSDictionary *r=SNResolveReceiveDirection(record,account,presence[typing]!=nil||presence[peeking]!=nil);
++            NSDictionary *r=SNResolveReceiveDirection(record,account,[remoteParticipants containsUser:record[@"uid"] conversation:record[@"conversation"] atTime:nowTime()]);
+@@ -392,0 +473,11 @@
++static void enqueueReceiveWork(dispatch_block_t work) {
++    if(dispatch_get_specific(&workerKey)){work();return;}
++    if(atomic_fetch_add(&receiveInflight,1)>=64){
++        atomic_fetch_sub(&receiveInflight,1);atomic_fetch_add(&receiveBackpressure,1);
++        /* Results are already detached. worker never synchronously waits for
++           this host thread, so bounded backpressure cannot form a main/worker
++           cycle. An extreme burst may briefly slow the source callback. */
++        dispatch_sync(worker,work);return;
++    }
++    dispatch_async(worker,^{@try{work();}@finally{atomic_fetch_sub(&receiveInflight,1);}});
++}
+@@ -394 +484,0 @@
+-    if(atomic_fetch_add(&receiveInflight,1)>=64){atomic_fetch_sub(&receiveInflight,1);atomic_fetch_add(&receiveDrops,1);return;}
+@@ -397 +486,0 @@
+-        NSDictionary *batch=SNDecodeReceiveCallback(className,selector,arguments);
+@@ -399,4 +488,2 @@
+-        dispatch_async(worker,^{
+-            @try{@autoreleasepool{consumeReceiveBatch(batch,source,mode,foreground);}}
+-            @catch(NSException *e){logLine(@"RECEIVE-ERROR exception=%@",e.name);}
+-            @finally{atomic_fetch_sub(&receiveInflight,1);}
++        SNEnumerateReceiveBatches(className,selector,arguments,^(NSDictionary *batch){
++            enqueueReceiveWork(^{@try{consumeReceiveBatch(batch,source,mode,foreground);}@catch(NSException *e){logLine(@"RECEIVE-ERROR exception=%@",e.name);}});
+@@ -404 +491 @@
+-    } @catch(NSException *e){atomic_fetch_sub(&receiveInflight,1);logLine(@"RECEIVE-ERROR exception=%@",e.name);}
++    }@catch(NSException *e){logLine(@"RECEIVE-ERROR exception=%@",e.name);}
+@@ -436,0 +524,9 @@
++static NSString *hostNoticeIdentity(id object) {
++    static NSMapTable *identities;static dispatch_once_t once;
++    dispatch_once(&once,^{identities=[NSMapTable mapTableWithKeyOptions:NSPointerFunctionsWeakMemory|NSPointerFunctionsObjectPointerPersonality valueOptions:NSPointerFunctionsStrongMemory];});
++    @synchronized(identities){
++        NSString *rid=[identities objectForKey:object];
++        if(!rid){if(identities.count>=2048)[identities removeAllObjects];rid=NSUUID.UUID.UUIDString;[identities setObject:rid forKey:object];}
++        return rid;
++    }
++}
+@@ -438 +533,0 @@
+-    if(atomic_fetch_add(&receiveInflight,1)>=64){atomic_fetch_sub(&receiveInflight,1);atomic_fetch_add(&receiveDrops,1);return;}
+@@ -443,8 +538,7 @@
+-        dispatch_async(worker,^{
+-            @try{
+-                consumeReceiveBatch(batch,@"host/inAppNotification",SN_SOURCE_LIVE,foreground);
+-                if(notice)consumeNativeNotice(notice,foreground);
+-            }@catch(NSException *error){logLine(@"NATIVE-NOTICE-ERROR exception=%@",error.name);}
+-            @finally{atomic_fetch_sub(&receiveInflight,1);}
+-        });
+-    }@catch(__unused NSException *e){atomic_fetch_sub(&receiveInflight,1);}
++        if(notice&&!notice[@"id"]&&payload){
++            NSString *identity=hostNoticeIdentity(payload);
++            NSMutableDictionary *copy=[notice mutableCopy];copy[@"id"]=identity;notice=[copy copy];
++        }
++        NSDictionary *snapshot=notice;
++        enqueueReceiveWork(^{@try{consumeReceiveBatch(batch,@"host/inAppNotification",SN_SOURCE_LIVE,foreground);if(snapshot)consumeNativeNotice(snapshot,foreground);}@catch(NSException *e){logLine(@"NATIVE-NOTICE-ERROR exception=%@",e.name);}});
++    }@catch(__unused NSException *e){}
+@@ -477,0 +572,11 @@
++static void recordBackgroundHealth(void) {
++    double wall=NSDate.date.timeIntervalSince1970;
++    if(lastHeartbeatWall>0&&wall-lastHeartbeatWall>90){
++        heartbeatGaps++;maxHeartbeatGap=fmax(maxHeartbeatGap,wall-lastHeartbeatWall);
++        logLine(@"EXECUTION-GAP seconds=%.1f cause=unproven-suspension-or-scheduling-delay",wall-lastHeartbeatWall);
++    }
++    lastHeartbeatWall=wall;
++    AVAudioSession *audio=AVAudioSession.sharedInstance;
++    NSDictionary *snapshot=@{@"sampledAt":@(wall),@"backgroundSeconds":@(backgroundStartedWall>0?fmax(0,wall-backgroundStartedWall):0),@"audioPlaying":@(keepPlayer.isPlaying),@"audioInterrupted":@(audioInterrupted),@"audioCategory":audio.category?:@"unknown",@"audioMode":audio.mode?:@"unknown",@"duplexBackgroundDeferred":@(deferringLifecycle),@"requiresUserResume":@(backgroundNeedsUserResume),@"executionGaps":@(heartbeatGaps),@"largestGapSeconds":@(maxHeartbeatGap),@"recoveryAttempts":@(audioRecoveryAttempts),@"permanentExecutionGuaranteed":@NO};
++    dispatch_async(worker,^{backgroundHealth=snapshot;});
++}
+@@ -482 +587 @@
+-    if(deferringLifecycle){dispatch_block_t callback=deferredBackground;deferredBackground=nil;deferringLifecycle=NO;if(callback)callback();}
++    if(deferringLifecycle){backgroundNeedsUserResume=YES;dispatch_block_t callback=deferredBackground;deferredBackground=nil;deferringLifecycle=NO;if(callback)callback();}
+@@ -486 +591 @@
+-    if(!atomic_load(&experiments)||audioInterrupted||atomic_load(&appState)!=UIApplicationStateBackground)return NO;
++    if(!atomic_load(&experiments)||audioInterrupted||backgroundNeedsUserResume||atomic_load(&appState)!=UIApplicationStateBackground)return NO;
+@@ -569 +674,4 @@
+-                dispatch_async(dispatch_get_main_queue(),^{if(keepPlayer)stopExperiment(@"host-call-state");});
++                dispatch_async(dispatch_get_main_queue(),^{
++                    NSString *category=AVAudioSession.sharedInstance.category;
++                    if(keepPlayer&&([category isEqual:AVAudioSessionCategoryRecord]||[category isEqual:AVAudioSessionCategoryPlayAndRecord]))stopExperiment(@"host-recording-or-call");
++                });
+@@ -628 +736,6 @@
+-    NSDictionary *status=@{@"version":SNVersion,@"state":stateLabel(),@"knownUsers":@(users.count),@"nameHits":@(nameHits),@"nameMisses":@(nameMisses),@"wirePackets":@(wireCount),@"unsupportedWirePackets":@(malformedCount),@"packetDrops":@(atomic_load(&packetDrops)),@"notificationRequestsAccepted":@(postedCount),@"secondsSinceWire":lastWire?@(now-lastWire):@(-1),@"apnsRegisteredThisRun":@(nativePushRegistered),@"apnsDeliveryCallbacks":@(apnsCallbacks),@"nativeNoticeCandidates":@(nativeNoticeCandidates),@"nativeNoticesAccepted":@(nativeNoticeAccepted),@"experimentalKeepAlive":@(atomic_load(&experiments)),@"onDeviceValidationRequired":@YES,@"receiveCallbacks":@(receivedCallbacks),@"decodedMessages":@(decodedMessages),@"decodedSnaps":@(decodedSnaps),@"snapshotRecordsSuppressed":@(snapshotSuppressed),@"receiveQueueDrops":@(atomic_load(&receiveDrops)),@"localAccountKnown":@(account.length>0)};
++    NSMutableDictionary *status=[@{@"version":SNVersion,@"state":stateLabel(),@"knownUsers":@(users.count),@"nameHits":@(nameHits),@"nameMisses":@(nameMisses),@"wirePackets":@(wireCount),@"unsupportedWirePackets":@(malformedCount),@"packetDrops":@(atomic_load(&packetDrops)),@"notificationRequestsAccepted":@(postedCount),@"secondsSinceWire":lastWire?@(now-lastWire):@(-1),@"apnsRegisteredThisRun":@(nativePushRegistered),@"apnsDeliveryCallbacks":@(apnsCallbacks),@"nativeNoticeCandidates":@(nativeNoticeCandidates),@"nativeNoticesAccepted":@(nativeNoticeAccepted),@"experimentalKeepAlive":@(atomic_load(&experiments)),@"onDeviceValidationRequired":@YES,@"receiveCallbacks":@(receivedCallbacks),@"decodedMessages":@(decodedMessages),@"decodedSnaps":@(decodedSnaps),@"snapshotRecordsSuppressed":@(snapshotSuppressed),@"receiveQueueDrops":@(atomic_load(&receiveDrops)),@"localAccountKnown":@(account.length>0)} mutableCopy];
++    status[@"outbox"]=[outbox statisticsForScopes:deliveryScopes()];
++    status[@"outboxAcceptedThisRun"]=@(outboxAcceptedThisRun);status[@"outboxCompletionTimeouts"]=@(outboxTimeouts);
++    status[@"receiveBackpressureWaits"]=@(atomic_load(&receiveBackpressure));
++    status[@"backgroundHealth"]=backgroundHealth?:@{};
++    status[@"submissionDoesNotProveBannerDisplay"]=@YES;
+@@ -640 +753,2 @@
+-        atomic_store(&appState,UIApplicationStateBackground);logLine(@"LIFECYCLE background");startExperiment();dispatch_async(worker,^{saveCache();writeStatus();});
++        atomic_store(&appState,UIApplicationStateBackground);backgroundStartedWall=NSDate.date.timeIntervalSince1970;audioRecoveryAttempts=0;
++        logLine(@"LIFECYCLE background");startExperiment();recordBackgroundHealth();dispatch_async(worker,^{saveCache();scheduleOutbox(0);writeStatus();});
+@@ -644 +758,5 @@
+-        atomic_store(&appState,UIApplicationStateActive);
++        recordBackgroundHealth();
++        atomic_store(&appState,UIApplicationStateActive);backgroundStartedWall=0;
++        /* iOS need not send an interruption-ended event. Explicit foreground
++           interaction re-arms the experiment, not a forged lifecycle event. */
++        audioInterrupted=NO;backgroundNeedsUserResume=NO;audioRecoveryAttempts=0;
+@@ -647 +765 @@
+-        logLine(@"LIFECYCLE active");scan();dispatch_async(worker,^{loadConfig();NSString *uid=SNIdentifier(config[@"SelfUserID"]);if(uid)setAccount(uid);writeStatus();});
++        logLine(@"LIFECYCLE active");scan();dispatch_async(worker,^{loadConfig();NSString *uid=SNIdentifier(config[@"SelfUserID"]);if(uid)setAccount(uid);[outbox retryBlockedInScopes:deliveryScopes() atTime:NSDate.date.timeIntervalSince1970];scheduleOutbox(0);writeStatus();});
+@@ -653 +771,3 @@
+-        /* No forced resume: do not fight a phone call / microphone recording. */
++        if(type==AVAudioSessionInterruptionTypeEnded)logLine(@"AUDIO-INTERRUPTION-ENDED requiresUserResume=%d",backgroundNeedsUserResume);
++        recordBackgroundHealth();
++        /* Never fake a foreground event to reopen a closed native socket. */
+@@ -656,3 +776,12 @@
+-    housekeeping=[NSTimer scheduledTimerWithTimeInterval:30 repeats:YES block:^(__unused NSTimer *timer){
+-        if(deferringLifecycle&&(!keepPlayer.isPlaying||!atomic_load(&experiments)))stopExperiment(@"audio-stopped-or-disabled");
+-        dispatch_async(worker,^{saveCache();writeStatus();});
++    housekeeping=[NSTimer timerWithTimeInterval:5 repeats:YES block:^(__unused NSTimer *timer){
++        if(deferringLifecycle&&!atomic_load(&experiments))stopExperiment(@"disabled");
++        if(deferringLifecycle&&!keepPlayer.isPlaying){
++            NSString *category=AVAudioSession.sharedInstance.category;
++            BOOL safe=!audioInterrupted&&!backgroundNeedsUserResume&&[category isEqual:AVAudioSessionCategoryPlayback]&&atomic_load(&appState)==UIApplicationStateBackground;
++            BOOL recovered=NO;
++            if(safe&&audioRecoveryAttempts<2){audioRecoveryAttempts++;recovered=[keepPlayer play];logLine(@"KEEPALIVE-RECOVERY playing=%d attempt=%lu guaranteed=0",recovered,(unsigned long)audioRecoveryAttempts);}
++            if(!recovered)stopExperiment(@"audio-stopped");
++        }
++        recordBackgroundHealth();
++        static unsigned ticks=0;
++        dispatch_async(worker,^{if(++ticks%6==0){saveCache();writeStatus();}scheduleOutbox(0);});
+@@ -659,0 +789 @@
++    [NSRunLoop.mainRunLoop addTimer:housekeeping forMode:NSRunLoopCommonModes];
+@@ -673,0 +804,2 @@
++        dispatch_queue_set_specific(worker,&workerKey,&workerKey,NULL);
++        remoteParticipants=[SNRemoteParticipants new];
+@@ -679,0 +812 @@
++        outbox=[[SNOutbox alloc] initWithDirectory:[support stringByAppendingPathComponent:@"outbox-v5"]];
+@@ -682,3 +815,3 @@
+-        dispatch_async(dispatch_get_main_queue(),^{setup();});
+-    }
+-}
++        dispatch_async(dispatch_get_main_queue(),^{setup();dispatch_async(worker,^{scheduleOutbox(0);});});
++    }
++}
+diff --git a/scripts/build-macos.sh b/scripts/build-macos.sh
+--- a/scripts/build-macos.sh
++++ b/scripts/build-macos.sh
+@@ -17,0 +18,2 @@
++"$cc" "${flags[@]}" -fobjc-arc -fblocks -c Sources/SNContent.m -o build/SNContent.o
++"$cc" "${flags[@]}" -fobjc-arc -fblocks -c Sources/SNOutbox.m -o build/SNOutbox.o
+@@ -20 +22 @@
+-  build/SNCore.o build/SNReceivePolicy.o build/SNRuntime.o build/SNReceive.o build/SNHostNotice.o build/Tweak.o \
++  build/SNCore.o build/SNReceivePolicy.o build/SNRuntime.o build/SNReceive.o build/SNHostNotice.o build/SNContent.o build/SNOutbox.o build/Tweak.o \
+diff --git a/scripts/test-macos.sh b/scripts/test-macos.sh
+--- a/scripts/test-macos.sh
++++ b/scripts/test-macos.sh
+@@ -14 +14 @@
+-  Sources/SNRuntime.m Sources/SNReceive.m tests/TestFoundation.m "$build/core.o" "$build/policy.o" -o "$build/test_foundation"
++  Sources/SNRuntime.m Sources/SNReceive.m Sources/SNContent.m tests/TestFoundation.m "$build/core.o" "$build/policy.o" -o "$build/test_foundation"
+@@ -19 +19 @@
+-  Sources/SNRuntime.m Sources/SNReceive.m tests/TestReceive.m "$build/core.o" "$build/policy.o" -o "$build/test_receive"
++  Sources/SNRuntime.m Sources/SNReceive.m Sources/SNContent.m tests/TestReceive.m "$build/core.o" "$build/policy.o" -o "$build/test_receive"
+@@ -24 +24 @@
+-  Sources/SNRuntime.m Sources/SNReceive.m Sources/SNHostNotice.m tests/TestHostNotice.m \
++  Sources/SNRuntime.m Sources/SNReceive.m Sources/SNContent.m Sources/SNHostNotice.m tests/TestHostNotice.m \
+@@ -30 +30 @@
+-  Sources/SNRuntime.m Sources/SNReceive.m tests/TestNativeReceive.m \
++  Sources/SNRuntime.m Sources/SNReceive.m Sources/SNContent.m tests/TestNativeReceive.m \
+@@ -32,0 +33,7 @@
++
++# Burst queue persistence / voice labels / remote-identity lifetime.
++xcrun clang -std=gnu11 -fobjc-arc -fblocks -Wall -Wextra -Werror \
++  -Wno-deprecated-declarations -framework Foundation -framework CoreFoundation \
++  Sources/SNRuntime.m Sources/SNReceive.m Sources/SNContent.m Sources/SNOutbox.m tests/TestOutbox.m \
++  "$build/core.o" "$build/policy.o" -o "$build/test_outbox"
++"$build/test_outbox"
+diff --git a/tests/TestNativeReceive.m b/tests/TestNativeReceive.m
+--- a/tests/TestNativeReceive.m
++++ b/tests/TestNativeReceive.m
+@@ -42,0 +43,3 @@
++@property(nonatomic) BOOL isStickerMessage;
++@property(nonatomic) BOOL isSingleImageChatMedia;
++@property(nonatomic) BOOL isStoryReplyMessage;
+@@ -139,0 +143,14 @@
++    m=msg(109,999);m.isVoiceNote=YES;CHECK([firstEvent(m)[@"kind"] isEqual:@"message"]);CHECK([firstEvent(m)[@"subtype"] isEqual:@"voice"]);
++    m.isVoiceNote=NO;m.isStickerMessage=YES;CHECK([firstEvent(m)[@"subtype"] isEqual:@"sticker"]);
++    m.isStickerMessage=NO;m.isSingleImageChatMedia=YES;CHECK([firstEvent(m)[@"subtype"] isEqual:@"photo"]);
++    m.isSingleImageChatMedia=NO;m.isStoryReplyMessage=YES;CHECK([firstEvent(m)[@"subtype"] isEqual:@"story_reply"]);
++    NSMutableArray *burst=[NSMutableArray array];for(NSUInteger i=1;i<=600;i++)[burst addObject:msg(1000+i,1)];
++    __block NSUInteger total=0,batches=0;
++    SNEnumerateReceiveBatches(CLS,SELNAME,@[uuid(C),NSNull.null,burst,@[]],^(NSDictionary *batch){batches++;total+=[batch[@"events"] count];CHECK([batch[@"events"] count]<=128);});
++    CHECK(total==600);CHECK(batches==5);
++    // The old 2048-entry set stopped accepting every subsequent message.
++    tracker=[[SNReceiveTracker alloc] initWithMonitoringStart:1800000000];
++    for(NSUInteger i=1;i<=8300;i++){
++        NSDictionary *ev=@{@"event":[@(10000+i) stringValue],@"uid":U,@"conversation":C,@"kind":@"message",@"incoming":@YES,@"timestamp":@1800000001};
++        CHECK([tracker newEventsInSnapshot:@[ev] wallTime:1800000002].count==1);
++    }

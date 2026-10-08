@@ -1,37 +1,48 @@
-name: SnapNotify tests and build
+name: SnapNotify rc5 isolated validation
 on:
   push:
-  pull_request:
   workflow_dispatch:
 permissions:
   contents: read
-concurrency:
-  group: snapnotify-${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
 jobs:
-  portable-tests:
-    runs-on: ubuntu-latest
-    timeout-minutes: 10
-    steps:
-      - uses: actions/checkout@v4
-      - name: C core regression tests and sanitizers
-        run: bash scripts/test-portable.sh
-  ios-build:
-    needs: portable-tests
+  rc5-validation:
     runs-on: macos-latest
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
-      - name: Foundation adapters and inherited-hook tests
-        run: bash scripts/test-macos.sh
-      - name: Build arm64 library using the runner's Xcode SDK
-        run: bash scripts/build-macos.sh
-      - name: Upload dylib and checksum
-        uses: actions/upload-artifact@v4
         with:
-          name: SnapNotify-v4-dylib
+          persist-credentials: false
+      - name: Verify and apply the readable integration patch
+        run: |
+          python3 - <<'PY'
+          import hashlib, pathlib, subprocess
+          p = pathlib.Path('.ci/rc5-integration.patch')
+          assert hashlib.sha256(p.read_bytes()).hexdigest() == '1ffce9ccb472f8326df642957f13a46e5369f6a04a512ed8a30185dc5338b993'
+          subprocess.run(['git','apply','--check','--unidiff-zero',str(p)],check=True)
+          subprocess.run(['git','apply','--unidiff-zero',str(p)],check=True)
+          PY
+      - name: Portable tests and sanitizers
+        run: bash scripts/test-portable.sh
+      - name: Foundation, voice, large batches and durable queue tests
+        run: bash scripts/test-macos.sh
+      - name: Compile arm64 library
+        run: bash scripts/build-macos.sh
+      - name: Record exact compiled sources
+        run: |
+          python3 - <<'PY'
+          import hashlib, json, pathlib
+          root = pathlib.Path('.')
+          paths = ['Tweak.m','Makefile'] + [str(p) for folder in ('Sources','Core','scripts','tests') for p in root.joinpath(folder).rglob('*') if p.is_file() and '__pycache__' not in str(p)]
+          report = {p:hashlib.sha256(root.joinpath(p).read_bytes()).hexdigest() for p in sorted(paths)}
+          print(json.dumps(report,indent=2))
+          pathlib.Path('out/SOURCE_HASHES.json').write_text(json.dumps(report,indent=2))
+          PY
+      - uses: actions/upload-artifact@v4
+        with:
+          name: SnapNotify-rc5-validated
           path: |
             out/SnapNotify.dylib
             out/SHA256SUMS.txt
+            out/SOURCE_HASHES.json
           if-no-files-found: error
           retention-days: 14
