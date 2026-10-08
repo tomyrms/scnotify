@@ -26,15 +26,6 @@ static NSString *sck_app_state(void) {
     return ([[UIApplication sharedApplication] applicationState] == UIApplicationStateBackground) ? @"BG" : @"FG";
 }
 
-static BOOL sck_is_call_event(NSString *s) {
-    NSString *low = [s lowercaseString];
-    return [low containsString:@"call"];
-}
-
-static BOOL sck_is_typing_event(NSString *s) {
-    return [[s lowercaseString] containsString:@"typing"];
-}
-
 static NSString *sck_try_user(id obj) {
     if (!obj || ![obj isKindOfClass:[NSObject class]]) return @"";
     NSArray *keys = @[@"username", @"senderUsername", @"displayName", @"senderDisplayName", @"name", @"title"];
