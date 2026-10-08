@@ -43,15 +43,15 @@ static NSString *sck_try_user(id obj) {
 static NSString *sck_label_for(NSString *cls, NSString *sel) {
     NSString *all = [[cls stringByAppendingString:@":"] stringByAppendingString:sel];
     NSString *low = [all lowercaseString];
-    NSString *who = nil;
+    NSString *clslow = [cls lowercaseString];
+    NSString *sellov = [sel lowercaseString];
     if ([low containsString:@"typing"]) return @"écrit...";
-    if ([low containsString:@"call"]) return @"t'appelle";
+    if ([clslow containsString:@"sccall"] || [sellov containsString:@"callobserver"] || [sellov containsString:@"incomingcall"] || [sellov containsString:@"reportincoming"] || [sellov containsString:@"calldid"]) return @"t'appelle";
     if ([low containsString:@"receivedsnap"]) return @"t'a envoyé un snap";
     if ([low containsString:@"snapstate"]) return @"activité snap";
     if ([low containsString:@"snapupdate"]) return @"activité snap";
     if ([low containsString:@"messageupdate"] || [low containsString:@"conversationmessage"]) return @"activité chat";
     if ([low containsString:@"chatmessage"] || [low containsString:@"chatconversation"]) return @"activité chat";
-    (void)who;
     return nil;
 }
 
@@ -114,7 +114,7 @@ static void sck_notify_event(NSString *cls, NSString *sel, id a) {
     NSString *label = sck_label_for(cls, sel);
     NSString *lowsel = [[cls stringByAppendingString:sel] lowercaseString];
     BOOL isEvent = (label != nil);
-    BOOL isCall = [lowsel containsString:@"call"];
+    BOOL isCall = [lowsel containsString:@"sccall"] || [lowsel containsString:@"callobserver"] || [lowsel containsString:@"incomingcall"] || [lowsel containsString:@"reportincoming"];
     BOOL isTyping = [lowsel containsString:@"typing"];
     if (!isEvent) {
         isEvent = [lowsel containsString:@"snap"] || [lowsel containsString:@"chat"] || [lowsel containsString:@"message"] || [lowsel containsString:@"conversation"] || [lowsel containsString:@"receive"] || [lowsel containsString:@"incoming"];
@@ -217,8 +217,11 @@ static void sck_hit(id self, SEL _cmd, id a) {
     if ([sel hasPrefix:@"postNotificationName:"]) {
         if (![a isKindOfClass:[NSString class]]) return;
         NSString *low = [a lowercaseString];
-        if ([low containsString:@"managed"] || [low containsString:@"context"] || [low containsString:@"window"] || [low containsString:@"audiosession"] || [low containsString:@"keyboard"] || [low containsString:@"keypath"] || [low containsString:@"external"] || [low containsString:@"screen"] || [low containsString:@"scene"] || [low containsString:@"layout"] || [low hasPrefix:@"ns"] || [low hasPrefix:@"_ns"] || [low hasPrefix:@"_ui"] || [low hasPrefix:@"av"] || [low hasPrefix:@"un"] || [low hasPrefix:@"_un"]) return;
-        BOOL interesting = [low containsString:@"snap"] || [low containsString:@"chat"] || [low containsString:@"message"] || [low containsString:@"conversation"] || [low containsString:@"incoming"] || [low containsString:@"receive"] || [low containsString:@"typing"] || [low containsString:@"presence"];
+        NSString *core = low;
+        if ([core hasPrefix:@"com.snapchat."]) core = [core substringFromIndex:13];
+        else if ([core hasPrefix:@"com.snapchat"]) core = [core substringFromIndex:12];
+        if ([core containsString:@"managed"] || [core containsString:@"context"] || [core containsString:@"window"] || [core containsString:@"audiosession"] || [core containsString:@"keyboard"] || [core containsString:@"keypath"] || [core containsString:@"external"] || [core containsString:@"screen"] || [core containsString:@"scene"] || [core containsString:@"layout"] || [core containsString:@"lens"] || [core containsString:@"unlockable"] || [core containsString:@"viewcontroller"] || [core hasPrefix:@"ns"] || [core hasPrefix:@"_ns"] || [core hasPrefix:@"_ui"] || [core hasPrefix:@"av"] || [core hasPrefix:@"un"] || [core hasPrefix:@"_un"]) return;
+        BOOL interesting = [core containsString:@"typing"] || [core containsString:@"message"] || [core containsString:@"conversation"] || [core containsString:@"receive"] || [core containsString:@"incoming"] || [core containsString:@"call"] || [core containsString:@"presence"];
         if (!interesting) return;
         sck_log(@"NOTIFPOST %@", a);
         sck_notify_raw([@"post" stringByAppendingString:a], @"Snapchat", [NSString stringWithFormat:@"activité (%@)", a], NO);
@@ -366,7 +369,7 @@ static void sck_setup(void) {
             }
         }];
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 2 * NSEC_PER_SEC), dispatch_get_main_queue(), ^{
-            sck_notify_raw(@"boot", @"Snapchat", [NSString stringWithFormat:@"SnapNotify v2.0 chargé (%lu hooks)", (unsigned long)gOrig.count], YES);
+            sck_notify_raw(@"boot", @"Snapchat", [NSString stringWithFormat:@"SnapNotify v2.1 chargé (%lu hooks)", (unsigned long)gOrig.count], YES);
         });
     }];
     gTimer = [NSTimer scheduledTimerWithTimeInterval:20.0 repeats:YES block:^(NSTimer *t) { sck_ensure_audio(); }];
