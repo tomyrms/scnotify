@@ -1,840 +1,509 @@
-// SnapNotify v3.0 — keep-alive + local notification bridge for Snapchat
-// Adds: sender name extraction (KVC + protobuf description scan + userId cache),
-// per-type throttling, cross-hook dedup, Duplex realtime hooks.
-
+// SnapNotify 4.0.0-rc1 — explicit event adapters, not notifications from hook names.
 #import <Foundation/Foundation.h>
 #import <UIKit/UIKit.h>
-#import <AVFoundation/AVFoundation.h>
 #import <UserNotifications/UserNotifications.h>
-#import <objc/runtime.h>
+#import <AVFoundation/AVFoundation.h>
+#import "Sources/SNRuntime.h"
+#import "Core/SNCore.h"
+#include <stdatomic.h>
+#include <time.h>
 #include <stdarg.h>
-#include <stdlib.h>
-#include <string.h>
-#include <ctype.h>
+#include <math.h>
 
-static AVAudioPlayer *gPlayer = nil;
-static NSMutableDictionary *gOrig = nil;
-static NSMutableDictionary *gThrottle = nil;
-static NSMutableDictionary *gNameCache = nil;
-static NSLock *gLock = nil;
-static NSString *gLogPath = nil;
-static NSTimer *gTimer = nil;
-static _Thread_local BOOL t_inhit = NO;
-static NSFileHandle *gFH = nil;
-static NSUInteger gLogWrites = 0;
-static NSMutableDictionary *gHitWin = nil;
-static NSMutableDictionary *gHitSupp = nil;
-static double t_lastPresDump = 0;
-static BOOL gCacheDirty = NO;
+static NSString * const SNVersion=@"4.0.0-rc1";
+static dispatch_queue_t worker, logQueue;
+static NSMutableDictionary *users, *presence, *pendingEvents, *issuedRequests;
+static NSDictionary *config;
+static NSString *account, *session, *documents, *support;
+static SNLedger ledger;
+static atomic_int appState;
+static atomic_uint inflight;
+static atomic_bool experiments;
+static NSUInteger hookCount, nameHits, nameMisses, wireCount, malformedCount, postedCount;
+static atomic_ulong packetDrops;
+static uint64_t queueGeneration;
+static BOOL nativePushRegistered=NO, cacheDirty=NO;
+static NSDateFormatter *logFormat;
+static NSFileHandle *logHandle;
+static NSString *logPath;
+static double lastWire=0;
+static NSTimer *housekeeping;
+/* Main-thread-only experimental audio state. */
+static AVAudioPlayer *keepPlayer;
+static BOOL audioInterrupted=NO, deferringLifecycle=NO;
+static dispatch_block_t deferredBackground;
+static __weak id deferredReceiver;
 
-static void sck_log(NSString *fmt, ...);
-static NSString *sck_extract_name(id obj, BOOL *found);
-
-#pragma mark - helpers
-
-static NSString *sck_app_state(void) {
-    return ([[UIApplication sharedApplication] applicationState] == UIApplicationStateBackground) ? @"BG" : @"FG";
+static double nowTime(void) {
+    struct timespec t; clock_gettime(CLOCK_MONOTONIC,&t);
+    return (double)t.tv_sec+(double)t.tv_nsec/1e9;
 }
-
-static NSString *sck_regex_first(NSString *pattern, NSString *text) {
-    if (!pattern || !text || text.length < 4) return nil;
-    NSError *err = nil;
-    NSRegularExpression *re = [NSRegularExpression regularExpressionWithPattern:pattern options:NSRegularExpressionCaseInsensitive error:&err];
-    if (!re) return nil;
-    NSTextCheckingResult *m = [re firstMatchInString:text options:0 range:NSMakeRange(0, text.length)];
-    if (!m || m.numberOfRanges < 2) return nil;
-    NSRange r = [m rangeAtIndex:1];
-    if (r.location == NSNotFound || r.length == 0) return nil;
-    return [text substringWithRange:r];
+static NSString *stateLabel(void) {
+    switch(atomic_load(&appState)){case UIApplicationStateActive:return @"FG";case UIApplicationStateBackground:return @"BG";default:return @"INACTIVE";}
 }
-
-static NSString *sck_event_type(NSString *cls, NSString *sel) {
-    NSString *low = [[[cls stringByAppendingString:@":"] stringByAppendingString:sel] lowercaseString];
-    if ([low containsString:@"typing"]) return @"typing";
-    if ([low containsString:@"sccall"] || [low containsString:@"callobserver"] || [low containsString:@"incomingcall"] || [low containsString:@"reportincoming"]) return @"call";
-    if ([low containsString:@"receivedsnap"]) return @"snap";
-    if ([low containsString:@"snapstate"] || [low containsString:@"snapupdate"] || [low containsString:@"snapdelta"]) return @"snapstate";
-    if ([low containsString:@"chatmessage"] || [low containsString:@"conversationmessage"] || [low containsString:@"messageupdate"] || [low containsString:@"chatconversation"] || [low containsString:@"chatormessage"] || [low containsString:@"receivedchat"]) return @"message";
-    if ([low containsString:@"message"] || [low containsString:@"conversation"] || [low containsString:@"receive"] || [low containsString:@"incoming"] || [low containsString:@"presence"]) return @"generic";
-    return nil;
-}
-
-static NSString *sck_message_body(NSString *t, NSString *name) {
-    NSString *who = (name.length ? name : @"Quelqu'un");
-    if ([t isEqualToString:@"typing"]) return [NSString stringWithFormat:@"%@ est en train d'écrire...", who];
-    if ([t isEqualToString:@"call"]) return (name.length ? [NSString stringWithFormat:@"%@ t'appelle !", name] : @"Appel entrant !");
-    if ([t isEqualToString:@"snap"]) return [NSString stringWithFormat:@"%@ t'a envoyé un snap", who];
-    if ([t isEqualToString:@"snapstate"]) return [NSString stringWithFormat:@"%@ a vu/ouvert ton snap", who];
-    if ([t isEqualToString:@"message"]) return [NSString stringWithFormat:@"%@ t'a envoyé un message", who];
-    return [NSString stringWithFormat:@"activité de %@", who];
-}
-
-static NSString *sck_duplex_kind(NSData *d) {
-    if (!d.length) return nil;
-    NSArray *kinds = @[@"sync_trigger", @"hermod", @"typing", @"chat", @"message_content", @"message", @"snap", @"story", @"presence"];
-    for (NSString *k in kinds) {
-        NSData *kd = [k dataUsingEncoding:NSUTF8StringEncoding];
-        if ([d rangeOfData:kd options:0 range:NSMakeRange(0, d.length)].location != NSNotFound) return k;
-    }
-    return nil;
-}
-
-static NSString *sck_extract_name_depth(id obj, BOOL *found, int depth) {
-    if (found) *found = NO;
-    if (!obj || depth > 2) return nil;
-    NSString *name = nil;
-    NSString *desc = nil;
-
-    if ([obj isKindOfClass:[NSDictionary class]]) {
-        NSDictionary *d = (NSDictionary *)obj;
-        for (id k in d) {
-            if (![k isKindOfClass:[NSString class]]) continue;
-            NSString *lk = [k lowercaseString];
-            id v = d[k];
-            if (![v isKindOfClass:[NSString class]]) continue;
-            if ([lk containsString:@"username"] || [lk containsString:@"displayname"] || ([lk containsString:@"name"] && ![lk containsString:@"filename"])) { name = v; break; }
-        }
-    }
-    if (!name) {
-        for (NSString *k in @[@"senderUsername", @"username", @"senderDisplayName", @"displayName", @"senderName", @"displayUsername", @"fromUsername", @"senderUserName", @"name", @"sender", @"user", @"title", @"recipientUsername", @"recipientDisplayName", @"conversationName"]) {
+static void logLine(NSString *format,...) NS_FORMAT_FUNCTION(1,2);
+static void logLine(NSString *format,...) {
+    va_list ap;va_start(ap,format);NSString *message=[[NSString alloc] initWithFormat:format arguments:ap];va_end(ap);
+    NSString *state=stateLabel();NSDate *date=[NSDate date];
+    dispatch_async(logQueue,^{
+        @autoreleasepool {
+            if(!logFormat){logFormat=[NSDateFormatter new];logFormat.locale=[[NSLocale alloc] initWithLocaleIdentifier:@"en_US_POSIX"];logFormat.dateFormat=@"yyyy-MM-dd HH:mm:ss.SSS";}
+            NSString *line=[NSString stringWithFormat:@"[%@] [%@] %@\n",[logFormat stringFromDate:date],state,message];
+            NSData *data=[line dataUsingEncoding:NSUTF8StringEncoding];
             @try {
-                if ([obj respondsToSelector:NSSelectorFromString(k)]) {
-                    id v = [obj valueForKey:k];
-                    if ([v isKindOfClass:[NSString class]] && [(NSString *)v length] > 0 && [(NSString *)v length] < 40) { name = v; break; }
-                    if (v && ![v isKindOfClass:[NSString class]] && ![v isKindOfClass:[NSNumber class]] && ![v isKindOfClass:[NSData class]]) {
-                        NSString *rec = sck_extract_name_depth(v, NULL, depth + 1);
-                        if (rec.length) { name = rec; break; }
-                    }
+                NSFileManager *fm=NSFileManager.defaultManager;
+                if(!logPath)logPath=[documents stringByAppendingPathComponent:@"snapnotify.log"];
+                if(!logHandle){
+                    if(![fm fileExistsAtPath:logPath])[fm createFileAtPath:logPath contents:nil attributes:@{NSFileProtectionKey:NSFileProtectionCompleteUntilFirstUserAuthentication}];
+                    logHandle=[NSFileHandle fileHandleForWritingAtPath:logPath];[logHandle seekToEndOfFile];
                 }
-            } @catch (NSException *e) {}
+                if(logHandle.offsetInFile+data.length>1024*1024){
+                    [logHandle closeFile];logHandle=nil;
+                    NSString *old=[logPath stringByAppendingString:@".1"];
+                    [fm removeItemAtPath:old error:NULL];[fm moveItemAtPath:logPath toPath:old error:NULL];
+                    [fm createFileAtPath:logPath contents:nil attributes:@{NSFileProtectionKey:NSFileProtectionCompleteUntilFirstUserAuthentication}];
+                    logHandle=[NSFileHandle fileHandleForWritingAtPath:logPath];
+                }
+                [logHandle writeData:data];
+            } @catch(NSException *e){logHandle=nil;NSLog(@"[SnapNotify] log IO failed: %@",e.name);}
         }
-    }
-    @try { desc = [obj description]; } @catch (NSException *e) { desc = nil; }
-    if (!name && desc) {
-        NSString *p1 = @"(?:senderUsername|username|senderDisplayName|displayName|senderName)(?:[^A-Za-z0-9]{0,12}Optional\\([^A-Za-z0-9]{0,3})?[^A-Za-z0-9]{0,12}([A-Za-z0-9._-]{2,40})";
-        name = sck_regex_first(p1, desc);
-    }
-    NSString *ident = nil;
-    @try {
-        for (NSString *k in @[@"conversationId", @"senderId", @"userId"]) {
-            if ([obj respondsToSelector:NSSelectorFromString(k)]) {
-                id v = [obj valueForKey:k];
-                if ([v isKindOfClass:[NSString class]] && [(NSString *)v length] > 0 && [(NSString *)v length] < 64) { ident = v; break; }
-            }
-        }
-    } @catch (NSException *e) {}
-    if (!ident && desc) {
-        NSString *p2 = @"(?:conversationId|senderId|userId)(?:[^A-Za-z0-9]{0,12}Optional\\([^A-Za-z0-9]{0,3})?[^A-Za-z0-9]{0,12}([A-Za-z0-9._-]{2,64})";
-        ident = sck_regex_first(p2, desc);
-    }
-    if (ident && name.length) {
-        BOOL changed = NO;
-        [gLock lock];
-        if (![gNameCache[ident] isEqual:name]) { gNameCache[ident] = name; changed = YES; gCacheDirty = YES; }
-        [gLock unlock];
-        if (changed) sck_log(@"NAMECACHE %@ -> %@", ident, name);
-    } else if (!name && ident) {
-        [gLock lock];
-        name = gNameCache[ident];
-        [gLock unlock];
-    }
-    if (name.length) { if (found) *found = YES; return name; }
-    return nil;
-}
-
-static NSString *sck_extract_name(id obj, BOOL *found) {
-    return sck_extract_name_depth(obj, found, 0);
-}
-
-static NSString *sck_extract_ident(id obj) {
-    if (!obj) return nil;
-    @try {
-        for (NSString *k in @[@"conversationId", @"senderId", @"userId"]) {
-            if ([obj respondsToSelector:NSSelectorFromString(k)]) {
-                id v = [obj valueForKey:k];
-                if ([v isKindOfClass:[NSString class]] && [(NSString *)v length] > 0 && [(NSString *)v length] < 64) return v;
-            }
-        }
-    } @catch (NSException *e) {}
-    NSString *desc = nil;
-    @try { desc = [obj description]; } @catch (NSException *e) { desc = nil; }
-    if (desc) {
-        NSString *p2 = @"(?:conversationId|senderId|userId)(?:[^A-Za-z0-9]{0,12}Optional\\([^A-Za-z0-9]{0,3})?[^A-Za-z0-9]{0,12}([A-Za-z0-9._-]{2,64})";
-        return sck_regex_first(p2, desc);
-    }
-    return nil;
-}
-
-#pragma mark - logging (thread-safe, rotation at 1 MB)
-
-static void sck_log(NSString *fmt, ...) {
-    va_list ap; va_start(ap, fmt);
-    NSString *msg = [[NSString alloc] initWithFormat:fmt arguments:ap];
-    va_end(ap);
-    NSLog(@"[SnapNotify] %@", msg);
-    static NSDateFormatter *df = nil;
-    if (!df) { df = [NSDateFormatter new]; df.dateFormat = @"HH:mm:ss.SSS"; }
-    NSString *line = [NSString stringWithFormat:@"[%@] [%@] %@\n", [df stringFromDate:[NSDate date]], sck_app_state(), msg];
-    NSData *d = [line dataUsingEncoding:NSUTF8StringEncoding];
-    [gLock lock];
-    @try {
-        if (!gLogPath) {
-            NSString *docs = [NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES) firstObject];
-            gLogPath = [docs stringByAppendingPathComponent:@"snapnotify.log"];
-        }
-        NSFileManager *fm = [NSFileManager defaultManager];
-        if (gFH) {
-            gLogWrites++;
-            if (gLogWrites % 200 == 0) {
-                unsigned long long sz = [[fm attributesOfItemAtPath:gLogPath error:nil] fileSize];
-                if (sz > 1024 * 1024) { [gFH closeFile]; gFH = nil; [fm removeItemAtPath:gLogPath error:nil]; }
-            }
-        }
-        if (!gFH) {
-            if (![fm fileExistsAtPath:gLogPath]) { [d writeToFile:gLogPath atomically:YES]; }
-            gFH = [NSFileHandle fileHandleForWritingAtPath:gLogPath];
-        }
-        if (gFH) { [gFH seekToEndOfFile]; [gFH writeData:d]; }
-        else { [d writeToFile:gLogPath atomically:YES]; }
-    } @catch (NSException *e) {
-        gFH = nil;
-        NSLog(@"[SnapNotify] log exc %@", e);
-    }
-    [gLock unlock];
-}
-
-static void sck_log_obj(NSString *tag, id obj) {
-    if (!obj) return;
-    @try {
-        NSString *d = [obj description];
-        if (d.length > 500) d = [d substringToIndex:500];
-        sck_log(@"   %@[%@]=%@", tag, NSStringFromClass(object_getClass(obj)), d);
-    } @catch (NSException *e) {}
-}
-
-static void sck_cache_save(void) {
-    NSDictionary *copy = nil;
-    [gLock lock];
-    copy = [gNameCache copy];
-    [gLock unlock];
-    if (!copy.count) return;
-    @try {
-        NSString *docs = [NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES) firstObject];
-        [copy writeToFile:[docs stringByAppendingPathComponent:@"scnotify_names.plist"] atomically:YES];
-    } @catch (NSException *e) {}
-}
-
-#pragma mark - local notification (typed throttle, thread-safe)
-
-static void sck_notify_thr(NSString *key, NSString *title, NSString *body, BOOL silent, double secs) {
-    if (t_inhit) return;
-    t_inhit = YES;
-    @try {
-        [gLock lock];
-        NSDate *last = gThrottle[key];
-        BOOL skip = last && [[NSDate date] timeIntervalSinceDate:last] < secs;
-        if (!skip) gThrottle[key] = [NSDate date];
-        [gLock unlock];
-        if (skip) { sck_log(@"NOTIF-SKIP key=%@", key); t_inhit = NO; return; }
-        UNMutableNotificationContent *c = [UNMutableNotificationContent new];
-        c.title = title;
-        c.body = body;
-        c.userInfo = @{@"scnotify": @YES};
-        c.threadIdentifier = @"snapnotify";
-        if (@available(iOS 15.0, *)) {
-            c.interruptionLevel = UNNotificationInterruptionLevelTimeSensitive;
-        }
-        if (!silent) c.sound = [UNNotificationSound defaultSound];
-        sck_log(@"NOTIF-POST key=%@ body=%@", key, body);
-        UNNotificationRequest *r = [UNNotificationRequest requestWithIdentifier:[[NSUUID UUID] UUIDString] content:c trigger:nil];
-        [[UNUserNotificationCenter currentNotificationCenter] addNotificationRequest:r withCompletionHandler:^(NSError *e) {
-            if (e) sck_log(@"notify err %@", e.localizedDescription);
-        }];
-    } @catch (NSException *e) { sck_log(@"notify exc %@", e); }
-    t_inhit = NO;
-}
-
-#pragma mark - silent audio keep-alive
-
-static NSData *sck_silence(void) {
-    uint32_t sr = 8000; uint16_t ch = 1, bps = 16;
-    uint32_t dataLen = sr * ch * bps / 8;
-    uint32_t fileLen = 44 + dataLen;
-    NSMutableData *d = [NSMutableData dataWithCapacity:fileLen];
-    uint32_t v; uint16_t s;
-    [d appendBytes:"RIFF" length:4]; v = fileLen - 8; [d appendBytes:&v length:4];
-    [d appendBytes:"WAVE" length:4]; [d appendBytes:"fmt " length:4]; v = 16; [d appendBytes:&v length:4];
-    s = 1; [d appendBytes:&s length:2]; s = ch; [d appendBytes:&s length:2];
-    v = sr; [d appendBytes:&v length:4]; v = sr * ch * bps / 8; [d appendBytes:&v length:4];
-    s = ch * bps / 8; [d appendBytes:&s length:2]; s = bps; [d appendBytes:&s length:2];
-    [d appendBytes:"data" length:4]; v = dataLen; [d appendBytes:&v length:4];
-    int16_t sample = 1;
-    for (uint32_t i = 0; i < dataLen / 2; i++) [d appendBytes:&sample length:2];
-    return d;
-}
-
-static void sck_ensure_audio(void) {
-    dispatch_async(dispatch_get_main_queue(), ^{
-        @try {
-            NSError *err = nil;
-            AVAudioSession *sess = [AVAudioSession sharedInstance];
-            [sess setCategory:AVAudioSessionCategoryPlayback withOptions:AVAudioSessionCategoryOptionMixWithOthers error:&err];
-            [sess setActive:YES error:&err];
-            if (!gPlayer) {
-                gPlayer = [[AVAudioPlayer alloc] initWithData:sck_silence() error:&err];
-                gPlayer.numberOfLoops = -1;
-                gPlayer.volume = 0.0;
-                [gPlayer prepareToPlay];
-            }
-            if (gPlayer && !gPlayer.isPlaying) {
-                BOOL ok = [gPlayer play];
-                if (!ok) sck_log(@"keepalive play failed err=%@", err);
-            }
-        } @catch (NSException *e) { sck_log(@"audio exc %@", e); }
     });
 }
-
-#pragma mark - swizzling framework
-
-static IMP sck_orig(id self, SEL _cmd) {
-    Class c = object_getClass(self);
-    while (c) {
-        NSString *key = [NSString stringWithFormat:@"%s|%s", class_getName(c), sel_getName(_cmd)];
-        NSValue *v = gOrig[key];
-        if (v) return (IMP)[v pointerValue];
-        c = class_getSuperclass(c);
-    }
-    return NULL;
+static BOOL enabled(NSString *key) {return [config[key] boolValue];}
+static double setting(NSString *key,double fallback,double min,double max) {
+    id v=config[key];double x=[v isKindOfClass:NSNumber.class]?[v doubleValue]:fallback;
+    return isfinite(x)?fmax(min,fmin(max,x)):fallback;
 }
-
-static BOOL sck_enc_ok(Method m, int objArgs) {
-    const char *e = method_getTypeEncoding(m);
-    if (!e || e[0] != 'v') return NO;
-    int ats = 0;
-    const char *p = e + 1;
-    while (*p) {
-        char c = *p;
-        if (c >= '0' && c <= '9') { p++; continue; }
-        if (c == '@') {
-            ats++; p++;
-            if (*p == '?') p++;
-            else if (*p == '"') { p++; while (*p && *p != '"') p++; if (*p) p++; }
-            continue;
-        }
-        if (c == ':') { ats++; p++; continue; }
-        if (c=='r'||c=='n'||c=='N'||c=='O'||c=='R'||c=='V'||c=='o'||c=='A') { p++; continue; }
-        return NO;
-    }
-    return ats == objArgs + 2;
+static NSString *shortID(NSString *uid) {
+    if(!uid.length)return @"missing";
+    return enabled(@"DiagnosticsIncludeIdentifiers")?uid:[uid substringToIndex:MIN((NSUInteger)8,uid.length)];
 }
-
-static void sck_hit(id self, SEL _cmd, id a, id b, id c) {
-    if (t_inhit) return;
-    NSString *sel = NSStringFromSelector(_cmd);
-    NSString *cls = NSStringFromClass(object_getClass(self));
-    if ([sel isEqualToString:@"setValue:forIvarName:"] || [sel isEqualToString:@"_updatePresencePlatformActiveConvo"] || [sel isEqualToString:@"_notifyConvoIdToCall"]) return;
-    if ([cls containsString:@"SaberServiceProvider"]) return;
-    if ([sel isEqualToString:@"userNotificationCenter:willPresentNotification:withCompletionHandler:"]) {
-        @try {
-            id req = [b valueForKey:@"request"];
-            id content = [req valueForKey:@"content"];
-            id ui = [content valueForKey:@"userInfo"];
-            if ([ui isKindOfClass:[NSDictionary class]] && [[ui objectForKey:@"scnotify"] boolValue]) return;
-            NSString *title = [content valueForKey:@"title"] ?: @"";
-            NSString *body = [content valueForKey:@"body"] ?: @"";
-            sck_log(@"WILLPRESENT title=%@ body=%@", title, body);
-            BOOL active = ([[UIApplication sharedApplication] applicationState] == UIApplicationStateActive);
-            if (!active && (title.length || body.length)) {
-                sck_notify_thr([NSString stringWithFormat:@"wp|%@|%@", title, body], @"Snapchat", body.length ? body : title, NO, 2.0);
-            }
-        } @catch (NSException *e) { sck_log(@"willpresent exc %@", e); }
-        return;
-    }
-    if ([sel isEqualToString:@"application:didRegisterForRemoteNotificationsWithDeviceToken:"]) {
-        NSData *tok = [b isKindOfClass:[NSData class]] ? (NSData *)b : nil;
-        sck_log(@"PUSH TOKEN len=%lu", (unsigned long)tok.length);
-        return;
-    }
-    if ([sel isEqualToString:@"application:didFailToRegisterForRemoteNotificationsWithError:"]) {
-        sck_log(@"PUSH REGISTRATION FAILED: %@", b);
-        return;
-    }
-    if ([sel hasPrefix:@"application:didReceiveRemoteNotification:"]) {
-        NSDictionary *ui = [b isKindOfClass:[NSDictionary class]] ? (NSDictionary *)b : nil;
-        sck_log(@"PUSH RECV keys=%@", ui.allKeys);
-        BOOL active = ([[UIApplication sharedApplication] applicationState] == UIApplicationStateActive);
-        if (ui && !active) {
-            NSString *body = nil;
-            id aps = ui[@"aps"];
-            if ([aps isKindOfClass:[NSDictionary class]]) {
-                id alert = aps[@"alert"];
-                if ([alert isKindOfClass:[NSString class]]) body = alert;
-                else if ([alert isKindOfClass:[NSDictionary class]]) body = alert[@"body"] ?: alert[@"title"];
-            }
-            if (!body.length) body = ui[@"body"] ?: ui[@"message"] ?: @"notification";
-            sck_notify_thr([@"push" stringByAppendingString:body], @"Snapchat", body, NO, 2.0);
+static void loadConfig(void) {
+    NSMutableDictionary *defaults=[@{
+        @"Enabled":@YES,@"TypingNotifications":@YES,@"SnapNotifications":@YES,
+        @"MessageNotifications":@YES,@"CallNotifications":@YES,@"PeekingNotifications":@YES,
+        @"NotifyInForeground":@NO,@"ExperimentalKeepAlive":@YES,
+        @"DiagnosticsIncludeIdentifiers":@NO,@"TypingIdleSeconds":@8.0,
+        @"TypingRestartGapSeconds":@1.5,@"NameWaitSeconds":@0.8,
+        @"Aliases":@{},@"SelfUserID":@"",@"TypingInactiveStates":@[]
+    } mutableCopy];
+    NSString *p=[documents stringByAppendingPathComponent:@"SnapNotifyConfig.plist"];
+    NSDictionary *file=[NSDictionary dictionaryWithContentsOfFile:p];
+    if(file){
+        for(NSString *key in [defaults allKeys]) {
+            id a=defaults[key],b=file[key];
+            BOOL ok=([a isKindOfClass:NSNumber.class]&&[b isKindOfClass:NSNumber.class])||([a isKindOfClass:NSString.class]&&[b isKindOfClass:NSString.class])||([a isKindOfClass:NSDictionary.class]&&[b isKindOfClass:NSDictionary.class])||([a isKindOfClass:NSArray.class]&&[b isKindOfClass:NSArray.class]);
+            if(ok)defaults[key]=b;
         }
-        return;
+    }else [defaults writeToFile:p atomically:YES];
+    NSMutableDictionary *aliases=[NSMutableDictionary dictionary];
+    for(id key in defaults[@"Aliases"]){if(aliases.count>=2048)break;NSString *uid=SNIdentifier(key),*name=SNName(defaults[@"Aliases"][key]);if(uid&&name)aliases[uid]=name;}
+    defaults[@"Aliases"]=[aliases copy];
+    if([defaults[@"TypingInactiveStates"] count]>256)defaults[@"TypingInactiveStates"]=@[];
+    config=[defaults copy];atomic_store(&experiments,enabled(@"Enabled")&&enabled(@"ExperimentalKeepAlive"));
+}
+static NSString *cachePath(void) {return [support stringByAppendingPathComponent:@"identities-v4.plist"];}
+static void saveCache(void) {
+    if(!cacheDirty||!account.length)return;cacheDirty=NO;
+    NSError *error=nil;
+    NSData *data=[NSPropertyListSerialization dataWithPropertyList:@{@"version":@4,@"account":account,@"users":users} format:NSPropertyListBinaryFormat_v1_0 options:0 error:&error];
+    if(!data||![data writeToFile:cachePath() options:NSDataWritingAtomic|NSDataWritingFileProtectionCompleteUntilFirstUserAuthentication error:&error]){cacheDirty=YES;logLine(@"CACHE-WRITE-FAILED code=%ld",(long)error.code);}
+}
+static void setAccount(NSString *uid) {
+    if(!uid.length||[account isEqualToString:uid])return;
+    BOOL switching=account.length>0;
+    saveCache();account=[uid copy];
+    if(switching){
+        queueGeneration++;
+        NSArray *owned=issuedRequests.allKeys;
+        [[UNUserNotificationCenter currentNotificationCenter] removePendingNotificationRequestsWithIdentifiers:owned];
+        [[UNUserNotificationCenter currentNotificationCenter] removeDeliveredNotificationsWithIdentifiers:owned];
+        [issuedRequests removeAllObjects];[users removeAllObjects];[presence removeAllObjects];[pendingEvents removeAllObjects];memset(&ledger,0,sizeof(ledger));
     }
-    if ([sel isEqualToString:@"addNotificationRequest:withCompletionHandler:"]) {
-        @try {
-            id content = [a valueForKey:@"content"];
-            id ui = [content valueForKey:@"userInfo"];
-            if ([ui isKindOfClass:[NSDictionary class]] && [[ui objectForKey:@"scnotify"] boolValue]) return;
-            NSString *title = [content valueForKey:@"title"] ?: @"";
-            NSString *body = [content valueForKey:@"body"] ?: @"";
-            sck_log(@"SNAP-LOCAL title=%@ body=%@", title, body);
-            BOOL active = ([[UIApplication sharedApplication] applicationState] == UIApplicationStateActive);
-            if (!active && (title.length || body.length)) {
-                sck_notify_thr([NSString stringWithFormat:@"sl|%@|%@", title, body], @"Snapchat", body.length ? body : title, NO, 2.0);
-            }
-        } @catch (NSException *e) { sck_log(@"snap-local exc %@", e); }
-        return;
-    }
-    if ([sel isEqualToString:@"userNotificationCenter:didReceiveNotificationResponse:withCompletionHandler:"]) {
-        @try {
-            id notif = [b valueForKey:@"notification"];
-            id req = [notif valueForKey:@"request"];
-            id content = [req valueForKey:@"content"];
-            id ui = [content valueForKey:@"userInfo"];
-            if ([ui isKindOfClass:[NSDictionary class]] && [[ui objectForKey:@"scnotify"] boolValue]) { sck_log(@"TAP (ours)"); return; }
-            sck_log(@"TAP title=%@ body=%@", [content valueForKey:@"title"] ?: @"", [content valueForKey:@"body"] ?: @"");
-        } @catch (NSException *e) { sck_log(@"tap exc %@", e); }
-        return;
-    }
-    if ([cls containsString:@"DuplexMessageHandler"] && [sel isEqualToString:@"onReceive:"]) {
-        NSData *d = [a isKindOfClass:[NSData class]] ? (NSData *)a : nil;
-        NSString *kind = sck_duplex_kind(d);
-        NSMutableString *hex = [NSMutableString string];
-        const uint8_t *bp = d.bytes;
-        NSUInteger cap = (kind && ![kind isEqualToString:@"presence"]) ? 400 : 48;
-        NSUInteger hn = d.length < cap ? d.length : cap;
-        for (NSUInteger i = 0; i < hn; i++) [hex appendFormat:@"%02x", bp[i]];
-        sck_log(@"DUPLEX kind=%@ len=%lu hex=%@", kind ?: @"?", (unsigned long)d.length, hex.length ? hex : @"-");
-        if (!kind || [kind isEqualToString:@"presence"] || [kind isEqualToString:@"sync_trigger"]) return;
-        BOOL dactive = ([[UIApplication sharedApplication] applicationState] == UIApplicationStateActive);
-        if (dactive) return;
-        NSString *dbody = nil;
-        if ([kind isEqualToString:@"typing"]) dbody = @"quelqu'un est en train d'écrire...";
-        else if ([kind isEqualToString:@"snap"]) dbody = @"nouveau snap reçu";
-        else dbody = @"nouveau message reçu";
-        sck_notify_thr([@"duplex|" stringByAppendingString:kind], @"Snapchat", dbody, NO, 2.0);
-        return;
-    }
-    if ([sel hasPrefix:@"postNotificationName:"]) {
-        if (![a isKindOfClass:[NSString class]]) return;
-        NSString *low = [a lowercaseString];
-        NSString *core = low;
-        if ([core hasPrefix:@"com.snapchat."]) core = [core substringFromIndex:13];
-        else if ([core hasPrefix:@"com.snapchat"]) core = [core substringFromIndex:12];
-        if ([core containsString:@"managed"] || [core containsString:@"context"] || [core containsString:@"window"] || [core containsString:@"audiosession"] || [core containsString:@"keyboard"] || [core containsString:@"keypath"] || [core containsString:@"external"] || [core containsString:@"screen"] || [core containsString:@"scene"] || [core containsString:@"layout"] || [core containsString:@"lens"] || [core containsString:@"unlockable"] || [core containsString:@"viewcontroller"] || [core hasPrefix:@"ns"] || [core hasPrefix:@"_ns"] || [core hasPrefix:@"_ui"] || [core hasPrefix:@"av"] || [core hasPrefix:@"un"] || [core hasPrefix:@"_un"]) return;
-        BOOL interesting = [core containsString:@"typing"] || [core containsString:@"message"] || [core containsString:@"conversation"] || [core containsString:@"receive"] || [core containsString:@"incoming"] || [core containsString:@"call"] || [core containsString:@"presence"];
-        if (!interesting) return;
-        sck_log(@"NOTIFPOST %@", a);
-        sck_notify_thr([@"post" stringByAppendingString:a], @"Snapchat", [NSString stringWithFormat:@"activité (%@)", a], NO, 10.0);
-        return;
-    }
-    @try {
-        double nowt = [[NSDate date] timeIntervalSince1970];
-        NSString *hk = [NSString stringWithFormat:@"%@|%@", cls, sel];
-        NSInteger rolledCount = 0;
-        BOOL loghit = YES;
-        [gLock lock];
-        NSArray *win = gHitWin[hk];
-        double wstart = win ? [win[0] doubleValue] : nowt;
-        NSUInteger wc = win ? [win[1] unsignedIntegerValue] : 0;
-        if (nowt - wstart > 5.0) {
-            rolledCount = (NSInteger)[gHitSupp[hk] unsignedIntegerValue];
-            gHitSupp[hk] = @0;
-            wstart = nowt; wc = 0;
+    /* Learning our own ID for the first time must not cancel the incoming
+       call whose state callback supplied it. Only a real account switch resets. */
+    NSDictionary *saved=[NSDictionary dictionaryWithContentsOfFile:cachePath()];
+    if([saved[@"version"] isEqual:@4]&&[saved[@"account"] isEqual:account]&&[saved[@"users"] isKindOfClass:NSDictionary.class]) {
+        for(id key in saved[@"users"]){
+            if(users.count>=2048)break;NSString *user=SNIdentifier(key);id value=saved[@"users"][key];
+            if(user&&!users[user]&&[value isKindOfClass:NSDictionary.class]&&SNName(value[@"name"]))users[user]=@{@"name":SNName(value[@"name"]),@"quality":@1};
         }
-        wc++;
-        gHitWin[hk] = @[@(wstart), @(wc)];
-        if (wc > 6) { loghit = NO; gHitSupp[hk] = @([gHitSupp[hk] unsignedIntegerValue] + 1); }
-        [gLock unlock];
-        if (rolledCount > 0) sck_log(@"SUPPRESSED %@ x%ld", hk, (long)rolledCount);
-        if (loghit) sck_log(@"HIT [%@] -[%@ %@]", sck_app_state(), cls, sel);
-        if ([cls containsString:@"SCCallStateProvider"] && [sel isEqualToString:@"updateWithPresencePlatformActiveConversationsInfo:"]) {
-            @try {
-                NSString *desc = [a description] ?: @"";
-                double pnow = [[NSDate date] timeIntervalSince1970];
-                if (pnow - t_lastPresDump > 120.0) { t_lastPresDump = pnow; sck_log(@"PRESENCE-DESC %.700@", desc); }
-                NSRange r = [desc rangeOfString:@"remoteTypingParticipants"];
-                if (r.location != NSNotFound) {
-                    NSString *tail = [desc substringFromIndex:r.location];
-                    NSRange close = [tail rangeOfString:@"]"];
-                    NSString *uid = sck_regex_first(@"userId: *([0-9a-fA-F-]{36})", tail);
-                    if (uid.length) {
-                        BOOL inSection = (close.location == NSNotFound);
-                        if (!inSection) {
-                            NSRange uir = [tail rangeOfString:uid];
-                            inSection = (uir.location != NSNotFound && uir.location < close.location);
-                        }
-                        if (inSection) {
-                            NSString *conv = sck_regex_first(@"conversationId: *([0-9a-fA-F-]{36})", desc);
-                            [gLock lock];
-                            NSString *nm = gNameCache[uid];
-                            if (!nm.length && conv.length) nm = gNameCache[conv];
-                            [gLock unlock];
-                            sck_log(@"PRESENCE-TYPING uid=%@ conv=%@ name=%@", uid, conv.length ? conv : @"?", nm.length ? nm : @"(none)");
-                            BOOL active = ([[UIApplication sharedApplication] applicationState] == UIApplicationStateActive);
-                            if (!active) {
-                                NSString *body = nm.length ? [NSString stringWithFormat:@"%@ est en train d'écrire...", nm] : @"quelqu'un est en train d'écrire...";
-                                sck_notify_thr([@"typing|" stringByAppendingString:(conv.length ? conv : uid)], @"Snapchat", body, NO, 15.0);
-                            }
-                        }
-                    }
+    }
+    cacheDirty=users.count>0;logLine(@"ACCOUNT-CHANGED account=%@ cache=%lu",shortID(uid),(unsigned long)users.count);
+}
+static void remember(NSArray<NSDictionary *> *records) {
+    for(NSDictionary *u in records) {
+        NSString *uid=SNIdentifier(u[@"uid"]),*name=SNName(u[@"name"]);if(!uid||!name)continue;
+        NSInteger quality=[u[@"quality"] integerValue];NSDictionary *old=users[uid];
+        if(old&&[old[@"quality"] integerValue]>quality)continue;
+        if([old[@"name"] isEqual:name])continue;
+        if(users.count>=2048&&!old)[users removeObjectForKey:users.allKeys.firstObject];
+        users[uid]=@{@"name":name,@"quality":@(quality)};cacheDirty=YES;
+        /* Do not publish contact names in diagnostics. */
+        logLine(@"IDENTITY-LEARNED uid=%@ quality=%ld",shortID(uid),(long)quality);
+    }
+}
+static NSString *resolveName(NSString *uid) {
+    NSDictionary *aliases=config[@"Aliases"];NSString *name=SNName(aliases[uid])?:SNName(users[uid][@"name"]);
+    if(name)nameHits++;else nameMisses++;return name;
+}
+static BOOL eventEnabled(NSString *kind) {
+    NSDictionary *keys=@{@"typing":@"TypingNotifications",@"peek":@"PeekingNotifications",@"snap":@"SnapNotifications",@"message":@"MessageNotifications",@"call":@"CallNotifications"};
+    return enabled(@"Enabled")&&keys[kind]&&enabled(keys[kind]);
+}
+static NSString *eventKey(NSDictionary *event) {
+    return [@[event[@"kind"],event[@"conversation"],event[@"uid"],event[@"event"]] componentsJoinedByString:@"|"];
+}
+static NSString *bodyFor(NSDictionary *event,NSString *name) {
+    NSString *who=name ?: [NSString stringWithFormat:@"Contact %@",shortID(event[@"uid"])];
+    NSString *kind=event[@"kind"];
+    if([kind isEqual:@"typing"])return [who stringByAppendingString:@" est en train d’écrire…"];
+    if([kind isEqual:@"peek"])return [who stringByAppendingString:@" entrouvre la conversation"];
+    if([kind isEqual:@"snap"])return [who stringByAppendingString:@" t’a envoyé un snap"];
+    if([kind isEqual:@"message"])return [who stringByAppendingString:@" t’a envoyé un message"];
+    return [who stringByAppendingString:[event[@"video"] boolValue]?@" t’appelle en vidéo":@" t’appelle"];
+}
+static BOOL isForegroundSuppressed(void) {return atomic_load(&appState)==UIApplicationStateActive&&!enabled(@"NotifyInForeground");}
+static void deliver(NSDictionary *event,uint64_t ticket,uint64_t generation,unsigned attempt) {
+    if(generation!=queueGeneration)return;
+    NSString *key=eventKey(event);
+    /* STOP / account changes can cancel the pending name wait. */
+    if(![pendingEvents[key][@"ticket"] isEqual:@(ticket)])return;
+    if(!eventEnabled(event[@"kind"])||isForegroundSuppressed()) {
+        sn_ledger_commit(&ledger,ticket,nowTime(),60);[pendingEvents removeObjectForKey:key];return;
+    }
+    NSString *name=resolveName(event[@"uid"]);
+    UNMutableNotificationContent *content=[UNMutableNotificationContent new];
+    content.title=@"Snapchat";content.body=bodyFor(event,name);content.sound=UNNotificationSound.defaultSound;
+    content.threadIdentifier=[@"snapnotify." stringByAppendingString:event[@"conversation"]];
+    content.userInfo=@{@"scnotify":@YES,@"version":SNVersion,@"kind":event[@"kind"]};
+    if(@available(iOS 15.0,*)){if([event[@"kind"] isEqual:@"call"])content.interruptionLevel=UNNotificationInterruptionLevelTimeSensitive;}
+    NSString *requestID=[NSString stringWithFormat:@"snapnotify.%@.%llu",session,(unsigned long long)ticket];
+    UNNotificationRequest *request=[UNNotificationRequest requestWithIdentifier:requestID content:content trigger:nil];
+    issuedRequests[requestID]=@(nowTime());
+    logLine(@"NOTIF-REQUEST type=%@ uid=%@ name=%@ attempt=%u",event[@"kind"],shortID(event[@"uid"]),name?@"resolved":@"unresolved",attempt);
+    [[UNUserNotificationCenter currentNotificationCenter] addNotificationRequest:request withCompletionHandler:^(NSError *error) {
+        dispatch_async(worker,^{
+            if(generation!=queueGeneration){
+                [[UNUserNotificationCenter currentNotificationCenter] removePendingNotificationRequestsWithIdentifiers:@[requestID]];
+                [[UNUserNotificationCenter currentNotificationCenter] removeDeliveredNotificationsWithIdentifiers:@[requestID]];
+                return;
+            }
+            if(![pendingEvents[key][@"ticket"] isEqual:@(ticket)])return;
+            if(error){
+                logLine(@"NOTIF-FAILED type=%@ domain=%@ code=%ld",event[@"kind"],error.domain,(long)error.code);
+                /* One bounded retry, same identifier. Do not lock out a failed
+                   notification or busy-loop when permission is denied. */
+                if(attempt==0 && !( [error.domain isEqualToString:UNErrorDomain] && error.code==UNErrorCodeNotificationsNotAllowed)){
+                    dispatch_after(dispatch_time(DISPATCH_TIME_NOW,NSEC_PER_SEC),worker,^{deliver(event,ticket,generation,1);});
+                }else{
+                    sn_ledger_cancel(&ledger,ticket);[pendingEvents removeObjectForKey:key];
+                    NSString *pk=[@[event[@"kind"],event[@"conversation"],event[@"uid"]] componentsJoinedByString:@"|"];
+                    SNPresence *ps=[presence[pk] mutableBytes];
+                    if(ps && [[NSString stringWithFormat:@"session-%llu",(unsigned long long)ps->session] isEqual:event[@"event"]]){ps->active=false;ps->notified=false;}
                 }
-            } @catch (NSException *e) { sck_log(@"presence exc %@", e); }
-            return;
-        }
-        if (loghit) {
-            sck_log_obj(@"a", a);
-            if (b && b != a) sck_log_obj(@"b", b);
-            if (c && c != a && c != b) sck_log_obj(@"c", c);
-        }
-        if ([cls containsString:@"Snapchatter"] || [cls containsString:@"ChatConversation"] || [cls containsString:@"ConversationViewModel"] || [cls containsString:@"ConversationMetadata"] || [cls containsString:@"FriendsFeed"] || [cls containsString:@"Hermod"] || [cls containsString:@"SOJU"]) {
-            sck_extract_name(self, NULL);
-            sck_extract_name(a, NULL);
-            if (b && b != a) sck_extract_name(b, NULL);
-            if (c && c != a && c != b) sck_extract_name(c, NULL);
-        }
-        if ([cls containsString:@"TypingBubbleView"]) return;
-        NSString *t = sck_event_type(cls, sel);
-        if (!t) return;
-        NSString *sell = [sel lowercaseString];
-        if ([t isEqualToString:@"call"]) {
-            BOOL realCall = [sell containsString:@"callobserver"] || [sell containsString:@"callchanged"] || [sell containsString:@"incomingcall"] || [sell containsString:@"reportincoming"] || [sell containsString:@"callreceived"] || [sell containsString:@"didreceivecall"];
-            if (!realCall) return;
-        }
-        BOOL active = ([[UIApplication sharedApplication] applicationState] == UIApplicationStateActive);
-        if (active && ![t isEqualToString:@"call"]) { sck_log(@"SKIP(active) %@ %@", cls, sel); return; }
-        BOOL foundName = NO;
-        NSString *name = sck_extract_name(a, &foundName);
-        if (!name.length && b && b != a) name = sck_extract_name(b, &foundName);
-        if (!name.length && c && c != a && c != b) name = sck_extract_name(c, &foundName);
-        NSString *body = nil;
-        BOOL gHermod = NO;
-        if ([t isEqualToString:@"generic"]) {
-            NSString *lowall = [[[cls stringByAppendingString:@":"] stringByAppendingString:sel] lowercaseString];
-            if ([lowall containsString:@"presence"]) return;
-            BOOL msgLike = [lowall containsString:@"message"] || [lowall containsString:@"chat"];
-            BOOL snapLike = [lowall containsString:@"snap"];
-            BOOL hermodLike = ([cls containsString:@"Hermod"] || [cls containsString:@"SOJU"] || [cls containsString:@"SyncTrigger"] || [cls containsString:@"DeltaSync"]) && ([lowall containsString:@"receive"] || [lowall containsString:@"payload"] || [lowall containsString:@"process"] || [lowall containsString:@"handle"] || [lowall containsString:@"delta"] || [lowall containsString:@"trigger"]);
-            if (!msgLike && !snapLike && !hermodLike) return;
-            NSString *base = snapLike ? @"nouvelle activité snap" : ((hermodLike && !msgLike) ? @"nouveau message reçu" : @"nouveau message");
-            body = name.length ? [NSString stringWithFormat:@"%@ : %@", name, base] : base;
-            if (hermodLike) gHermod = YES;
+            }else{
+                double ttl=[event[@"kind"] isEqual:@"call"]?300:([event[@"kind"] isEqual:@"typing"]||[event[@"kind"] isEqual:@"peek"])?60:86400;
+                sn_ledger_commit(&ledger,ticket,nowTime(),ttl);[pendingEvents removeObjectForKey:key];postedCount++;
+                logLine(@"NOTIF-ACCEPTED type=%@ ticket=%llu",event[@"kind"],(unsigned long long)ticket);
+            }
+        });
+    }];
+}
+static void notifyEvent(NSDictionary *event) {
+    NSString *uid=event[@"uid"],*kind=event[@"kind"];
+    if(!SNIdentifier(uid)||!SNIdentifier(event[@"conversation"])||!event[@"event"]||!kind)return;
+    if(account.length&&[uid isEqual:account]){logLine(@"EVENT-DROP reason=self type=%@",kind);return;}
+    if(!eventEnabled(kind))return;
+    NSString *key=eventKey(event);double now=nowTime();
+    uint64_t ticket=sn_ledger_reserve(&ledger,key.UTF8String,now,15);
+    if(!ticket){logLine(@"EVENT-DROP reason=duplicate type=%@ uid=%@",kind,shortID(uid));return;}
+    if(isForegroundSuppressed()) {
+        sn_ledger_commit(&ledger,ticket,now,([kind isEqual:@"call"]?300:60));
+        logLine(@"EVENT-OBSERVED type=%@ foreground=1",kind);return;
+    }
+    pendingEvents[key]=@{@"ticket":@(ticket),@"event":event,@"created":@(now)};
+    double wait=SNName(config[@"Aliases"][uid])||SNName(users[uid][@"name"])?0:setting(@"NameWaitSeconds",0.8,0,2);
+    uint64_t generation=queueGeneration;
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW,(int64_t)(wait*NSEC_PER_SEC)),worker,^{deliver(event,ticket,generation,0);});
+}
+static void cancelCall(SNCall call) {
+    NSDictionary *e=@{@"kind":@"call",@"uid":@(call.sender),@"conversation":@(call.conversation),@"event":@(call.call)};
+    NSString *key=eventKey(e);NSDictionary *pending=pendingEvents[key];
+    if(pending){sn_ledger_cancel(&ledger,[pending[@"ticket"] unsignedLongLongValue]);[pendingEvents removeObjectForKey:key];}
+    sn_ledger_mark(&ledger,key.UTF8String,nowTime(),300);
+    logLine(@"CALL-STOP uid=%@",shortID(@(call.sender)));
+}
+static void consumePacket(NSData *packet) {
+    lastWire=nowTime();wireCount++;
+    SNRecord records[SN_RECORD_MAX];size_t count=0;
+    if(!sn_decode_records((SNBytes){packet.bytes,packet.length},records,&count)) {
+        malformedCount++;logLine(@"WIRE-UNSUPPORTED bytes=%lu",(unsigned long)packet.length);return;
+    }
+    for(size_t i=0;i<count;i++) {
+        SNRecord r=records[i];
+        if(!strcmp(r.topic,"volatile")) {
+            SNCall call;
+            if(sn_decode_call(r.payload,&call)) {
+                if(call.action==SN_CALL_STOP){cancelCall(call);continue;}
+                if(call.skip_ringing){logLine(@"CALL-SILENT uid=%@",shortID(@(call.sender)));continue;}
+                notifyEvent(@{@"kind":@"call",@"uid":@(call.sender),@"conversation":@(call.conversation),@"event":@(call.call),@"video":@(call.video)});
+            }else logLine(@"WIRE-IGNORED topic=volatile reason=not-a-validated-call bytes=%lu",(unsigned long)r.payload.size);
+        } else if(!strcmp(r.topic,"presence")) {
+            /* The typed presence callback is the semantic source. Raw presence
+               bytes in the supplied logs are truncated, so no guessed schema. */
+            logLine(@"WIRE topic=presence bytes=%lu",(unsigned long)r.payload.size);
         } else {
-            body = sck_message_body(t, name);
-        }
-        double thr = [t isEqualToString:@"typing"] ? 15.0 : 2.0;
-        NSString *gident = sck_extract_ident(a);
-        if (!gident.length && b && b != a) gident = sck_extract_ident(b);
-        if (!gident.length && c && c != a && c != b) gident = sck_extract_ident(c);
-        NSString *key = [NSString stringWithFormat:@"%@|%@", t, gident.length ? gident : (name.length ? name : @"?")];
-        if (gHermod) key = @"hermod";
-        sck_log(@"EVENT type=%@ name=%@ body=%@", t, name.length ? name : @"(none)", body);
-        sck_notify_thr(key, @"Snapchat", body, NO, thr);
-    } @catch (NSException *e) { sck_log(@"hit exc %@", e); }
-}
-
-static void sck_repl0(id self, SEL _cmd) { sck_hit(self, _cmd, nil, nil, nil); IMP o = sck_orig(self, _cmd); if (o) ((void (*)(id, SEL))o)(self, _cmd); }
-static void sck_repl1(id self, SEL _cmd, id a) { sck_hit(self, _cmd, a, nil, nil); IMP o = sck_orig(self, _cmd); if (o) ((void (*)(id, SEL, id))o)(self, _cmd, a); }
-static void sck_repl2(id self, SEL _cmd, id a, id b) { sck_hit(self, _cmd, a, b, nil); IMP o = sck_orig(self, _cmd); if (o) ((void (*)(id, SEL, id, id))o)(self, _cmd, a, b); }
-static void sck_repl3(id self, SEL _cmd, id a, id b, id c) { sck_hit(self, _cmd, a, b, c); IMP o = sck_orig(self, _cmd); if (o) ((void (*)(id, SEL, id, id, id))o)(self, _cmd, a, b, c); }
-
-static id sck_repl_id1(id self, SEL _cmd, id a) {
-    IMP o = sck_orig(self, _cmd);
-    id ret = o ? ((id (*)(id, SEL, id))o)(self, _cmd, a) : nil;
-    @try {
-        if ([a isKindOfClass:[NSString class]]) {
-            if ([ret isKindOfClass:[NSString class]] && [ret length] > 0 && [ret length] < 40) {
-                BOOL changed = NO;
-                [gLock lock];
-                if (![gNameCache[a] isEqual:ret]) { gNameCache[a] = ret; changed = YES; gCacheDirty = YES; }
-                [gLock unlock];
-                if (changed) sck_log(@"NAMECACHE %@ -> %@", a, ret);
-            } else if (ret && ![ret isKindOfClass:[NSString class]]) {
-                NSString *nm = sck_extract_name(ret, NULL);
-                if (nm.length) {
-                    BOOL changed = NO;
-                    [gLock lock];
-                    if (![gNameCache[a] isEqual:nm]) { gNameCache[a] = nm; changed = YES; gCacheDirty = YES; }
-                    [gLock unlock];
-                    if (changed) sck_log(@"NAMECACHE %@ -> %@", a, nm);
-                }
-            }
-        }
-    } @catch (NSException *e) {}
-    return ret;
-}
-
-static id sck_repl_id2(id self, SEL _cmd, id a, id b) {
-    IMP o = sck_orig(self, _cmd);
-    id ret = o ? ((id (*)(id, SEL, id, id))o)(self, _cmd, a, b) : nil;
-    @try {
-        if ([a isKindOfClass:[NSString class]] && [ret isKindOfClass:[NSString class]] && [ret length] > 0 && [ret length] < 40) {
-            BOOL changed = NO;
-            [gLock lock];
-            if (![gNameCache[a] isEqual:ret]) { gNameCache[a] = ret; changed = YES; }
-            [gLock unlock];
-            if (changed) sck_log(@"NAMECACHE %@ -> %@", a, ret);
-        }
-    } @catch (NSException *e) {}
-    return ret;
-}
-
-static BOOL sck_hierarchy_conflict(Class c, const char *sn) {
-    for (Class k = class_getSuperclass(c); k; k = class_getSuperclass(k)) {
-        NSString *key = [NSString stringWithFormat:@"%s|%s", class_getName(k), sn];
-        [gLock lock];
-        BOOL d = (gOrig[key] != nil);
-        [gLock unlock];
-        if (d) return YES;
-    }
-    [gLock lock];
-    NSArray *keys = [gOrig allKeys];
-    [gLock unlock];
-    for (NSString *key in keys) {
-        NSRange r = [key rangeOfString:@"|"];
-        if (r.location == NSNotFound) continue;
-        NSString *ksn = [key substringFromIndex:r.location + 1];
-        if (strcmp([ksn UTF8String], sn) != 0) continue;
-        Class k = objc_getClass([[key substringToIndex:r.location] UTF8String]);
-        if (!k || k == c) continue;
-        for (Class a = class_getSuperclass(k); a; a = class_getSuperclass(a)) {
-            if (a == c) return YES;
+            logLine(@"WIRE-UNSUPPORTED topic=%s bytes=%lu",r.topic,(unsigned long)r.payload.size);
+            /* sync_trigger is not a snap. No fallback 'activity' notifications. */
         }
     }
-    return NO;
 }
-
-static void sck_attach(Class c, Method m) {
-    SEL sel = method_getName(m);
-    const char *sn = sel_getName(sel);
-    int colons = 0;
-    for (const char *p = sn; *p; p++) if (*p == ':') colons++;
-    NSString *key = [NSString stringWithFormat:@"%s|%s", class_getName(c), sn];
-    [gLock lock];
-    BOOL done = (gOrig[key] != nil);
-    [gLock unlock];
-    if (done) return;
-    if (sck_hierarchy_conflict(c, sn)) { sck_log(@"skip(hierarchy) -[%s %s]", class_getName(c), sn); return; }
-    {
-        char lowbuf[300];
-        size_t ln = strlen(sn);
-        if (ln >= sizeof(lowbuf)) ln = sizeof(lowbuf) - 1;
-        for (size_t k = 0; k < ln; k++) lowbuf[k] = (char)tolower((unsigned char)sn[k]);
-        lowbuf[ln] = 0;
-        BOOL resolver = (strstr(lowbuf, "displaynameforuser") != NULL) || (strstr(lowbuf, "usernameforuser") != NULL) || (strstr(lowbuf, "nameforuserid") != NULL) || (strstr(lowbuf, "displaynameforcontact") != NULL);
-        if (resolver && (colons == 1 || colons == 2)) {
-            IMP newImp = (colons == 1) ? (IMP)sck_repl_id1 : (IMP)sck_repl_id2;
-            IMP old = method_setImplementation(m, newImp);
-            [gLock lock];
-            gOrig[key] = [NSValue valueWithPointer:(void *)old];
-            [gLock unlock];
-            sck_log(@"swizzled(ret%d) -[%s %s]", colons, class_getName(c), sn);
-            return;
-        }
-    }
-    if (!sck_enc_ok(m, colons)) return;
-    IMP newImp = NULL;
-    switch (colons) {
-        case 0: newImp = (IMP)sck_repl0; break;
-        case 1: newImp = (IMP)sck_repl1; break;
-        case 2: newImp = (IMP)sck_repl2; break;
-        case 3: newImp = (IMP)sck_repl3; break;
-        default: return;
-    }
-    IMP old = method_setImplementation(m, newImp);
-    [gLock lock];
-    gOrig[key] = [NSValue valueWithPointer:(void *)old];
-    [gLock unlock];
-    sck_log(@"swizzled -[%s %s]", class_getName(c), sn);
-}
-
-static void sck_hook_all(Class c) {
-    unsigned mc = 0;
-    Method *ms = class_copyMethodList(c, &mc);
-    if (!ms) return;
-    for (unsigned j = 0; j < mc; j++) {
-        const char *sn = sel_getName(method_getName(ms[j]));
-        if (strcmp(sn, "dealloc") == 0 || strcmp(sn, ".cxx_destruct") == 0 || strcmp(sn, ".cxx_construct") == 0 || strcmp(sn, "initialize") == 0) continue;
-        int colons = 0;
-        for (const char *p = sn; *p; p++) if (*p == ':') colons++;
-        if (colons > 3) continue;
-        if (!sck_enc_ok(ms[j], colons)) continue;
-        sck_attach(c, ms[j]);
-    }
-    free(ms);
-}
-
-static void sck_hook_duplex(Class c) {
-    unsigned mc = 0;
-    Method *ms = class_copyMethodList(c, &mc);
-    if (!ms) return;
-    for (unsigned j = 0; j < mc; j++) {
-        const char *sn = sel_getName(method_getName(ms[j]));
-        int colons = 0;
-        for (const char *p = sn; *p; p++) if (*p == ':') colons++;
-        if (colons > 3) continue;
-        if (!sck_enc_ok(ms[j], colons)) continue;
-        sck_attach(c, ms[j]);
-    }
-    free(ms);
-}
-
-static void sck_scan(void) {
-    @try {
-        static NSArray *targets = nil;
-        if (!targets) targets = @[
-            @"session:didReceiveMessage:",
-            @"session:didReceiveMessage:replyHandler:",
-            @"session:didReceiveMessageData:",
-            @"session:didReceiveMessageData:replyHandler:",
-            @"URLSession:webSocketTask:didReceiveMessage:",
-            @"URLSession:webSocketTask:didReceiveMessageData:",
-            @"_didReceiveNotificationWithUserInfoInPerformer:",
-            @"didReceiveNotificationWithUserInfo:",
-            @"presentInAppNotification:delegate:",
-            @"presentInAppNotificationAsync:delegate:",
-            @"userNotificationCenter:willPresentNotification:withCompletionHandler:",
-            @"userNotificationCenter:didReceiveNotificationResponse:withCompletionHandler:",
-            @"handleInAppNotification:",
-            @"handleInAppNotification:navigationController:",
-            @"matchInAppNotification:systemNotification:",
-            @"callObserver:callChanged:",
-            @"_displayNameForUserId:",
-            @"displayNameForUserId:",
-            @"usernameForUserId:",
-            @"application:didReceiveRemoteNotification:fetchCompletionHandler:",
-            @"application:didReceiveRemoteNotification:",
-            @"application:didRegisterForRemoteNotificationsWithDeviceToken:",
-            @"application:didFailToRegisterForRemoteNotificationsWithError:",
-            @"addNotificationRequest:withCompletionHandler:",
-            @"postNotificationName:object:userInfo:",
-            @"postNotificationName:object:",
-            @"snapchatterForUserId:",
-            @"_snapchatterForUserId:",
-            @"performDeltaSync",
-            @"applyDelta:"
-        ];
-        NSSet *tset = [NSSet setWithArray:targets];
-        int n = objc_getClassList(NULL, 0);
-        if (n <= 0) return;
-        __unsafe_unretained Class *list = (__unsafe_unretained Class *)malloc(sizeof(Class) * n);
-        if (!list) return;
-        n = objc_getClassList(list, n);
-        for (int i = 0; i < n; i++) {
-            Class c = list[i];
-            if (c == nil) continue;
-            const char *cn = class_getName(c);
-            BOOL isSnapClass = cn && (strncmp(cn, "SC", 2) == 0 || strstr(cn, "Snapchat") != NULL);
-            if (isSnapClass && (strstr(cn, "Typing") || strstr(cn, "CallState") || strstr(cn, "CallLauncher") || strstr(cn, "SCCallLogSyncer") || strstr(cn, "SCPushNotificationDelegate") || strstr(cn, "Hermod") || strstr(cn, "DeltaSync") || strstr(cn, "SyncTrigger") || strstr(cn, "ChatConversationUpdater") || strstr(cn, "ChatConversationViewModel") || strstr(cn, "SCChatConversationManager"))) {
-                if (strstr(cn, "DeltaSync") || strstr(cn, "SyncTrigger") || strstr(cn, "Hermod")) sck_log(@"recon: %s", cn);
-                sck_hook_all(c);
-                continue;
-            }
-            if (cn && strncmp(cn, "SCSnapchatter", 13) == 0 && strlen(cn) < 34 && strchr(cn + 13, '_') == NULL) sck_log(@"recon: %s", cn);
-            if (isSnapClass && strstr(cn, "Duplex")) {
-                sck_hook_duplex(c);
-                continue;
-            }
-            unsigned mc = 0;
-            Method *ms = class_copyMethodList(c, &mc);
-            if (!ms) continue;
-            for (unsigned j = 0; j < mc; j++) {
-                NSString *nm = NSStringFromSelector(method_getName(ms[j]));
-                if ([tset containsObject:nm]) sck_attach(c, ms[j]);
-            }
-            free(ms);
-        }
-        free(list);
-        Class adc = objc_getClass("SCAppDelegate"), mdc = objc_getClass("SCMainAppDelegate");
-        if (adc && mdc) {
-            BOOL sub = NO;
-            for (Class k = class_getSuperclass(adc); k; k = class_getSuperclass(k)) if (k == mdc) sub = YES;
-            sck_log(@"recon: SCAppDelegate subclass of SCMainAppDelegate = %d", sub);
-        }
-        NSArray *soju = @[@"SOJUReceivedSnap", @"SOJUChatConversationSnapUpdates", @"SOJUSnapUpdate", @"SOJUReceivedSnapWithAttachment", @"SOJUReceivedChatMessage", @"SOJUChatv3SnapStateMessage", @"SOJUChatv3ReleaseMessage", @"SOJUChatConversationMessageUpdates", @"SOJUChatConversationMessages", @"SOJUConversationMessage", @"SOJUChatMessage", @"SOJUChatOrSnapMessage", @"SOJUConversationStateChatRelease", @"SOJUConversationStateSnapRelease"];
-        for (NSString *cn in soju) {
-            Class c = objc_getClass([cn UTF8String]);
-            if (!c) { sck_log(@"soju: class %@ not found", cn); continue; }
-            unsigned mc = 0;
-            Method *ms = class_copyMethodList(c, &mc);
-            if (!ms) continue;
-            for (unsigned j = 0; j < mc; j++) {
-                NSString *nm = NSStringFromSelector(method_getName(ms[j]));
-                if ([nm hasPrefix:@"init"] || [nm hasPrefix:@"parse"] || [nm hasPrefix:@"merge"] || [nm hasPrefix:@"decode"]) sck_attach(c, ms[j]);
-            }
-            free(ms);
-        }
-        NSArray *models = @[@"SCSnapchatter", @"SCChatConversation", @"SCChatConversationViewModel", @"SCChatConversationViewModelV3", @"SCFriendsFeedItem", @"SCFriendsFeedViewModel"];
-        for (NSString *mn in models) {
-            Class mc = objc_getClass([mn UTF8String]);
-            if (!mc) { sck_log(@"model: class %@ not found", mn); continue; }
-            sck_hook_all(mc);
-        }
-        sck_log(@"scan done hooks=%lu", (unsigned long)gOrig.count);
-    } @catch (NSException *e) { sck_log(@"scan exc %@", e); }
-}
-
-#pragma mark - setup
-
-static void sck_setup(void) {
-    NSNotificationCenter *nc = [NSNotificationCenter defaultCenter];
-    [nc addObserverForName:UIApplicationDidEnterBackgroundNotification object:nil queue:[NSOperationQueue mainQueue] usingBlock:^(NSNotification *note) { sck_log(@"app -> background"); if (gCacheDirty) { gCacheDirty = NO; sck_cache_save(); } sck_ensure_audio(); }];
-    [nc addObserverForName:UIApplicationDidBecomeActiveNotification object:nil queue:[NSOperationQueue mainQueue] usingBlock:^(NSNotification *note) { sck_log(@"app -> active"); sck_ensure_audio(); }];
-    [nc addObserverForName:AVAudioSessionInterruptionNotification object:nil queue:[NSOperationQueue mainQueue] usingBlock:^(NSNotification *note) {
-        sck_log(@"audio interrupt");
-        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 2 * NSEC_PER_SEC), dispatch_get_main_queue(), ^{ sck_ensure_audio(); });
-    }];
-    [nc addObserverForName:AVAudioSessionMediaServicesWereResetNotification object:nil queue:[NSOperationQueue mainQueue] usingBlock:^(NSNotification *note) {
-        sck_log(@"audio services reset");
-        gPlayer = nil;
-        sck_ensure_audio();
-    }];
-    [nc addObserverForName:UIApplicationWillResignActiveNotification object:nil queue:[NSOperationQueue mainQueue] usingBlock:^(NSNotification *note) { sck_log(@"app -> resignActive"); }];
-    [nc addObserverForName:UIApplicationWillEnterForegroundNotification object:nil queue:[NSOperationQueue mainQueue] usingBlock:^(NSNotification *note) { sck_log(@"app -> willEnterForeground"); }];
-    [nc addObserverForName:UIApplicationProtectedDataDidBecomeAvailable object:nil queue:[NSOperationQueue mainQueue] usingBlock:^(NSNotification *note) { sck_log(@"protectedData available"); }];
-    [nc addObserverForName:UIApplicationProtectedDataWillBecomeUnavailable object:nil queue:[NSOperationQueue mainQueue] usingBlock:^(NSNotification *note) { sck_log(@"protectedData unavailable"); }];
-    [UIDevice currentDevice].batteryMonitoringEnabled = YES;
-    gTimer = [NSTimer scheduledTimerWithTimeInterval:20.0 repeats:YES block:^(NSTimer *t) {
-        sck_ensure_audio();
-        if (gCacheDirty) { gCacheDirty = NO; sck_cache_save(); }
-        static int hb = 0;
-        if (++hb % 3 == 0) sck_log(@"HB state=%@ audio=%d battery=%.2f", sck_app_state(), gPlayer.isPlaying, [UIDevice currentDevice].batteryLevel);
-    }];
-    sck_ensure_audio();
-    [[UNUserNotificationCenter currentNotificationCenter] requestAuthorizationWithOptions:(UNAuthorizationOptionAlert | UNAuthorizationOptionSound | UNAuthorizationOptionBadge) completionHandler:^(BOOL granted, NSError *e) {
-        sck_log(@"notif auth granted=%d err=%@", granted, e.localizedDescription ?: @"-");
-    }];
-    [[UNUserNotificationCenter currentNotificationCenter] getNotificationSettingsWithCompletionHandler:^(UNNotificationSettings *settings) {
-        sck_log(@"notif permission=%ld alert=%ld sound=%ld badge=%ld", (long)settings.authorizationStatus, (long)settings.alertSetting, (long)settings.soundSetting, (long)settings.badgeSetting);
-    }];
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 3 * NSEC_PER_SEC), dispatch_get_main_queue(), ^{
-        sck_notify_thr(@"boot", @"Snapchat", [NSString stringWithFormat:@"SnapNotify v3.8 chargé (%lu hooks)", (unsigned long)gOrig.count], YES, 0.0);
+static void enqueuePacket(NSData *data) {
+    if(![data isKindOfClass:NSData.class]||!data.length||data.length>SN_PACKET_MAX)return;
+    if(atomic_fetch_add(&inflight,1)>=64){atomic_fetch_sub(&inflight,1);atomic_fetch_add(&packetDrops,1);return;}
+    NSData *copy=[data copy];
+    dispatch_async(worker,^{
+        @try {@autoreleasepool{consumePacket(copy);}}
+        @catch(NSException *error){logLine(@"WIRE-ERROR exception=%@",error.name);}
+        @finally{atomic_fetch_sub(&inflight,1);}
     });
-    sck_log(@"setup done");
+}
+static void cancelPresenceWait(NSString *kind,NSString *cid,NSString *uid,SNPresence *state) {
+    NSString *key=[@[kind,cid,uid,[NSString stringWithFormat:@"session-%llu",(unsigned long long)state->session]] componentsJoinedByString:@"|"];
+    NSDictionary *entry=pendingEvents[key];
+    if(entry){
+        uint64_t ticket=[entry[@"ticket"] unsignedLongLongValue];
+        sn_ledger_cancel(&ledger,ticket);[pendingEvents removeObjectForKey:key];
+        NSString *rid=[NSString stringWithFormat:@"snapnotify.%@.%llu",session,(unsigned long long)ticket];
+        [[UNUserNotificationCenter currentNotificationCenter] removePendingNotificationRequestsWithIdentifiers:@[rid]];
+        state->notified=false;
+        logLine(@"PRESENCE-CANCELLED-WAIT type=%@ uid=%@",kind,shortID(uid));
+    }
+}
+static void consumePresence(NSArray<NSDictionary *> *snapshots) {
+    if(!snapshots){logLine(@"PRESENCE-UNSUPPORTED preserved_previous_state=1");return;}
+    double now=nowTime();NSMutableSet *seen=[NSMutableSet set],*unknownPeek=[NSMutableSet set];
+    for(NSDictionary *convo in snapshots) {
+        NSString *cid=convo[@"conversation"];
+        if(![convo[@"peekingKnown"] boolValue])[unknownPeek addObject:cid];
+        for(NSString *kind in @[@"typing",@"peek"]) {
+            for(NSDictionary *person in convo[[kind isEqual:@"typing"]?@"typing":@"peeking"]) {
+                NSString *uid=person[@"uid"],*key=[@[kind,cid,uid] componentsJoinedByString:@"|"];
+                [seen addObject:key];
+                BOOL active=person[@"active"]?[person[@"active"] boolValue]:YES;
+                /* RemoteTypingParticipants membership is used when the proxy
+                   offers no boolean. Numeric enum meanings are NOT invented. */
+                if([kind isEqual:@"typing"]&&[config[@"TypingInactiveStates"] containsObject:person[@"rawState"]])active=NO;
+                NSMutableData *data=presence[key];if(!data){data=[NSMutableData dataWithLength:sizeof(SNPresence)];presence[key]=data;}
+                SNPresence *state=data.mutableBytes;
+                SNPresenceChange change=sn_presence_update(state,active,now,setting(@"TypingIdleSeconds",8,2,60),setting(@"TypingRestartGapSeconds",1.5,0,10));
+                logLine(@"PRESENCE type=%@ uid=%@ raw=%@ active=%d change=%d fallback=%@",kind,shortID(uid),person[@"rawState"],active,change,convo[@"fallback"]);
+                if(change==SN_PRESENCE_STOP)cancelPresenceWait(kind,cid,uid,state);
+                if(change==SN_PRESENCE_START)notifyEvent(@{@"kind":kind,@"uid":uid,@"conversation":cid,@"event":[NSString stringWithFormat:@"session-%llu",(unsigned long long)state->session]});
+            }
+        }
+    }
+    for(NSString *key in [presence allKeys]) {
+        NSArray *parts=[key componentsSeparatedByString:@"|"];SNPresence *state=[presence[key] mutableBytes];
+        if(![seen containsObject:key] && !([parts[0] isEqual:@"peek"]&&[unknownPeek containsObject:parts[1]])) {
+            if(state->active){cancelPresenceWait(parts[0],parts[1],parts[2],state);sn_presence_update(state,NO,now,8,0);logLine(@"PRESENCE-STOP type=%@ uid=%@",parts[0],shortID(parts[2]));}
+        }
+        if(presence.count>512 || (state->observed&&!state->active&&now-state->last_activity>300))[presence removeObjectForKey:key];
+    }
+}
+static void consumeReceived(NSArray *events) {
+    for(NSDictionary *e in events) {
+        NSNumber *ts=e[@"timestamp"];
+        if(ts){double t=ts.doubleValue;if(t>1e12)t/=1000;
+            double age=NSDate.date.timeIntervalSince1970-t;
+            if(!isfinite(t)||age>300||age< -60){logLine(@"EVENT-DROP reason=historical-or-invalid-time type=%@",e[@"kind"]);continue;}}
+        if(e[@"name"])remember(@[@{@"uid":e[@"uid"],@"name":e[@"name"],@"quality":@2}]);
+        notifyEvent(e);
+    }
 }
 
-#pragma mark - entry
+#pragma mark - Optional background experiment (main thread only)
+static void stopExperiment(NSString *reason) {
+    [keepPlayer stop];keepPlayer=nil;
+    /* Never deactivate or reset Snapchat's shared audio session. */
+    if(deferringLifecycle){dispatch_block_t callback=deferredBackground;deferredBackground=nil;deferringLifecycle=NO;if(callback)callback();}
+    deferredReceiver=nil;logLine(@"KEEPALIVE-STOP reason=%@",reason);
+}
+static BOOL startExperiment(void) {
+    if(!atomic_load(&experiments)||audioInterrupted||atomic_load(&appState)!=UIApplicationStateBackground)return NO;
+    NSArray *modes=NSBundle.mainBundle.infoDictionary[@"UIBackgroundModes"];
+    if(![modes isKindOfClass:NSArray.class]||![modes containsObject:@"audio"]){logLine(@"KEEPALIVE-UNAVAILABLE reason=no-audio-background-mode");return NO;}
+    AVAudioSession *audio=AVAudioSession.sharedInstance;
+    if([audio.category isEqual:AVAudioSessionCategoryRecord]||[audio.category isEqual:AVAudioSessionCategoryPlayAndRecord]){logLine(@"KEEPALIVE-UNAVAILABLE reason=host-recording-or-call");return NO;}
+    NSError *e=nil;
+    if(![audio setCategory:AVAudioSessionCategoryPlayback withOptions:AVAudioSessionCategoryOptionMixWithOthers error:&e]||![audio setActive:YES error:&e]){logLine(@"KEEPALIVE-UNAVAILABLE reason=audio-session code=%ld",(long)e.code);return NO;}
+    if(!keepPlayer){
+        /* One second, mono PCM16 @ 8 kHz. A genuinely silent buffer, not
+           per-sample allocation. This is not an APNs replacement. */
+        uint8_t h[44]={'R','I','F','F',0xa4,0x3e,0,0,'W','A','V','E','f','m','t',' ',16,0,0,0,1,0,1,0,0x40,0x1f,0,0,0x80,0x3e,0,0,2,0,16,0,'d','a','t','a',0x80,0x3e,0,0};
+        NSMutableData *wav=[NSMutableData dataWithBytes:h length:44];[wav increaseLengthBy:16000];
+        keepPlayer=[[AVAudioPlayer alloc] initWithData:wav error:&e];keepPlayer.numberOfLoops=-1;keepPlayer.volume=0;
+    }
+    BOOL ok=keepPlayer.isPlaying||[keepPlayer play];logLine(@"KEEPALIVE-EXPERIMENT playing=%d guaranteed=0",ok);return ok;
+}
+static void installBackgroundExperiment(Class cls) {
+    /* Exact observed lifecycle method, not UIApplication state spoofing and
+       not begin/endBackgroundTask tampering. Enabled only by the local config. */
+    SEL sel=NSSelectorFromString(@"_onAppDidEnterBackground");Method m=class_getInstanceMethod(cls,sel);
+    static BOOL installed=NO;if(installed||!m)return;
+    unsigned n=method_getNumberOfArguments(m);char *type=method_copyReturnType(m);BOOL valid=n==2&&type&&!strcmp(type,"v");free(type);if(!valid)return;
+    IMP original=method_getImplementation(m);
+    IMP replacement=imp_implementationWithBlock(^(id self){
+        if(NSThread.isMainThread)atomic_store(&appState,UIApplication.sharedApplication.applicationState);
+        if(NSThread.isMainThread && atomic_load(&experiments) && startExperiment()) {
+            if(deferringLifecycle && deferredReceiver!=self){((void(*)(id,SEL))original)(self,sel);return;}
+            __weak id weakSelf=self;deferredReceiver=self;deferringLifecycle=YES;
+            deferredBackground=^{id target=weakSelf;if(target)((void(*)(id,SEL))original)(target,sel);};
+            logLine(@"DUPLEX-BACKGROUND-DEFERRED experimental=1");return;
+        }
+        ((void(*)(id,SEL))original)(self,sel);logLine(@"DUPLEX-BACKGROUND host-callback=forwarded");
+    });
+    method_setImplementation(m,replacement);installed=YES;hookCount++;
+}
 
-__attribute__((constructor)) static void sck_init(void) {
+#pragma mark - Narrow, signature-checked hooks
+static void installForegroundPresentation(Class cls) {
+    SEL sel=NSSelectorFromString(@"userNotificationCenter:willPresentNotification:withCompletionHandler:");
+    unsigned count=0;Method *ms=class_copyMethodList(cls,&count);Method m=NULL;
+    for(unsigned i=0;i<count;i++)if(method_getName(ms[i])==sel){m=ms[i];break;}free(ms);if(!m)return;
+    static NSMutableSet *done;static dispatch_once_t once;dispatch_once(&once,^{done=[NSMutableSet set];});
+    NSString *key=NSStringFromClass(cls);if([done containsObject:key])return;
+    if(method_getNumberOfArguments(m)!=5)return;
+    char *r=method_copyReturnType(m);BOOL valid=r&&!strcmp(r,"v");free(r);
+    for(unsigned i=2;i<5;i++){char *a=method_copyArgumentType(m,i);valid &= a&&a[0]=='@';free(a);}if(!valid)return;
+    IMP original=method_getImplementation(m);
+    IMP replacement=imp_implementationWithBlock(^(id self,UNUserNotificationCenter *center,UNNotification *notification,void (^completion)(UNNotificationPresentationOptions)){
+        if([notification.request.content.userInfo[@"scnotify"] boolValue]) {
+            if(completion)completion(UNNotificationPresentationOptionBanner|UNNotificationPresentationOptionList|UNNotificationPresentationOptionSound);
+        }else ((void(*)(id,SEL,id,id,id))original)(self,sel,center,notification,completion);
+    });
+    method_setImplementation(m,replacement);[done addObject:key];hookCount++;
+}
+static void attach(Class cls,NSString *name,SNHookObserver observer) {
+    if(SNInstallHook(cls,NSSelectorFromString(name),observer)){hookCount++;logLine(@"HOOK class=%@ selector=%@",NSStringFromClass(cls),name);}
+}
+static void scan(void) {
+    /* Main-thread installation; each closure captures its own original IMP.
+       objc_copyClassList supplies a consistent, correctly sized allocation. */
+    unsigned count=0;Class *classes=objc_copyClassList(&count);if(!classes)return;
+    static unsigned lastClassCount=0;
+    if(count==lastClassCount){free(classes);return;}lastClassCount=count;
+    NSUInteger old=hookCount;
+    NSSet *resolverNames=[NSSet setWithArray:@[@"snapchatterForUserId:",@"_snapchatterForUserId:",@"displayNameForUserId:",@"_displayNameForUserId:",@"usernameForUserId:",@"userForUserId:"]];
+    NSDictionary *receiveHints=@{@"didReceiveSnap:":@"snap",@"didReceiveChatMessage:":@"message",@"didReceiveMessage:":@"",@"didReceiveMessages:":@"",@"onMessageReceived:":@"",@"onMessagesReceived:":@"",@"conversation:didReceiveMessage:":@""};
+    NSSet *identityFields=[NSSet setWithArray:@[@"userId",@"userID",@"username",@"displayName",@"setUserId:",@"setUsername:",@"setDisplayName:"]];
+    for(unsigned i=0;i<count;i++) {
+        Class cls=classes[i];NSString *cn=NSStringFromClass(cls);
+        BOOL snap=[cn hasPrefix:@"SC"]||[cn hasPrefix:@"SOJU"];
+        if(!snap)continue;
+        if([@[@"SCCDuplexMessageHandler",@"SCNDuplexMessageHandlerCppProxy"] containsObject:cn])attach(cls,@"onReceive:",^(id self,NSArray *a,id r){(void)self;(void)r;enqueuePacket(a.firstObject);});
+        if([cn isEqual:@"SCCallStateProvider"]){
+            attach(cls,@"updateWithPresencePlatformActiveConversationsInfo:",^(id self,NSArray *a,id r){(void)self;(void)r;NSArray *snapshot=SNPresenceRecords(a.firstObject);dispatch_async(worker,^{consumePresence(snapshot);});});
+            attach(cls,@"sessionWrapper:updatedState:",^(id self,NSArray *a,id r){
+                (void)self;(void)r;id state=SNRead(a.count>1?a[1]:nil,@"state");id local=SNRead(state,@"localParticipant");NSString *uid=SNIdentifier(SNRead(local,@"snapchatUserId"));
+                if(uid)dispatch_async(worker,^{setAccount(uid);});
+                /* Do not classify a state-provider callback as an incoming call. */
+                dispatch_async(dispatch_get_main_queue(),^{if(keepPlayer)stopExperiment(@"host-call-state");});
+            });
+        }
+        if([cn isEqual:@"SCDuplexAppUserLifecycleObserver"])installBackgroundExperiment(cls);
+        if([cn isEqual:@"SCNDuplexBackgroundNetworkTaskDelegateImpl"]){
+            attach(cls,@"beginBackgroundTask",^(id self,NSArray *a,id r){(void)self;(void)a;(void)r;logLine(@"DUPLEX-TASK begin");});
+            attach(cls,@"endBackgroundTask",^(id self,NSArray *a,id r){(void)self;(void)a;(void)r;logLine(@"DUPLEX-TASK end (not proof of OS suspension)");});
+        }
+        if([@[@"SCAppDelegate",@"SCMainAppDelegate",@"SCPushNotificationDelegate"] containsObject:cn]){
+            installForegroundPresentation(cls);
+            attach(cls,@"application:didFailToRegisterForRemoteNotificationsWithError:",^(id self,NSArray *a,id r){(void)self;(void)r;NSError *e=a.count>1&&[a[1] isKindOfClass:NSError.class]?a[1]:nil;logLine(@"APNS-FAILED domain=%@ code=%ld",e.domain,(long)e.code);dispatch_async(worker,^{nativePushRegistered=NO;});});
+            attach(cls,@"application:didRegisterForRemoteNotificationsWithDeviceToken:",^(id self,NSArray *a,id r){(void)self;(void)a;(void)r;logLine(@"APNS-REGISTERED token-redacted=1");dispatch_async(worker,^{nativePushRegistered=YES;});});
+        }
+        if([cn isEqual:@"SCUserInfoDeltaSyncRepository"])attach(cls,@"_processNewUserInfo:",^(id self,NSArray *a,id r){(void)self;(void)r;NSArray *records=SNUserRecords(a.firstObject);dispatch_async(worker,^{remember(records);});});
+        BOOL userModel=[cn hasPrefix:@"SCSnapchatter"]||[cn isEqual:@"SCFriendsFeedItem"];
+        unsigned mc=0;Method *methods=class_copyMethodList(cls,&mc);
+        for(unsigned m=0;m<mc;m++) {
+            NSString *name=NSStringFromSelector(method_getName(methods[m]));
+            if([resolverNames containsObject:name])attach(cls,name,^(id self,NSArray *args,id result){
+                (void)self;NSString *uid=SNIdentifier(args.firstObject);NSDictionary *u=SNUserRecord(result,uid);
+                if(u&&[name.lowercaseString containsString:@"username"]){NSMutableDictionary *r=[u mutableCopy];r[@"quality"]=@1;u=[r copy];}
+                if(u){NSDictionary *copy=u;dispatch_async(worker,^{remember(@[copy]);});}
+            });
+            if(userModel&&[identityFields containsObject:name])attach(cls,name,^(id self,NSArray *args,id result){(void)args;(void)result;NSDictionary *u=SNUserRecord(self,nil);if(u)dispatch_async(worker,^{remember(@[u]);});});
+            if([@[@"currentUserId",@"loggedInUserId"] containsObject:name])attach(cls,name,^(id self,NSArray *args,id result){(void)self;(void)args;NSString *uid=SNIdentifier(result);if(uid)dispatch_async(worker,^{setAccount(uid);});});
+            NSString *hint=receiveHints[name];
+            if(hint)attach(cls,name,^(id self,NSArray *args,id result){
+                (void)self;(void)result;NSMutableArray *events=[NSMutableArray array],*records=[NSMutableArray array];
+                for(id obj in args){[events addObjectsFromArray:SNReceivedRecords(obj,hint.length?hint:nil)];[records addObjectsFromArray:SNUserRecords(obj)];}
+                NSArray *copy=[events copy],*names=[records copy];
+                dispatch_async(worker,^{remember(names);if(!copy.count)logLine(@"RECEIVE-UNSUPPORTED class=%@ selector=%@",cn,name);consumeReceived(copy);});
+            });
+        }
+        free(methods);
+    }
+    free(classes);logLine(@"SCAN hooks=%lu added=%lu",(unsigned long)hookCount,(unsigned long)(hookCount-old));
+}
+static void writeStatus(void) {
+    double now=nowTime();
+    for(NSString *rid in [issuedRequests allKeys])if(now-[issuedRequests[rid] doubleValue]>86400)[issuedRequests removeObjectForKey:rid];
+    while(issuedRequests.count>2048){
+        NSString *oldest=[[issuedRequests keysSortedByValueUsingComparator:^NSComparisonResult(NSNumber *a,NSNumber *b){return [a compare:b];}] firstObject];
+        [issuedRequests removeObjectForKey:oldest];
+    }
+    for(NSString *key in [pendingEvents allKeys])if(now-[pendingEvents[key][@"created"] doubleValue]>15){sn_ledger_cancel(&ledger,[pendingEvents[key][@"ticket"] unsignedLongLongValue]);[pendingEvents removeObjectForKey:key];}
+    NSDictionary *status=@{@"version":SNVersion,@"state":stateLabel(),@"knownUsers":@(users.count),@"nameHits":@(nameHits),@"nameMisses":@(nameMisses),@"wirePackets":@(wireCount),@"unsupportedWirePackets":@(malformedCount),@"packetDrops":@(atomic_load(&packetDrops)),@"notificationRequestsAccepted":@(postedCount),@"secondsSinceWire":lastWire?@(now-lastWire):@(-1),@"apnsRegisteredThisRun":@(nativePushRegistered),@"experimentalKeepAlive":@(atomic_load(&experiments)),@"onDeviceValidationRequired":@YES};
+    NSData *json=[NSJSONSerialization dataWithJSONObject:status options:NSJSONWritingPrettyPrinted error:NULL];
+    [json writeToFile:[documents stringByAppendingPathComponent:@"snapnotify_status.json"] options:NSDataWritingAtomic|NSDataWritingFileProtectionCompleteUntilFirstUserAuthentication error:NULL];
+    logLine(@"HEALTH wire=%lu accepted=%lu users=%lu lastWire=%.1fs",(unsigned long)wireCount,(unsigned long)postedCount,(unsigned long)users.count,lastWire?now-lastWire:-1);
+}
+static void setup(void) {
+    atomic_store(&appState,UIApplication.sharedApplication.applicationState);
+    NSNotificationCenter *nc=NSNotificationCenter.defaultCenter;
+    [nc addObserverForName:UIApplicationDidEnterBackgroundNotification object:nil queue:NSOperationQueue.mainQueue usingBlock:^(__unused NSNotification *note){
+        atomic_store(&appState,UIApplicationStateBackground);logLine(@"LIFECYCLE background");startExperiment();dispatch_async(worker,^{saveCache();writeStatus();});
+    }];
+    [nc addObserverForName:UIApplicationWillResignActiveNotification object:nil queue:NSOperationQueue.mainQueue usingBlock:^(__unused NSNotification *note){atomic_store(&appState,UIApplicationStateInactive);}];
+    [nc addObserverForName:UIApplicationDidBecomeActiveNotification object:nil queue:NSOperationQueue.mainQueue usingBlock:^(__unused NSNotification *note){
+        atomic_store(&appState,UIApplicationStateActive);
+        /* A deferred background transition is obsolete once the host is active. */
+        deferredBackground=nil;deferredReceiver=nil;deferringLifecycle=NO;[keepPlayer stop];keepPlayer=nil;
+        logLine(@"LIFECYCLE active");scan();dispatch_async(worker,^{loadConfig();NSString *uid=SNIdentifier(config[@"SelfUserID"]);if(uid)setAccount(uid);writeStatus();});
+    }];
+    [nc addObserverForName:AVAudioSessionInterruptionNotification object:nil queue:NSOperationQueue.mainQueue usingBlock:^(NSNotification *note){
+        AVAudioSessionInterruptionType type=[note.userInfo[AVAudioSessionInterruptionTypeKey] unsignedIntegerValue];
+        audioInterrupted=type==AVAudioSessionInterruptionTypeBegan;
+        if(audioInterrupted)stopExperiment(@"audio-interruption");
+        /* No forced resume: do not fight a phone call / microphone recording. */
+    }];
+    [nc addObserverForName:AVAudioSessionMediaServicesWereResetNotification object:nil queue:NSOperationQueue.mainQueue usingBlock:^(__unused NSNotification *note){stopExperiment(@"media-services-reset");}];
+    housekeeping=[NSTimer scheduledTimerWithTimeInterval:30 repeats:YES block:^(__unused NSTimer *timer){
+        if(deferringLifecycle&&(!keepPlayer.isPlaying||!atomic_load(&experiments)))stopExperiment(@"audio-stopped-or-disabled");
+        dispatch_async(worker,^{saveCache();writeStatus();});
+    }];
+    [[UNUserNotificationCenter currentNotificationCenter] requestAuthorizationWithOptions:UNAuthorizationOptionAlert|UNAuthorizationOptionSound completionHandler:^(BOOL granted,NSError *error){logLine(@"NOTIFICATION-AUTH granted=%d code=%ld",granted,(long)error.code);}];
+    scan();
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW,2*NSEC_PER_SEC),dispatch_get_main_queue(),^{scan();});
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW,10*NSEC_PER_SEC),dispatch_get_main_queue(),^{scan();});
+    logLine(@"READY version=%@ host=%@ build=%@ session=%@",SNVersion,NSBundle.mainBundle.infoDictionary[@"CFBundleShortVersionString"]?:@"?",NSBundle.mainBundle.infoDictionary[@"CFBundleVersion"]?:@"?",session);
+}
+__attribute__((constructor)) static void start(void) {
     @autoreleasepool {
-        gLock = [NSLock new];
-        gOrig = [NSMutableDictionary new];
-        gThrottle = [NSMutableDictionary new];
-        gNameCache = [NSMutableDictionary new];
-        gHitWin = [NSMutableDictionary new];
-        gHitSupp = [NSMutableDictionary new];
-        @try {
-            NSString *docs = [NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES) firstObject];
-            NSDictionary *saved = [NSDictionary dictionaryWithContentsOfFile:[docs stringByAppendingPathComponent:@"scnotify_names.plist"]];
-            if (saved.count) [gNameCache addEntriesFromDictionary:saved];
-        } @catch (NSException *e) {}
-        sck_scan();
-        sck_setup();
+        /* Process-level guard also prevents accidentally injecting two copies
+           of the library and stacking another set of hooks in the same app. */
+        if(objc_lookUpClass("SnapNotifyV4ProcessGuard"))return;
+        Class guard=objc_allocateClassPair(NSObject.class,"SnapNotifyV4ProcessGuard",0);if(!guard)return;objc_registerClassPair(guard);
+        worker=dispatch_queue_create("ch.snapnotify.events",dispatch_queue_attr_make_with_autorelease_frequency(DISPATCH_QUEUE_SERIAL,DISPATCH_AUTORELEASE_FREQUENCY_WORK_ITEM));
+        logQueue=dispatch_queue_create("ch.snapnotify.log",DISPATCH_QUEUE_SERIAL);
+        users=[NSMutableDictionary dictionary];presence=[NSMutableDictionary dictionary];pendingEvents=[NSMutableDictionary dictionary];issuedRequests=[NSMutableDictionary dictionary];
+        session=NSUUID.UUID.UUIDString;queueGeneration=1;
+        documents=[NSSearchPathForDirectoriesInDomains(NSDocumentDirectory,NSUserDomainMask,YES) firstObject];
+        support=[[NSSearchPathForDirectoriesInDomains(NSApplicationSupportDirectory,NSUserDomainMask,YES) firstObject] stringByAppendingPathComponent:@"SnapNotify"];
+        [NSFileManager.defaultManager createDirectoryAtPath:support withIntermediateDirectories:YES attributes:@{NSFileProtectionKey:NSFileProtectionCompleteUntilFirstUserAuthentication} error:NULL];
+        atomic_store(&appState,UIApplicationStateInactive);
+        dispatch_sync(worker,^{loadConfig();NSString *uid=SNIdentifier(config[@"SelfUserID"]);if(uid)setAccount(uid);});
+        dispatch_async(dispatch_get_main_queue(),^{setup();});
     }
 }

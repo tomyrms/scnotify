@@ -1,8 +1,8 @@
-package com.scnotify.diag
+Package: com.scnotify.diag
 Name: SnapNotify
-Version: 1.0.0
+Version: 4.0.0~rc1
 Architecture: iphoneos-arm64
-Description: Keep-alive + local notification bridge for Snapchat (diagnostic build)
+Description: Local notification bridge with validated event adapters (experimental)
 Maintainer: tomyrms
 Author: tomyrms
 Section: Tweaks

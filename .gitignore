@@ -1,5 +1,11 @@
 .theos/
 packages/
+build/
 out/
 *.deb
+*.ipa
+*.log
+*.log.1
 .DS_Store
+__pycache__/
+*.pyc

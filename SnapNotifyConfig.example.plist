@@ -1,0 +1,36 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>Enabled</key>
+	<true/>
+	<key>TypingNotifications</key>
+	<true/>
+	<key>SnapNotifications</key>
+	<true/>
+	<key>MessageNotifications</key>
+	<true/>
+	<key>CallNotifications</key>
+	<true/>
+	<key>PeekingNotifications</key>
+	<true/>
+	<key>NotifyInForeground</key>
+	<false/>
+	<key>ExperimentalKeepAlive</key>
+	<true/>
+	<key>DiagnosticsIncludeIdentifiers</key>
+	<false/>
+	<key>TypingIdleSeconds</key>
+	<real>8.0</real>
+	<key>TypingRestartGapSeconds</key>
+	<real>1.5</real>
+	<key>NameWaitSeconds</key>
+	<real>0.8</real>
+	<key>Aliases</key>
+	<dict/>
+	<key>SelfUserID</key>
+	<string></string>
+	<key>TypingInactiveStates</key>
+	<array/>
+</dict>
+</plist>

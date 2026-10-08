@@ -1,48 +1,37 @@
-name: build
-
+name: SnapNotify tests and build
 on:
   push:
+  pull_request:
   workflow_dispatch:
-
+permissions:
+  contents: read
+concurrency:
+  group: snapnotify-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
 jobs:
-  build:
-    runs-on: macos-14
-    env:
-      THEOS: /Users/runner/theos
+  portable-tests:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
-
-      - name: Setup Theos
-        run: |
-          git clone --recursive --depth 1 https://github.com/theos/theos.git "$THEOS"
-          echo "$THEOS/bin" >> "$GITHUB_PATH"
-
-      - name: Install ldid
-        run: brew install ldid
-
-      - name: Setup SDK
-        run: |
-          git clone --depth 1 --filter=blob:none --sparse https://github.com/theos/sdks.git /tmp/sdks
-          cd /tmp/sdks
-          SDK=$(git ls-tree --name-only HEAD | grep '^iPhoneOS.*\.sdk$' | sort -V | tail -1)
-          echo "Using SDK: $SDK"
-          git sparse-checkout set "$SDK"
-          mkdir -p "$THEOS/sdks"
-          cp -R "$SDK" "$THEOS/sdks/"
-
-      - name: Build
-        run: |
-          make -j4
-
-      - name: Collect artifacts
-        run: |
-          mkdir -p out
-          find .theos -name '*.dylib' -not -path '*dSYM*' -print -exec cp {} out/ \;
-          ls -la out
-          file out/*.dylib
-
-      - name: Upload dylib
+      - name: C core regression tests and sanitizers
+        run: bash scripts/test-portable.sh
+  ios-build:
+    needs: portable-tests
+    runs-on: macos-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - name: Foundation adapters and inherited-hook tests
+        run: bash scripts/test-macos.sh
+      - name: Build arm64 library using the runner's Xcode SDK
+        run: bash scripts/build-macos.sh
+      - name: Upload dylib and checksum
         uses: actions/upload-artifact@v4
         with:
-          name: SnapNotify-dylib
-          path: out/*.dylib
+          name: SnapNotify-v4-dylib
+          path: |
+            out/SnapNotify.dylib
+            out/SHA256SUMS.txt
+          if-no-files-found: error
+          retention-days: 14
