@@ -261,6 +261,32 @@ static void sck_hit(id self, SEL _cmd, id a, id b) {
         } @catch (NSException *e) { sck_log(@"willpresent exc %@", e); }
         return;
     }
+    if ([sel isEqualToString:@"application:didRegisterForRemoteNotificationsWithDeviceToken:"]) {
+        NSData *tok = [b isKindOfClass:[NSData class]] ? (NSData *)b : nil;
+        sck_log(@"PUSH TOKEN len=%lu", (unsigned long)tok.length);
+        return;
+    }
+    if ([sel isEqualToString:@"application:didFailToRegisterForRemoteNotificationsWithError:"]) {
+        sck_log(@"PUSH REGISTRATION FAILED: %@", b);
+        return;
+    }
+    if ([sel hasPrefix:@"application:didReceiveRemoteNotification:"]) {
+        NSDictionary *ui = [b isKindOfClass:[NSDictionary class]] ? (NSDictionary *)b : nil;
+        sck_log(@"PUSH RECV keys=%@", ui.allKeys);
+        BOOL active = ([[UIApplication sharedApplication] applicationState] == UIApplicationStateActive);
+        if (ui && !active) {
+            NSString *body = nil;
+            id aps = ui[@"aps"];
+            if ([aps isKindOfClass:[NSDictionary class]]) {
+                id alert = aps[@"alert"];
+                if ([alert isKindOfClass:[NSString class]]) body = alert;
+                else if ([alert isKindOfClass:[NSDictionary class]]) body = alert[@"body"] ?: alert[@"title"];
+            }
+            if (!body.length) body = ui[@"body"] ?: ui[@"message"] ?: @"notification";
+            sck_notify_thr([@"push" stringByAppendingString:body], @"Snapchat", body, NO, 2.0);
+        }
+        return;
+    }
     if ([sel hasPrefix:@"postNotificationName:"]) {
         if (![a isKindOfClass:[NSString class]]) return;
         NSString *low = [a lowercaseString];
@@ -284,7 +310,7 @@ static void sck_hit(id self, SEL _cmd, id a, id b) {
         NSString *name = sck_extract_name(a, &foundName);
         if (!name.length && b && b != a) name = sck_extract_name(b, &foundName);
         NSString *body = sck_message_body(t, name);
-        double thr = [t isEqualToString:@"typing"] ? 60.0 : ([t isEqualToString:@"call"] ? 3.0 : 8.0);
+        double thr = [t isEqualToString:@"typing"] ? 25.0 : 2.0;
         NSString *key = [NSString stringWithFormat:@"%@|%@", t, name.length ? name : @"?"];
         sck_notify_thr(key, @"Snapchat", body, NO, thr);
     } @catch (NSException *e) { sck_log(@"hit exc %@", e); }
@@ -374,6 +400,10 @@ static void sck_scan(void) {
             @"handleInAppNotification:navigationController:",
             @"matchInAppNotification:systemNotification:",
             @"callObserver:callChanged:",
+            @"application:didReceiveRemoteNotification:fetchCompletionHandler:",
+            @"application:didReceiveRemoteNotification:",
+            @"application:didRegisterForRemoteNotificationsWithDeviceToken:",
+            @"application:didFailToRegisterForRemoteNotificationsWithError:",
             @"postNotificationName:object:userInfo:",
             @"postNotificationName:object:"
         ];
@@ -447,7 +477,7 @@ static void sck_setup(void) {
             }
         }];
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 2 * NSEC_PER_SEC), dispatch_get_main_queue(), ^{
-            sck_notify_thr(@"boot", @"Snapchat", [NSString stringWithFormat:@"SnapNotify v3.0 chargé (%lu hooks)", (unsigned long)gOrig.count], YES, 0.0);
+            sck_notify_thr(@"boot", @"Snapchat", [NSString stringWithFormat:@"SnapNotify v3.1 chargé (%lu hooks)", (unsigned long)gOrig.count], YES, 0.0);
         });
     }];
     gTimer = [NSTimer scheduledTimerWithTimeInterval:20.0 repeats:YES block:^(NSTimer *t) { sck_ensure_audio(); }];
