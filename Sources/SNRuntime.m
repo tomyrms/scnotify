@@ -256,17 +256,16 @@ BOOL SNInstallHook(Class cls, SEL sel, SNHookObserver observer) {
         }
         IMP original=method_getImplementation(m);if(!original)return NO;
         SNHookObserver observe=[observer copy];IMP replacement=NULL;
-        if(isVoid) switch(argc) {
-            case 0: replacement=imp_implementationWithBlock(^(id self){((void(*)(id,SEL))original)(self,sel);SNInspect(^{observe(self,@[],nil);});});break;
-            case 1: replacement=imp_implementationWithBlock(^(id self,id a){((void(*)(id,SEL,id))original)(self,sel,a);SNInspect(^{observe(self,@[a?:NSNull.null],nil);});});break;
-            case 2: replacement=imp_implementationWithBlock(^(id self,id a,id b){((void(*)(id,SEL,id,id))original)(self,sel,a,b);SNInspect(^{observe(self,@[a?:NSNull.null,b?:NSNull.null],nil);});});break;
-            case 3: replacement=imp_implementationWithBlock(^(id self,id a,id b,id c){((void(*)(id,SEL,id,id,id))original)(self,sel,a,b,c);SNInspect(^{observe(self,@[a?:NSNull.null,b?:NSNull.null,c?:NSNull.null],nil);});});break;
-        }
-        else switch(argc) {
-            case 0: replacement=imp_implementationWithBlock(^id(id self){id v=((id(*)(id,SEL))original)(self,sel);SNInspect(^{observe(self,@[],v);});return v;});break;
-            case 1: replacement=imp_implementationWithBlock(^id(id self,id a){id v=((id(*)(id,SEL,id))original)(self,sel,a);SNInspect(^{observe(self,@[a?:NSNull.null],v);});return v;});break;
-            case 2: replacement=imp_implementationWithBlock(^id(id self,id a,id b){id v=((id(*)(id,SEL,id,id))original)(self,sel,a,b);SNInspect(^{observe(self,@[a?:NSNull.null,b?:NSNull.null],v);});return v;});break;
-            default:return NO;
+        if(isVoid) {
+            if(argc==0) replacement=imp_implementationWithBlock(^(id self){((void(*)(id,SEL))original)(self,sel);SNInspect(^{observe(self,@[],nil);});});
+            else if(argc==1) replacement=imp_implementationWithBlock(^(id self,id a){((void(*)(id,SEL,id))original)(self,sel,a);SNInspect(^{observe(self,@[a?:NSNull.null],nil);});});
+            else if(argc==2) replacement=imp_implementationWithBlock(^(id self,id a,id b){((void(*)(id,SEL,id,id))original)(self,sel,a,b);SNInspect(^{observe(self,@[a?:NSNull.null,b?:NSNull.null],nil);});});
+            else if(argc==3) replacement=imp_implementationWithBlock(^(id self,id a,id b,id c){((void(*)(id,SEL,id,id,id))original)(self,sel,a,b,c);SNInspect(^{observe(self,@[a?:NSNull.null,b?:NSNull.null,c?:NSNull.null],nil);});});
+        } else {
+            if(argc==0) replacement=imp_implementationWithBlock(^id(id self){id v=((id(*)(id,SEL))original)(self,sel);SNInspect(^{observe(self,@[],v);});return v;});
+            else if(argc==1) replacement=imp_implementationWithBlock(^id(id self,id a){id v=((id(*)(id,SEL,id))original)(self,sel,a);SNInspect(^{observe(self,@[a?:NSNull.null],v);});return v;});
+            else if(argc==2) replacement=imp_implementationWithBlock(^id(id self,id a,id b){id v=((id(*)(id,SEL,id,id))original)(self,sel,a,b);SNInspect(^{observe(self,@[a?:NSNull.null,b?:NSNull.null],v);});return v;});
+            else return NO;
         }
         if(!replacement)return NO;
         method_setImplementation(m,replacement);[installed addObject:key];return YES;
