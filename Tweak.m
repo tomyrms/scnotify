@@ -380,11 +380,43 @@ static void sck_hit(id self, SEL _cmd, id a, id b, id c) {
     }
     @try {
         sck_log(@"HIT [%@] -[%@ %@]", sck_app_state(), cls, sel);
-        NSString *t = sck_event_type(cls, sel);
-        if (!t) return;
+        if ([cls containsString:@"SCCallStateProvider"] && [sel isEqualToString:@"updateWithPresencePlatformActiveConversationsInfo:"]) {
+            @try {
+                NSString *desc = [a description] ?: @"";
+                NSRange r = [desc rangeOfString:@"remoteTypingParticipants"];
+                if (r.location != NSNotFound) {
+                    NSString *tail = [desc substringFromIndex:r.location];
+                    NSRange close = [tail rangeOfString:@"]"];
+                    NSString *uid = sck_regex_first(@"userId: *([0-9a-fA-F-]{36})", tail);
+                    if (uid.length) {
+                        BOOL inSection = (close.location == NSNotFound);
+                        if (!inSection) {
+                            NSRange uir = [tail rangeOfString:uid];
+                            inSection = (uir.location != NSNotFound && uir.location < close.location);
+                        }
+                        if (inSection) {
+                            [gLock lock]; NSString *nm = gNameCache[uid]; [gLock unlock];
+                            sck_log(@"PRESENCE-TYPING uid=%@ name=%@", uid, nm.length ? nm : @"(none)");
+                            BOOL active = ([[UIApplication sharedApplication] applicationState] == UIApplicationStateActive);
+                            if (!active) {
+                                NSString *body = nm.length ? [NSString stringWithFormat:@"%@ est en train d'écrire...", nm] : @"quelqu'un est en train d'écrire...";
+                                sck_notify_thr([@"typing|" stringByAppendingString:(nm.length ? nm : uid)], @"Snapchat", body, NO, 25.0);
+                            }
+                        }
+                    }
+                }
+            } @catch (NSException *e) { sck_log(@"presence exc %@", e); }
+            return;
+        }
         sck_log_obj(@"a", a);
         if (b && b != a) sck_log_obj(@"b", b);
         if (c && c != a && c != b) sck_log_obj(@"c", c);
+        if ([cls containsString:@"Snapchatter"] || [cls containsString:@"ChatConversation"] || [cls containsString:@"ConversationViewModel"] || [cls containsString:@"ConversationMetadata"]) {
+            sck_extract_name(self, NULL);
+        }
+        if ([cls containsString:@"TypingBubbleView"]) return;
+        NSString *t = sck_event_type(cls, sel);
+        if (!t) return;
         NSString *sell = [sel lowercaseString];
         if ([t isEqualToString:@"call"]) {
             BOOL realCall = [sell containsString:@"callobserver"] || [sell containsString:@"callchanged"] || [sell containsString:@"incomingcall"] || [sell containsString:@"reportincoming"] || [sell containsString:@"callreceived"] || [sell containsString:@"didreceivecall"];
@@ -420,6 +452,20 @@ static void sck_repl1(id self, SEL _cmd, id a) { sck_hit(self, _cmd, a, nil, nil
 static void sck_repl2(id self, SEL _cmd, id a, id b) { sck_hit(self, _cmd, a, b, nil); IMP o = sck_orig(self, _cmd); if (o) ((void (*)(id, SEL, id, id))o)(self, _cmd, a, b); }
 static void sck_repl3(id self, SEL _cmd, id a, id b, id c) { sck_hit(self, _cmd, a, b, c); IMP o = sck_orig(self, _cmd); if (o) ((void (*)(id, SEL, id, id, id))o)(self, _cmd, a, b, c); }
 
+static id sck_repl_id1(id self, SEL _cmd, id a) {
+    IMP o = sck_orig(self, _cmd);
+    id ret = o ? ((id (*)(id, SEL, id))o)(self, _cmd, a) : nil;
+    @try {
+        if ([a isKindOfClass:[NSString class]] && [ret isKindOfClass:[NSString class]] && [ret length] > 0 && [ret length] < 40) {
+            [gLock lock];
+            gNameCache[a] = ret;
+            [gLock unlock];
+            sck_log(@"NAMECACHE %@ -> %@", a, ret);
+        }
+    } @catch (NSException *e) {}
+    return ret;
+}
+
 static void sck_attach(Class c, Method m) {
     SEL sel = method_getName(m);
     const char *sn = sel_getName(sel);
@@ -430,6 +476,14 @@ static void sck_attach(Class c, Method m) {
     BOOL done = (gOrig[key] != nil);
     [gLock unlock];
     if (done) return;
+    if (colons == 1 && (strstr(sn, "displayNameForUserId") || strstr(sn, "usernameForUserId") || strstr(sn, "nameForUserId"))) {
+        IMP old = method_setImplementation(m, (IMP)sck_repl_id1);
+        [gLock lock];
+        gOrig[key] = [NSValue valueWithPointer:(void *)old];
+        [gLock unlock];
+        sck_log(@"swizzled(ret) -[%s %s]", class_getName(c), sn);
+        return;
+    }
     if (!sck_enc_ok(m, colons)) return;
     IMP newImp = NULL;
     switch (colons) {
@@ -497,6 +551,9 @@ static void sck_scan(void) {
             @"handleInAppNotification:navigationController:",
             @"matchInAppNotification:systemNotification:",
             @"callObserver:callChanged:",
+            @"_displayNameForUserId:",
+            @"displayNameForUserId:",
+            @"usernameForUserId:",
             @"application:didReceiveRemoteNotification:fetchCompletionHandler:",
             @"application:didReceiveRemoteNotification:",
             @"application:didRegisterForRemoteNotificationsWithDeviceToken:",
@@ -516,7 +573,7 @@ static void sck_scan(void) {
             if (c == nil) continue;
             const char *cn = class_getName(c);
             BOOL isSnapClass = cn && (strncmp(cn, "SC", 2) == 0 || strstr(cn, "Snapchat") != NULL);
-            if (isSnapClass && (strstr(cn, "Typing") || strstr(cn, "CallState") || strstr(cn, "CallLauncher") || strstr(cn, "SCCallLogSyncer") || strstr(cn, "SCPushNotificationDelegate") || strstr(cn, "SCMainAppDelegate") || strstr(cn, "SCAppDelegate"))) {
+            if (isSnapClass && (strstr(cn, "Typing") || strstr(cn, "CallState") || strstr(cn, "CallLauncher") || strstr(cn, "SCCallLogSyncer") || strstr(cn, "SCPushNotificationDelegate") || strstr(cn, "SCMainAppDelegate") || strstr(cn, "SCAppDelegate") || strstr(cn, "Hermod") || strstr(cn, "ChatConversationUpdater") || strstr(cn, "ChatConversationViewModel") || strstr(cn, "SCChatConversationManager"))) {
                 sck_hook_all(c);
                 continue;
             }
@@ -573,7 +630,7 @@ static void sck_setup(void) {
             sck_log(@"notif permission=%ld alert=%ld sound=%ld badge=%ld", (long)settings.authorizationStatus, (long)settings.alertSetting, (long)settings.soundSetting, (long)settings.badgeSetting);
         }];
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 2 * NSEC_PER_SEC), dispatch_get_main_queue(), ^{
-            sck_notify_thr(@"boot", @"Snapchat", [NSString stringWithFormat:@"SnapNotify v3.4 chargé (%lu hooks)", (unsigned long)gOrig.count], YES, 0.0);
+            sck_notify_thr(@"boot", @"Snapchat", [NSString stringWithFormat:@"SnapNotify v3.5 chargé (%lu hooks)", (unsigned long)gOrig.count], YES, 0.0);
         });
     }];
     [nc addObserverForName:UIApplicationWillResignActiveNotification object:nil queue:[NSOperationQueue mainQueue] usingBlock:^(NSNotification *note) { sck_log(@"app -> resignActive"); }];
