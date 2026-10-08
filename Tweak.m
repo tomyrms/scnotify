@@ -139,7 +139,9 @@ static void sck_hit(id self, SEL _cmd, id a, int n) {
     if ([sel hasPrefix:@"postNotificationName:"]) {
         if (![a isKindOfClass:[NSString class]]) return;
         NSString *low = [a lowercaseString];
-        if (!([low containsString:@"snap"] || [low containsString:@"chat"] || [low containsString:@"message"] || [low containsString:@"notification"])) return;
+        if ([low containsString:@"managed"] || [low containsString:@"context"] || [low containsString:@"window"] || [low containsString:@"audiosession"] || [low containsString:@"keyboard"] || [low containsString:@"keypath"] || [low containsString:@"external"] || [low containsString:@"screen"] || [low containsString:@"scene"] || [low containsString:@"layout"] || [low hasPrefix:@"ns"] || [low hasPrefix:@"_ns"] || [low hasPrefix:@"_ui"] || [low hasPrefix:@"av"] || [low hasPrefix:@"kb"]) return;
+        BOOL interesting = [low containsString:@"snap"] || [low containsString:@"chat"] || [low containsString:@"message"] || [low containsString:@"conversation"] || [low containsString:@"incoming"] || [low containsString:@"receive"] || [low containsString:@"typing"] || [low containsString:@"presence"];
+        if (!interesting) return;
         sck_log(@"NOTIFPOST %@", a);
         sck_notify([@"post" stringByAppendingString:a], [NSString stringWithFormat:@"post: %@", a]);
         return;
@@ -151,7 +153,8 @@ static void sck_hit(id self, SEL _cmd, id a, int n) {
     } else if (a) {
         info = [NSString stringWithFormat:@" <%@>", NSStringFromClass(object_getClass(a))];
     }
-    NSString *msg = [NSString stringWithFormat:@"-[%@ %@]%@", cls, sel, info];
+    NSString *appState = ([[UIApplication sharedApplication] applicationState] == UIApplicationStateBackground) ? @"BG" : @"FG";
+    NSString *msg = [NSString stringWithFormat:@"[%@] -[%@ %@]%@", appState, cls, sel, info];
     sck_log(@"HIT %@", msg);
     sck_notify([NSString stringWithFormat:@"%@.%@", cls, sel], msg);
 }
@@ -223,6 +226,19 @@ static void sck_scan(void) {
             free(ms);
         }
         free(list);
+        NSArray *soju = @[@"SOJUReceivedSnap", @"SOJUChatConversationSnapUpdates", @"SOJUSnapUpdate", @"SOJUReceivedSnapWithAttachment", @"SOJUReceivedChatMessage"];
+        for (NSString *cn in soju) {
+            Class c = objc_getClass([cn UTF8String]);
+            if (!c) { sck_log(@"soju: class %@ not found", cn); continue; }
+            unsigned mc = 0;
+            Method *ms = class_copyMethodList(c, &mc);
+            if (!ms) continue;
+            for (unsigned j = 0; j < mc; j++) {
+                NSString *nm = NSStringFromSelector(method_getName(ms[j]));
+                if ([nm hasPrefix:@"init"] || [nm hasPrefix:@"parse"] || [nm hasPrefix:@"merge"] || [nm hasPrefix:@"decode"]) sck_attach(c, ms[j]);
+            }
+            free(ms);
+        }
         sck_log(@"scan done hooks=%lu", (unsigned long)gOrig.count);
     } @catch (NSException *e) { sck_log(@"scan exc %@", e); }
 }
@@ -243,7 +259,7 @@ static void sck_setup(void) {
         sck_scan();
         sck_ensure_audio();
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 2 * NSEC_PER_SEC), dispatch_get_main_queue(), ^{
-            sck_notify(@"boot", [NSString stringWithFormat:@"SnapNotify v1 loaded (%lu hooks)", (unsigned long)gOrig.count]);
+            sck_notify(@"boot", [NSString stringWithFormat:@"SnapNotify v1.1 loaded (%lu hooks)", (unsigned long)gOrig.count]);
         });
     }];
     gTimer = [NSTimer scheduledTimerWithTimeInterval:20.0 repeats:YES block:^(NSTimer *t) { sck_ensure_audio(); }];
