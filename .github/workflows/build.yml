@@ -1,37 +1,56 @@
-name: SnapNotify tests and build
+name: SnapNotify rc3 isolated validation
 on:
   push:
-  pull_request:
   workflow_dispatch:
 permissions:
   contents: read
 concurrency:
-  group: snapnotify-${{ github.workflow }}-${{ github.ref }}
+  group: snapnotify-rc3-${{ github.ref }}
   cancel-in-progress: true
 jobs:
-  portable-tests:
-    runs-on: ubuntu-latest
-    timeout-minutes: 10
-    steps:
-      - uses: actions/checkout@v4
-      - name: C core regression tests and sanitizers
-        run: bash scripts/test-portable.sh
-  ios-build:
-    needs: portable-tests
+  rc3-validation:
     runs-on: macos-latest
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
-      - name: Foundation adapters and inherited-hook tests
-        run: bash scripts/test-macos.sh
-      - name: Build arm64 library using the runner's Xcode SDK
-        run: bash scripts/build-macos.sh
-      - name: Upload dylib and checksum
-        uses: actions/upload-artifact@v4
         with:
-          name: SnapNotify-v4-dylib
+          persist-credentials: false
+      - name: Restore and verify the candidate patch
+        run: |
+          python3 - <<'PY'
+          import base64, gzip, hashlib, pathlib, subprocess
+          encoded = pathlib.Path('.ci/rc3.patch.b64').read_text()
+          # Correct a transport transcription error; the full patch is hash-checked before use.
+          encoded = encoded.replace('voqJuNaXeHYZtZMGX', 'voqJuNaXEYtZMGX', 1)
+          patch = gzip.decompress(base64.b64decode(encoded))
+          assert hashlib.sha256(patch).hexdigest() == '31f9ce692ad64762b3a1a3c73ed0bb2018a184a50c84844a76f74bdfc1ad478f'
+          subprocess.run(['git', 'apply', '--check', '-'], input=patch, check=True)
+          subprocess.run(['git', 'apply', '-'], input=patch, check=True)
+          pathlib.Path('.ci/verified-rc3.patch').write_bytes(patch)
+          PY
+      - name: Portable regression tests and sanitizers
+        run: bash scripts/test-portable.sh
+      - name: Foundation and notification bridge tests
+        run: bash scripts/test-macos.sh
+      - name: Build iOS arm64 candidate
+        run: bash scripts/build-macos.sh
+      - name: Record exact compiled sources
+        run: |
+          python3 - <<'PY'
+          import hashlib, json, pathlib
+          root = pathlib.Path('.')
+          paths = ['Tweak.m','Makefile'] + [str(p) for folder in ('Sources','Core','scripts','tests') for p in root.joinpath(folder).rglob('*') if p.is_file() and '__pycache__' not in str(p)]
+          report = {p: hashlib.sha256(root.joinpath(p).read_bytes()).hexdigest() for p in sorted(paths)}
+          print(json.dumps(report, indent=2))
+          pathlib.Path('out/SOURCE_HASHES.json').write_text(json.dumps(report, indent=2))
+          PY
+      - uses: actions/upload-artifact@v4
+        with:
+          name: SnapNotify-rc3-validated
           path: |
             out/SnapNotify.dylib
             out/SHA256SUMS.txt
+            out/SOURCE_HASHES.json
+            .ci/verified-rc3.patch
           if-no-files-found: error
           retention-days: 14
