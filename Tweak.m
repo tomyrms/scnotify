@@ -578,8 +578,8 @@ static void sck_setup(void) {
     }];
     [nc addObserverForName:UIApplicationWillResignActiveNotification object:nil queue:[NSOperationQueue mainQueue] usingBlock:^(NSNotification *note) { sck_log(@"app -> resignActive"); }];
     [nc addObserverForName:UIApplicationWillEnterForegroundNotification object:nil queue:[NSOperationQueue mainQueue] usingBlock:^(NSNotification *note) { sck_log(@"app -> willEnterForeground"); }];
-    [nc addObserverForName:UIApplicationProtectedDataDidBecomeAvailableNotification object:nil queue:[NSOperationQueue mainQueue] usingBlock:^(NSNotification *note) { sck_log(@"protectedData available"); }];
-    [nc addObserverForName:UIApplicationProtectedDataWillBecomeUnavailableNotification object:nil queue:[NSOperationQueue mainQueue] usingBlock:^(NSNotification *note) { sck_log(@"protectedData unavailable"); }];
+    [nc addObserverForName:UIApplicationProtectedDataDidBecomeAvailable object:nil queue:[NSOperationQueue mainQueue] usingBlock:^(NSNotification *note) { sck_log(@"protectedData available"); }];
+    [nc addObserverForName:UIApplicationProtectedDataWillBecomeUnavailable object:nil queue:[NSOperationQueue mainQueue] usingBlock:^(NSNotification *note) { sck_log(@"protectedData unavailable"); }];
     [UIDevice currentDevice].batteryMonitoringEnabled = YES;
     gTimer = [NSTimer scheduledTimerWithTimeInterval:20.0 repeats:YES block:^(NSTimer *t) {
         sck_ensure_audio();
