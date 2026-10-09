@@ -1,4 +1,4 @@
-// SnapNotify 4.0.0-rc6 — explicit event adapters, not notifications from hook names.
+// SnapNotify 4.0.0-rc7 — explicit event adapters, not notifications from hook names.
 #import <Foundation/Foundation.h>
 #import <UIKit/UIKit.h>
 #import <UserNotifications/UserNotifications.h>
@@ -8,6 +8,8 @@
 #import "Sources/SNHostNotice.h"
 #import "Sources/SNForeground.h"
 #import "Sources/SNEventBuffer.h"
+#import "Sources/SNPresenceActivity.h"
+#import "Core/SNPresenceWire.h"
 #import <CommonCrypto/CommonDigest.h>
 #import "Core/SNCore.h"
 #include <stdatomic.h>
@@ -15,7 +17,7 @@
 #include <stdarg.h>
 #include <math.h>
 
-static NSString * const SNVersion=@"4.0.0-rc6";
+static NSString * const SNVersion=@"4.0.0-rc7";
 static dispatch_queue_t worker, logQueue;
 static NSMutableDictionary *users, *presence, *pendingEvents, *issuedRequests;
 static NSDictionary *config;
@@ -29,6 +31,10 @@ static void scheduleNotificationPump(void);
 static void beginNativeNotice(NSDictionary *notice,NSString *key,BOOL foreground);
 /* These receive diagnostics and the snapshot tracker belong to worker. */
 static SNReceiveTracker *receiveTracker;
+static SNPresenceActivityTracker *activityTracker;
+static NSMutableDictionary *compositionKinds;
+static NSUInteger presenceActivityPackets, presenceActivityRejected, compositionUnknown;
+static void consumePresence(NSArray<NSDictionary *> *,BOOL,BOOL);
 static NSMutableDictionary *receiveSources;
 static NSArray *receiveHooks;
 static NSUInteger receivedCallbacks, decodedMessages, decodedSnaps, snapshotSuppressed;
@@ -142,7 +148,7 @@ static void setAccount(NSString *uid) {
         NSArray *owned=issuedRequests.allKeys;
         [[UNUserNotificationCenter currentNotificationCenter] removePendingNotificationRequestsWithIdentifiers:owned];
         [[UNUserNotificationCenter currentNotificationCenter] removeDeliveredNotificationsWithIdentifiers:owned];
-        [issuedRequests removeAllObjects];[users removeAllObjects];[presence removeAllObjects];[pendingEvents removeAllObjects];[notificationBuffer removeAll];[receiveTracker reset];[receiveSources removeAllObjects];memset(&ledger,0,sizeof(ledger));
+        [issuedRequests removeAllObjects];[users removeAllObjects];[presence removeAllObjects];[pendingEvents removeAllObjects];[notificationBuffer removeAll];[receiveTracker reset];[activityTracker reset];[compositionKinds removeAllObjects];[receiveSources removeAllObjects];memset(&ledger,0,sizeof(ledger));
     }
     /* Learning our own ID for the first time must not cancel the incoming
        call whose state callback supplied it. Only a real account switch resets. */
@@ -181,9 +187,10 @@ static NSString *eventKey(NSDictionary *event) {
 static NSString *bodyFor(NSDictionary *event,NSString *name) {
     NSString *who=name ?: [NSString stringWithFormat:@"Contact %@",shortID(event[@"uid"])];
     NSString *kind=event[@"kind"];
-    /* Label requested by the user. The raw numeric presence state is not a
-       verified text/voice discriminator, so it also shows while typing text. */
-    if([kind isEqual:@"typing"])return [who stringByAppendingString:@" est en train de faire un vocal…"];
+    if([kind isEqual:@"typing"]){
+        return [who stringByAppendingString:[event[@"activity"] isEqual:@"voice"]?
+            @" est en train d’enregistrer un vocal…":@" est en train d’écrire…"];
+    }
     if([kind isEqual:@"peek"])return [who stringByAppendingString:@" entrouvre la conversation"];
     if([kind isEqual:@"snap"])return [who stringByAppendingString:@" t’a envoyé un snap"];
     if([kind isEqual:@"message"]){
@@ -299,6 +306,32 @@ static void cancelCall(SNCall call) {
     sn_ledger_mark(&ledger,key.UTF8String,nowTime(),300);scheduleNotificationPump();
     logLine(@"CALL-STOP uid=%@",shortID(@(call.sender)));
 }
+/* The duplex presence record supplies the composing/voice discriminator.
+   Its bitfield is distinct from the native typingState enum. Decode only
+   the verified inner presence envelope, never arbitrary network bytes. */
+static void consumeWirePresence(SNBytes payload,BOOL foreground) {
+    if(![NSBundle.mainBundle.infoDictionary[@"CFBundleShortVersionString"] isEqual:@"14.17.1"]){presenceActivityRejected++;return;}
+    SNWirePresence wire;
+    if(!sn_decode_presence(payload,&wire)){presenceActivityRejected++;logLine(@"PRESENCE-ACTIVITY-UNSUPPORTED bytes=%lu",(unsigned long)payload.size);return;}
+    NSString *cid=@(wire.conversation);NSMutableArray *participants=[NSMutableArray array],*remote=[NSMutableArray array];
+    for(size_t i=0;i<wire.count;i++) {
+        SNWirePresenceParticipant person=wire.participants[i];NSString *uid=@(person.uid);
+        BOOL active=(person.flags&SN_WIRE_PRESENCE_COMPOSING)!=0;
+        NSString *activity=(person.flags&SN_WIRE_PRESENCE_VOICE)?@"voice":@"text";
+        [participants addObject:@{@"uid":uid,@"isActive":@(active),@"activity":activity}];
+        NSString *typingKey=[@[@"typing",cid,uid] componentsJoinedByString:@"|"];
+        NSString *peekKey=[@[@"peek",cid,uid] componentsJoinedByString:@"|"];
+        /* With no account ID, only a participant already known remote from
+           the host snapshot may notify. The full state can still enrich a
+           subsequent host snapshot once its remote identity is available. */
+        BOOL knownRemote=account.length?![account isEqual:uid]:(presence[typingKey]!=nil||presence[peekKey]!=nil);
+        if(knownRemote)[remote addObject:@{@"uid":uid,@"active":@(active),@"rawState":@(person.flags),@"activity":activity}];
+    }
+    if(![activityTracker updateConversation:cid participants:participants time:nowTime()]){presenceActivityRejected++;return;}
+    presenceActivityPackets++;
+    logLine(@"PRESENCE-ACTIVITY participants=%lu remote=%lu",(unsigned long)participants.count,(unsigned long)remote.count);
+    consumePresence(@[@{@"conversation":cid,@"typing":remote,@"peeking":@[],@"peekingKnown":@NO,@"fallback":@NO}],foreground,NO);
+}
 static void consumePacket(NSData *packet,BOOL foreground) {
     lastWire=nowTime();wireCount++;
     SNRecord records[SN_RECORD_MAX];size_t count=0;
@@ -315,9 +348,7 @@ static void consumePacket(NSData *packet,BOOL foreground) {
                 notifyEvent(@{@"kind":@"call",@"uid":@(call.sender),@"conversation":@(call.conversation),@"event":@(call.call),@"video":@(call.video),@"observedInForeground":@(foreground)});
             }else logLine(@"WIRE-IGNORED topic=volatile reason=not-a-validated-call bytes=%lu",(unsigned long)r.payload.size);
         } else if(!strcmp(r.topic,"presence")) {
-            /* The typed presence callback is the semantic source. Raw presence
-               bytes in the supplied logs are truncated, so no guessed schema. */
-            logLine(@"WIRE topic=presence bytes=%lu",(unsigned long)r.payload.size);
+            consumeWirePresence(r.payload,foreground);
         } else {
             logLine(@"WIRE-UNSUPPORTED topic=%s bytes=%lu",r.topic,(unsigned long)r.payload.size);
             /* No notification from a topic name alone. Decode only structured
@@ -352,11 +383,11 @@ static void cancelPresenceWait(NSString *kind,NSString *cid,NSString *uid,SNPres
         logLine(@"PRESENCE-CANCELLED-WAIT type=%@ uid=%@",kind,shortID(uid));
     }
 }
-static void consumePresence(NSArray<NSDictionary *> *snapshots,BOOL foreground) {
+static void consumePresence(NSArray<NSDictionary *> *snapshots,BOOL foreground,BOOL completeSet) {
     if(!snapshots){logLine(@"PRESENCE-UNSUPPORTED preserved_previous_state=1");return;}
-    double now=nowTime();NSMutableSet *seen=[NSMutableSet set],*unknownPeek=[NSMutableSet set];
+    double now=nowTime();NSMutableSet *seen=[NSMutableSet set],*unknownPeek=[NSMutableSet set],*scope=[NSMutableSet set];
     for(NSDictionary *convo in snapshots) {
-        NSString *cid=convo[@"conversation"];
+        NSString *cid=convo[@"conversation"];[scope addObject:cid];
         if(![convo[@"peekingKnown"] boolValue])[unknownPeek addObject:cid];
         for(NSString *kind in @[@"typing",@"peek"]) {
             for(NSDictionary *person in convo[[kind isEqual:@"typing"]?@"typing":@"peeking"]) {
@@ -365,22 +396,43 @@ static void consumePresence(NSArray<NSDictionary *> *snapshots,BOOL foreground) 
                 BOOL active=person[@"active"]?[person[@"active"] boolValue]:YES;
                 /* RemoteTypingParticipants membership is used when the proxy
                    offers no boolean. Numeric enum meanings are NOT invented. */
-                if([kind isEqual:@"typing"]&&[config[@"TypingInactiveStates"] containsObject:person[@"rawState"]])active=NO;
+                if([kind isEqual:@"typing"]&&!person[@"activity"]&&[config[@"TypingInactiveStates"] containsObject:person[@"rawState"]])active=NO;
                 NSMutableData *data=presence[key];if(!data){data=[NSMutableData dataWithLength:sizeof(SNPresence)];presence[key]=data;}
                 SNPresence *state=data.mutableBytes;
+                NSString *activity=nil;
+                if([kind isEqual:@"typing"]){
+                    activity=person[@"activity"]?:[activityTracker activityForConversation:cid sender:uid time:now];
+                    if([activity isEqual:@"inactive"])active=NO;
+                    BOOL known=[activity isEqual:@"text"]||[activity isEqual:@"voice"];
+                    NSString *previous=compositionKinds[key];
+                    /* A voice<->text transition is a new activity even when
+                       the generic composing flag stays on. Cancel old waits.
+                       Unknown->known also starts now: no label was guessed. */
+                    if(active&&known&&(![previous isEqual:activity]||!state->notified)&&(state->active||[previous isEqual:@"text"]||[previous isEqual:@"voice"])){
+                        cancelPresenceWait(kind,cid,uid,state);state->active=false;state->notified=false;
+                    }
+                    if(active&&known)compositionKinds[key]=activity;
+                    /* Retain the last medium through STOP so an immediate
+                       text->voice restart bypasses the same-medium debounce. */
+                }
                 SNPresenceChange change=sn_presence_update(state,active,now,setting(@"TypingIdleSeconds",8,2,60),setting(@"TypingRestartGapSeconds",1.5,0,10));
                 logLine(@"PRESENCE type=%@ uid=%@ raw=%@ active=%d change=%d fallback=%@",kind,shortID(uid),person[@"rawState"],active,change,convo[@"fallback"]);
                 if(change==SN_PRESENCE_STOP)cancelPresenceWait(kind,cid,uid,state);
-                if(change==SN_PRESENCE_START)notifyEvent(@{@"kind":kind,@"uid":uid,@"conversation":cid,@"event":[NSString stringWithFormat:@"session-%llu",(unsigned long long)state->session],@"observedInForeground":@(foreground)});
+                if(change==SN_PRESENCE_START){
+                    if([kind isEqual:@"typing"]&&![activity isEqual:@"text"]&&![activity isEqual:@"voice"]){
+                        state->notified=false;compositionUnknown++;logLine(@"PRESENCE-ACTIVITY-WAIT reason=unknown uid=%@",shortID(uid));
+                    }else notifyEvent(@{@"kind":kind,@"uid":uid,@"conversation":cid,@"event":[NSString stringWithFormat:@"session-%llu",(unsigned long long)state->session],@"observedInForeground":@(foreground),@"activity":activity?:@"unknown"});
+                }
             }
         }
     }
     for(NSString *key in [presence allKeys]) {
         NSArray *parts=[key componentsSeparatedByString:@"|"];SNPresence *state=[presence[key] mutableBytes];
+        if(!completeSet&&![scope containsObject:parts[1]])continue;
         if(![seen containsObject:key] && !([parts[0] isEqual:@"peek"]&&[unknownPeek containsObject:parts[1]])) {
             if(state->active){cancelPresenceWait(parts[0],parts[1],parts[2],state);sn_presence_update(state,NO,now,8,0);logLine(@"PRESENCE-STOP type=%@ uid=%@",parts[0],shortID(parts[2]));}
         }
-        if(presence.count>512 || (state->observed&&!state->active&&now-state->last_activity>300))[presence removeObjectForKey:key];
+        if(presence.count>512 || (state->observed&&!state->active&&now-state->last_activity>300)){[presence removeObjectForKey:key];[compositionKinds removeObjectForKey:key];}
     }
 }
 static void consumeReceived(NSArray *events) {
@@ -614,7 +666,7 @@ static void scan(void) {
         if([@[@"SCHermodDuplexServiceImplementation",@"SCDuplexSyncTriggerServiceImpl"] containsObject:cn])attach(cls,@"onReceive:",^(id self,NSArray *a,__unused id r){observeTransport(self,a.firstObject);});
         if([cn isEqual:@"SCNotificationDisplayModel"]&&SNInstallNoticeChoice(cls,^(id payload){observeHostNotice(payload);})){hookCount++;logLine(@"HOOK native-notice-choice installed=1");}
         if([cn isEqual:@"SCCallStateProvider"]){
-            attach(cls,@"updateWithPresencePlatformActiveConversationsInfo:",^(id self,NSArray *a,id r){(void)self;(void)r;BOOL foreground=atomic_load(&appState)==UIApplicationStateActive;NSArray *snapshot=SNPresenceRecords(a.firstObject);dispatch_async(worker,^{consumePresence(snapshot,foreground);});});
+            attach(cls,@"updateWithPresencePlatformActiveConversationsInfo:",^(id self,NSArray *a,id r){(void)self;(void)r;BOOL foreground=atomic_load(&appState)==UIApplicationStateActive;NSArray *snapshot=SNPresenceRecords(a.firstObject);dispatch_async(worker,^{consumePresence(snapshot,foreground,YES);});});
             attach(cls,@"sessionWrapper:updatedState:",^(id self,NSArray *a,id r){
                 (void)self;(void)r;id state=SNRead(a.count>1?a[1]:nil,@"state");id local=SNRead(state,@"localParticipant");NSString *uid=SNIdentifier(SNRead(local,@"snapchatUserId"));
                 if(uid)dispatch_async(worker,^{setAccount(uid);});
@@ -677,7 +729,7 @@ static void writeStatus(void) {
         NSString *oldest=[[issuedRequests keysSortedByValueUsingComparator:^NSComparisonResult(NSNumber *a,NSNumber *b){return [a compare:b];}] firstObject];
         [issuedRequests removeObjectForKey:oldest];
     }
-    NSDictionary *status=@{@"version":SNVersion,@"state":stateLabel(),@"knownUsers":@(users.count),@"nameHits":@(nameHits),@"nameMisses":@(nameMisses),@"wirePackets":@(wireCount),@"unsupportedWirePackets":@(malformedCount),@"packetDrops":@(atomic_load(&packetDrops)),@"notificationRequestsAccepted":@(postedCount),@"secondsSinceWire":lastWire?@(now-lastWire):@(-1),@"apnsRegisteredThisRun":@(nativePushRegistered),@"apnsDeliveryCallbacks":@(apnsCallbacks),@"nativeNoticeCandidates":@(nativeNoticeCandidates),@"nativeNoticesAccepted":@(nativeNoticeAccepted),@"experimentalKeepAlive":@(atomic_load(&experiments)),@"onDeviceValidationRequired":@YES,@"receiveCallbacks":@(receivedCallbacks),@"decodedMessages":@(decodedMessages),@"decodedSnaps":@(decodedSnaps),@"snapshotRecordsSuppressed":@(snapshotSuppressed),@"receiveQueueDrops":@(atomic_load(&receiveDrops)),@"localAccountKnown":@(account.length>0),@"notificationBacklog":@(notificationBuffer.count),@"notificationInFlight":@(pendingEvents.count),@"notificationBufferOverflows":@(notificationBufferOverflows),@"notificationFailures":@(notificationFailures),@"notifyInForeground":@(enabled(@"NotifyInForeground")),@"secondsSinceReceive":lastReceive?@(now-lastReceive):@(-1),@"notificationSettings":notificationSettings?:@{},@"background":backgroundDiagnostics?:@{}};
+    NSDictionary *status=@{@"version":SNVersion,@"state":stateLabel(),@"knownUsers":@(users.count),@"nameHits":@(nameHits),@"nameMisses":@(nameMisses),@"wirePackets":@(wireCount),@"unsupportedWirePackets":@(malformedCount),@"packetDrops":@(atomic_load(&packetDrops)),@"notificationRequestsAccepted":@(postedCount),@"secondsSinceWire":lastWire?@(now-lastWire):@(-1),@"apnsRegisteredThisRun":@(nativePushRegistered),@"apnsDeliveryCallbacks":@(apnsCallbacks),@"nativeNoticeCandidates":@(nativeNoticeCandidates),@"nativeNoticesAccepted":@(nativeNoticeAccepted),@"experimentalKeepAlive":@(atomic_load(&experiments)),@"onDeviceValidationRequired":@YES,@"receiveCallbacks":@(receivedCallbacks),@"decodedMessages":@(decodedMessages),@"decodedSnaps":@(decodedSnaps),@"snapshotRecordsSuppressed":@(snapshotSuppressed),@"receiveQueueDrops":@(atomic_load(&receiveDrops)),@"localAccountKnown":@(account.length>0),@"notificationBacklog":@(notificationBuffer.count),@"notificationInFlight":@(pendingEvents.count),@"notificationBufferOverflows":@(notificationBufferOverflows),@"notificationFailures":@(notificationFailures),@"notifyInForeground":@(enabled(@"NotifyInForeground")),@"secondsSinceReceive":lastReceive?@(now-lastReceive):@(-1),@"notificationSettings":notificationSettings?:@{},@"background":backgroundDiagnostics?:@{},@"presenceActivityPackets":@(presenceActivityPackets),@"presenceActivityRejected":@(presenceActivityRejected),@"compositionUnknown":@(compositionUnknown)};
     NSData *json=[NSJSONSerialization dataWithJSONObject:status options:NSJSONWritingPrettyPrinted error:NULL];
     [json writeToFile:[documents stringByAppendingPathComponent:@"snapnotify_status.json"] options:NSDataWritingAtomic|NSDataWritingFileProtectionCompleteUntilFirstUserAuthentication error:NULL];
     NSDictionary *schema=@{@"version":SNVersion,@"hooks":receiveHooks?:@[],@"sources":[receiveSources copy],@"containsMessageBodies":@NO,@"transportSources":[transportSources copy]};
@@ -748,6 +800,7 @@ __attribute__((constructor)) static void start(void) {
         logQueue=dispatch_queue_create("ch.snapnotify.log",DISPATCH_QUEUE_SERIAL);
         notificationBuffer=[[SNEventBuffer alloc] initWithCapacity:8192];
         users=[NSMutableDictionary dictionary];presence=[NSMutableDictionary dictionary];pendingEvents=[NSMutableDictionary dictionary];issuedRequests=[NSMutableDictionary dictionary];
+        activityTracker=[SNPresenceActivityTracker new];compositionKinds=[NSMutableDictionary dictionary];
         receiveTracker=[[SNReceiveTracker alloc] initWithMonitoringStart:NSDate.date.timeIntervalSince1970];transportSources=[NSMutableDictionary dictionary];receiveSources=[NSMutableDictionary dictionary];receiveHooks=@[];
         session=NSUUID.UUID.UUIDString;queueGeneration=1;
         documents=[NSSearchPathForDirectoriesInDomains(NSDocumentDirectory,NSUserDomainMask,YES) firstObject];

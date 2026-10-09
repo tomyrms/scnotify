@@ -1,0 +1,58 @@
+SnapNotify rc7 - presence decoder validation
+
+This is a transcription of executed commands and observed results, not an
+unabridged terminal recording. All participant/conversation identifiers and
+packets in these tests are synthetic. No user's messages or device traces were
+used. Execution host: Windows, PowerShell; Zig 0.15.2 portable toolchain.
+
+Working directory:
+C:\Users\jtoma\Documents\Codex\2026-10-09\files-mentioned-by-the-user-snapnotify
+
+Executed parser tests:
+
+$env:CC=(Resolve-Path work/toolchain/zig-x86_64-windows-0.15.2/zig.exe).Path
+python -m unittest discover -s work/SnapNotify-v4.0.0-rc7/tests -p test_presence_wire.py -v
+
+Observed result: process exit code 0; 21 tests passed.
+Terminal summary:
+----------------------------------------------------------------------
+Ran 21 tests in 0.016s
+
+OK
+
+Executed sanitizer build and fuzz smoke test:
+
+& work/toolchain/zig-x86_64-windows-0.15.2/zig.exe cc -std=c11 -Wall -Wextra -Werror -O1 -g -fsanitize=undefined work/SnapNotify-v4.0.0-rc7/Core/SNCore.c work/SnapNotify-v4.0.0-rc7/Core/SNPresenceWire.c work/SnapNotify-v4.0.0-rc7/tests/fuzz_presence_wire.c -o work/fuzz-build/fuzz_presence_wire.exe
+if($LASTEXITCODE -eq 0){& work/fuzz-build/fuzz_presence_wire.exe}
+
+Observed result: process exit code 0; no sanitizer diagnostic in returned output.
+Program output:
+presence: 100000 deterministic mutation/random inputs + every seed truncation passed.
+
+Scope:
+- Compiles and executes the production C decoder, using the existing SNCore wire
+  reader. The Python test's temporary wrapper includes both production C files.
+- Checks valid typing/voice flags, inactive and unknown bits, normalized UUIDs,
+  empty snapshots, multiple users, matching/conflicting duplicate users,
+  duplicate singular fields, wrong wire types, malformed participant keys,
+  absent fields, truncated packets, overflowing varints, field/participant/input
+  size limits, null pointers, and zeroed output on failure.
+- Fuzz smoke test uses deterministic random inputs and mutations of a valid
+  synthetic presence payload. This is not exhaustive fuzzing or an iOS test.
+
+Protocol evidence:
+https://github.com/CoffeeBrewer64/SE-Extended/blob/be815bbf435d8ece4514b390dc6dbbf2ee81c0aa/core/src/main/kotlin/me/rhunk/snapenhance/core/features/impl/spying/FriendTracker.kt#L169-L189
+Repository commit: be815bbf435d8ece4514b390dc6dbbf2ee81c0aa
+
+That source's presence decoder reads conversation field 6, repeated participant
+field 4, participant key field 1 (uuid:session), and flags at participant field
+2 -> field 1. It interprets bit 4 as typing/composition and bit 6 together with
+bit 4 as speaking. The new implementation uses this interoperable schema; no
+third-party implementation code was copied.
+
+Compatibility caveat:
+The source calls the voice state "speaking". There was no supplied Snapchat
+14.17.1 iOS recording trace to independently confirm the mapping on that build.
+These raw protocol bits are not the numeric SCCPresencePlatform typingState
+enum and must not be applied to it. Actual keyboard-to-voice transitions and
+notification delivery still require validation on the user's iPhone.

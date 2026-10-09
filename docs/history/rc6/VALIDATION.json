@@ -1,0 +1,30 @@
+{
+  "version": "4.0.0-rc6",
+  "base_archive": "SnapNotify-v4.0.0-rc5.zip",
+  "base_archive_sha256": "ebcaf58c00f4fc8bbe021117c69ddbb17a6f354fb707c5a19509757e8dc2b422",
+  "change": "Neutral composing-presence label; numeric typingState is not a verified text/voice discriminator",
+  "production_code_changes": [
+    "Tweak.m: presence notification text and version"
+  ],
+  "checks_executed": [
+    "exact source comparison against rc5",
+    "ZIP CRC",
+    "SHA-256 manifest verification"
+  ],
+  "tests_rerun": false,
+  "reason": "Reversible copy-only change; production Core and adapters are byte-identical to rc5",
+  "prior_rc5_results": {
+    "portable_tests_passed": 94,
+    "fuzz_inputs": 200000,
+    "reference": "docs/history/rc5/VALIDATION.json"
+  },
+  "ios_compilation": {
+    "executed": false,
+    "reason": "Apple SDK unavailable on this Windows host"
+  },
+  "phone_tests_rc6": {
+    "executed": false
+  },
+  "user_feedback_rc5": "General operation reported successful; composing voice note displayed as typing",
+  "distribution": "sources only; no IPA or dylib"
+}

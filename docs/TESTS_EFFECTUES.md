@@ -1,14 +1,14 @@
-# Vérification rc6 — correction du libellé de préparation
+# Vérifications rc7
 
-## Vérifications exécutées pour cette livraison
+Exécuté ici sur Windows x64, avec Zig 0.15.2 compilant les sources C de production :
 
-- Comparaison exacte avec l’archive rc5 livrée : dans les sources de production, seul `Tweak.m` change, pour le libellé et le numéro de version. Le champ version du paquet `control` est également actualisé.
-- Le libellé de présence est maintenant « prépare un message… » ; le libellé de réception « t’a envoyé un vocal » est conservé.
-- Tous les fichiers `Core/`, `Sources/`, `tests/`, les scripts et le workflow sont identiques octet pour octet à rc5.
-- Intégrité ZIP, liste de fichiers et manifeste SHA-256 vérifiés après empaquetage.
+- Suite complète : **115 tests réussis**, sortie enregistrée dans `portable-tests-rc7.txt`.
+- Nouveau décodeur de présence : 21 tests de protocole, drapeaux texte/vocal, UUIDs, groupes, types incorrects, duplications, dépassements, troncatures et échec transactionnel.
+- Fuzzer du nouveau décodeur : **100 000 entrées mutation/aléatoires**, plus troncatures, avec UBSan. Commandes et compte rendu dans `fuzz-presence-rc7.txt`. Pas d’ASan dans cette exécution Windows; la CI POSIX conserve ASan+UBSan.
+- Syntaxe des trois scripts shell vérifiée avec `bash -n`.
+- Relecture indépendante de l’intégration des états, des changements de média, de l’annulation des notifications en attente et de l’isolation des conversations/comptes.
+- ZIP et manifeste SHA-256 vérifiés après génération.
 
-Il s’agit d’une correction de texte : aucun test supplémentaire reproduisant la chaîne de caractères n’est ajouté. Les 94 tests C/Python et les 200 000 essais aléatoires consignés dans les journaux **rc5** n’ont pas été relancés pour cette modification. Ces résultats restent ceux de rc5, dont le cœur C est inchangé.
+**Non exécutés ici :** les sept programmes Foundation, compilation iOS, réception réseau réelle sur iPhone et affichage des deux bannières. Le nouveau test `TestPresenceActivity` couvre le cache texte/vocal, l’expiration, l’arrêt, les groupes, les données invalides et le reset; il sera exécuté sur le runner Mac.
 
-Compilation Objective-C/iOS et essais iPhone rc6 **non exécutés ici**, faute de SDK Apple sur Windows. L’utilisateur a confirmé le bon fonctionnement général de rc5 ; ce retour ne constitue pas une validation de rc6 ni une mesure exhaustive des notifications.
-
-Le workflow existant recompilera et exécutera les six programmes Foundation avant de produire la nouvelle dylib.
+Le schéma de protocole est corroboré par une implémentation publique indépendante. Les fixtures sont synthétiques et ne constituent pas une capture de vocal sur Snapchat iOS 14.17.1. Les anciens journaux rc5 restent historiques.

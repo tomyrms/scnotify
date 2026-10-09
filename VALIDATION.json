@@ -1,30 +1,47 @@
 {
-  "version": "4.0.0-rc6",
-  "base_archive": "SnapNotify-v4.0.0-rc5.zip",
-  "base_archive_sha256": "ebcaf58c00f4fc8bbe021117c69ddbb17a6f354fb707c5a19509757e8dc2b422",
-  "change": "Neutral composing-presence label; numeric typingState is not a verified text/voice discriminator",
-  "production_code_changes": [
-    "Tweak.m: presence notification text and version"
-  ],
-  "checks_executed": [
-    "exact source comparison against rc5",
-    "ZIP CRC",
-    "SHA-256 manifest verification"
-  ],
-  "tests_rerun": false,
-  "reason": "Reversible copy-only change; production Core and adapters are byte-identical to rc5",
-  "prior_rc5_results": {
-    "portable_tests_passed": 94,
-    "fuzz_inputs": 200000,
-    "reference": "docs/history/rc5/VALIDATION.json"
+  "version": "4.0.0-rc7",
+  "base_archive": "SnapNotify-v4.0.0-rc6.zip",
+  "base_archive_sha256": "8e136c49dafb722a81bccedcaaa8d80f239097973035bb2ba425b9ebdea3d5ff",
+  "target_snapchat": "14.17.1",
+  "portable_tests": {
+    "executed": true,
+    "passed": 115,
+    "failed": 0,
+    "log": "docs/portable-tests-rc7.txt"
+  },
+  "presence_decoder_tests": {
+    "executed": true,
+    "passed": 21,
+    "fixtures": "synthetic"
+  },
+  "presence_fuzz": {
+    "executed": true,
+    "random_inputs": 100000,
+    "ubsan": true,
+    "asan": false,
+    "log": "docs/fuzz-presence-rc7.txt"
+  },
+  "foundation_tests": {
+    "executed": false,
+    "programs": [
+      "TestFoundation",
+      "TestReceive",
+      "TestHostNotice",
+      "TestNativeReceive",
+      "TestForeground",
+      "TestEventBuffer",
+      "TestPresenceActivity"
+    ]
   },
   "ios_compilation": {
     "executed": false,
-    "reason": "Apple SDK unavailable on this Windows host"
+    "reason": "No Apple SDK on Windows"
   },
-  "phone_tests_rc6": {
-    "executed": false
+  "phone_validation": {
+    "executed": false,
+    "voice_flag_meaning_confirmed_on_target": false
   },
-  "user_feedback_rc5": "General operation reported successful; composing voice note displayed as typing",
-  "distribution": "sources only; no IPA or dylib"
+  "semantic_basis": "Public presence protocol composing+speaking flags; distinct from iOS typingState enum",
+  "unknown_activity_behavior": "Wait for an identifiable type; no fabricated text/voice label",
+  "distribution": "Sources only; no IPA or dylib"
 }

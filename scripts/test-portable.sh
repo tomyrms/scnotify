@@ -12,3 +12,8 @@ trap 'rm -rf "$build"' EXIT
   -fsanitize=address,undefined -fno-omit-frame-pointer \
   Core/SNReceivePolicy.c tests/fuzz_receive.c -o "$build/fuzz_receive"
 "$build/fuzz_receive"
+
+"${CC:-clang}" -std=c11 -D_POSIX_C_SOURCE=200809L -Wall -Wextra -Werror -g \
+  -fsanitize=address,undefined -fno-omit-frame-pointer \
+  Core/SNCore.c Core/SNPresenceWire.c tests/fuzz_presence_wire.c -o "$build/fuzz_presence_wire"
+"$build/fuzz_presence_wire"

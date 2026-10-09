@@ -1,26 +1,22 @@
-# Vérification iPhone — rc6
-
-Appareil cible déclaré : iPhone 14, iOS 26.6.2, Snapchat 14.17.1, installation Sideloadly. Ce protocole n’a pas été exécuté dans cette livraison.
-
-1. Compiler avec la CI incluse; attendre tests et build réussis, remplacer l’ancienne dylib et relancer. Vérifier la version rc6 dans `READY`.
-2. Autoriser les alertes et sons iOS. Pour tester au premier plan, définir `NotifyInForeground=true` dans la configuration EXISTANTE.
-3. Depuis un autre compte, commencer un texte puis l’annuler; recommencer avec un vocal sans l’envoyer. L’activité doit afficher « prépare un message… » dans les deux cas, jamais affirmer que le vocal est de la saisie texte. Envoyer ensuite le vocal : la notification de réception doit indiquer « t’a envoyé un vocal » si le type vocal est reconnu.
-4. Avec un autre compte, envoyer un chat, un vocal, deux snaps, un sticker et un média de chat. Chaque ID distinct doit provoquer sa requête; les retransmissions du même ID restent uniques. Un vocal doit afficher « t’a envoyé un vocal » s’il expose un prédicat/type vocal reconnu.
-5. Envoyer une rafale de 30 messages distincts. Comparer le nombre attendu aux deltas de `notificationRequestsAccepted`, au journal `NOTIF-ACCEPTED` et au centre de notifications. `notificationBacklog` doit revenir à zéro; `notificationBufferOverflows`, `receiveQueueDrops`, `packetDrops` et `notificationFailures` ne doivent pas augmenter. Une bannière unique pendant une rafale ne signifie pas forcément qu’une seule requête a été acceptée.
-6. Laisser Snapchat en arrière-plan sans fermer sa carte; envoyer à 1, 5, 10, 15 et 30 minutes. Recommencer après un vocal et une interruption audio réelle. Ne pas inférer une réception à partir du seul lecteur audio.
-7. Annuler un appel pendant l’attente du nom et vérifier qu’aucune notification tardive ne réapparaît. Si plusieurs comptes sont utilisés, vérifier qu’un retour de l’ancien compte n’annule pas les notifications du nouveau.
-
-## Lire le diagnostic
-
-- `receiveCallbacks` ne progresse plus : le tweak ne reçoit plus les callbacks. Examiner l’état audio, la connexion et la suspension; ce n’est pas un problème de texte de notification.
-- Callbacks présents, `decodedMessages/decodedSnaps` immobiles : regarder les rejets dans `snapnotify_receive_schema.json`.
-- Décodage présent mais pas d’envoi : examiner les filtres de date/direction, le réglage premier plan et la déduplication.
-- `NOTIF-FAILED` : code et domaine d’erreur iOS. `NOTIF-ACCEPTED` signifie requête acceptée, pas affichage visuel confirmé.
-- `background.audioBackgroundModeDeclared=false` : l’IPA ne déclare pas le mode audio requis par l’expérience. Modifier Info.plist seul ne garantit ni l’exécution ni les droits APNs.
-- `background.audioPlaying=false` / `lastKeepAliveStop` : dernier motif d’arrêt. `secondsSinceMainHeartbeat` très élevé est compatible avec une suspension ou un blocage, sans les distinguer à lui seul. Le diagnostic est un instantané; il ne se met pas à jour pendant une suspension.
-
-Conserver les trois fichiers `snapnotify.log`, `snapnotify_status.json`, `snapnotify_receive_schema.json`. Si possible conserver une copie avant de revenir au premier plan, puis une seconde après. Ne pas joindre certificat, mot de passe ou jeton d’appareil.
-
-## Limites explicites
-
-La file n’est pas persistée si iOS termine le processus. Elle est bornée à 8192 éléments, avec 16 envois en cours. Le décodeur limite chaque callback à 512 événements/4096 objets parcourus; le suivi limite 2048 IDs frais par conversation et 128 conversations. Les seuils défensifs ne promettent pas un nombre infini de notifications. Une notice native sans ID stable ne permet pas de distinguer parfaitement deux textes identiques de deux callbacks du même événement. Le maintien audio ne garantit pas la reconnexion du canal Snapchat.
+# Validation iPhone rc7
+
+Ce protocole reste à exécuter sur Snapchat 14.17.1.
+
+1. Compiler et injecter rc7, lancer Snapchat et vérifier sa version dans `READY`. Autoriser les alertes iOS; activer `NotifyInForeground` pour l’essai avec Snapchat ouvert.
+2. Depuis un autre compte, écrire un texte pendant quelques secondes : attendre « est en train d’écrire… ».
+3. Arrêter, puis enregistrer un vocal : attendre « est en train d’enregistrer un vocal… ». Envoyer le vocal : vérifier séparément « t’a envoyé un vocal ».
+4. Alterner texte → vocal et vocal → texte, avec et sans bref arrêt. Vérifier que l’ancien libellé en attente est annulé et que les répétitions du même état ne font pas une rafale de doublons.
+5. Tester deux contacts/conversations, puis un groupe : la présence d’un contact ne doit pas attribuer son activité à un autre. Une mise à jour d’une conversation ne doit pas annuler l’activité d’une autre.
+6. Refaire un essai en arrière-plan, puis la rafale de messages reçus et les essais de durée déjà utilisés avec rc5.
+
+## Si aucune notification de préparation ne s’affiche
+
+Consulter `snapnotify_status.json` :
+
+- `presenceActivityPackets` doit augmenter lorsqu’un paquet de présence compatible est décodé.
+- `presenceActivityRejected` indique un paquet incompatible ou malformé; aucun état n’est inventé dans ce cas.
+- `compositionUnknown` indique que la présence générique a été vue sans pouvoir identifier texte/vocal. Le journal montre `PRESENCE-ACTIVITY-WAIT`.
+
+Conserver `snapnotify.log`, `snapnotify_status.json` et `snapnotify_receive_schema.json`. Pour comparer les deux activités, noter l’heure d’un essai texte puis d’un essai vocal. Il faut ces observations pour valider le schéma sur cette IPA ou adapter sa réception si les paquets n’atteignent pas les hooks.
+
+Une demande acceptée par iOS ne prouve pas qu’une bannière a été affichée. Le maintien en arrière-plan reste soumis à iOS; ce correctif porte sur la classification de l’activité.

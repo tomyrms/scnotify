@@ -40,3 +40,7 @@ xcrun clang -std=gnu11 -fobjc-arc -fblocks -Wall -Wextra -Werror \
 xcrun clang -std=gnu11 -fobjc-arc -fblocks -Wall -Wextra -Werror \
   -framework Foundation Sources/SNEventBuffer.m tests/TestEventBuffer.m -o "$build/test_event_buffer"
 "$build/test_event_buffer"
+
+xcrun clang -std=gnu11 -fobjc-arc -fblocks -Wall -Wextra -Werror \
+  -framework Foundation Sources/SNPresenceActivity.m tests/TestPresenceActivity.m -o "$build/test_presence_activity"
+"$build/test_presence_activity"
