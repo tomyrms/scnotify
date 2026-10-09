@@ -15,7 +15,8 @@ class ReceivePolicyTests(unittest.TestCase):
         library = build_library(cls.tmp.name, 'policy', ROOT / 'Core/SNReceivePolicy.c',
                                 ['sn_receive_kind', 'sn_receive_hint',
                                  'sn_receive_native_content_kind', 'sn_receive_source',
-                                 'sn_receive_seconds', 'sn_receive_time_valid'])
+                                 'sn_receive_seconds', 'sn_receive_time_valid',
+                                 'sn_receive_snapshot_minimum'])
         cls.lib = c.CDLL(str(library))
         for name in ('sn_receive_kind', 'sn_receive_hint'):
             f = getattr(cls.lib, name); f.argtypes = [c.c_char_p]; f.restype = c.c_int
@@ -27,6 +28,8 @@ class ReceivePolicyTests(unittest.TestCase):
         cls.lib.sn_receive_seconds.restype = c.c_double
         cls.lib.sn_receive_time_valid.argtypes = [c.c_double, c.c_double]
         cls.lib.sn_receive_time_valid.restype = c.c_bool
+        cls.lib.sn_receive_snapshot_minimum.argtypes = [c.c_double, c.c_double]
+        cls.lib.sn_receive_snapshot_minimum.restype = c.c_double
 
     @classmethod
     def tearDownClass(cls):
@@ -174,6 +177,27 @@ class ReceivePolicyTests(unittest.TestCase):
         for time in (now, now-300, now+60): self.assertTrue(self.lib.sn_receive_time_valid(time, now))
         for time in (now-301, now+61, 0, float('nan'), float('inf')): self.assertFalse(self.lib.sn_receive_time_valid(time, now))
         self.assertFalse(self.lib.sn_receive_time_valid(now, float('nan')))
+
+    def test_snapshot_gate_keeps_monitoring_start_after_delayed_observation(self):
+        start = 1800000000
+        minimum = self.lib.sn_receive_snapshot_minimum(start, start + 10)
+        self.assertEqual(minimum, start)
+        for created, observed in ((start + 1, start + 10), (start + 5, start + 11),
+                                  (start + 15, start + 23)):
+            self.assertTrue(self.lib.sn_receive_time_valid(created, observed))
+            self.assertGreaterEqual(created, minimum)
+        self.assertLess(start - 1, minimum)
+
+    def test_snapshot_gate_without_monitoring_start_uses_original_baseline(self):
+        baseline = 1800000010
+        for start in (0, -1, float('nan'), float('inf')):
+            self.assertEqual(self.lib.sn_receive_snapshot_minimum(start, baseline), baseline - 1)
+
+    def test_snapshot_gate_invalid_without_any_valid_start(self):
+        for baseline in (0, -1, float('nan'), float('inf')):
+            self.assertTrue(math.isnan(self.lib.sn_receive_snapshot_minimum(0, baseline)))
+        # A valid monitoring start does not depend on a missing baseline.
+        self.assertEqual(self.lib.sn_receive_snapshot_minimum(1800000000, float('nan')), 1800000000)
 
 if __name__ == '__main__':
     unittest.main()

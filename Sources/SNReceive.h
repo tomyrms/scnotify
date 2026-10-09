@@ -22,7 +22,9 @@ NSDictionary *SNDecodeReceived(NSArray *arguments, NSString * _Nullable conversa
    Snapshot observers are not receive callbacks. Old first-batch records seed
    a baseline; newly created incoming IDs can notify under the date/direction
    gates, including first-batch records created since monitoring began.
-   Incomplete live records await timestamp/direction evidence. Seen identities
+   Incomplete live records await timestamp/direction evidence, preserving the
+   original monitoring/baseline time even when callbacks arrive late. Duplicate
+   representations in a callback can supply missing metadata. Seen identities
    expire after the entire date-eligibility horizon instead of filling forever. */
 @interface SNReceiveTracker : NSObject
 /* A positive start permits first-batch incoming records created after start. */

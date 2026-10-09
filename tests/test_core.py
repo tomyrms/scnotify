@@ -226,6 +226,48 @@ class LedgerTests(unittest.TestCase):
     def test_distinct_snaps_from_same_sender(self):
         self.assertTrue(self.reserve(b'snap|same-convo|same-user|id-1'))
         self.assertTrue(self.reserve(b'snap|same-convo|same-user|id-2'))
+    def test_voice_then_chat_remains_independent_of_typing_and_call_stop(self):
+        # Voice and text both use the message namespace in the real adapter.
+        # A shared sender/conversation, close timestamps, and STOP callbacks
+        # must not turn the second received message into a duplicate.
+        prefix = (CONV + '|' + USER + '|').encode()
+        voice = b'message|' + prefix + b'voice-100'
+        chat = b'message|' + prefix + b'chat-101'
+        typing = b'typing|' + prefix + b'session-1'
+        call = b'call|' + prefix + CALL.encode()
+        voice_ticket = self.reserve(voice, 10)
+        self.assertTrue(voice_ticket)
+        self.assertTrue(lib.sn_ledger_commit(C.byref(self.l), voice_ticket, 10.01, 86400))
+        typing_ticket = self.reserve(typing, 10.02)
+        chat_ticket = self.reserve(chat, 10.03)
+        call_ticket = self.reserve(call, 10.03)
+        self.assertTrue(typing_ticket and chat_ticket and call_ticket)
+        lib.sn_ledger_cancel(C.byref(self.l), typing_ticket)
+        lib.sn_ledger_mark(C.byref(self.l), call, 10.04, 300)
+        lib.sn_ledger_cancel(C.byref(self.l), call_ticket)
+        self.assertTrue(lib.sn_ledger_commit(C.byref(self.l), chat_ticket, 10.05, 86400))
+        for key in (voice, chat, call):
+            with self.subTest(key=key): self.assertEqual(self.reserve(key, 10.06), 0)
+        self.assertTrue(self.reserve(b'message|' + prefix + b'chat-102', 10.06))
+    def test_burst_messages_survive_out_of_order_completion_and_ledger_rollover(self):
+        # Match the production pump's 16 concurrent deliveries. Exercise more
+        # events than ledger slots, so completed entries must make room while
+        # every still-pending message retains its own asynchronous ticket.
+        issued = set()
+        prefix = ('message|' + CONV + '|' + USER + '|').encode()
+        for batch_index in range(128):
+            now = batch_index * 0.01
+            keys = [prefix + str(batch_index * 16 + i).encode() for i in range(16)]
+            tickets = [self.reserve(key, now) for key in keys]
+            self.assertTrue(all(tickets))
+            self.assertEqual(len(set(tickets)), 16)
+            self.assertFalse(issued.intersection(tickets))
+            issued.update(tickets)
+            for key, ticket in reversed(list(zip(keys, tickets))):
+                self.assertEqual(self.reserve(key, now + 0.001), 0)
+                self.assertTrue(lib.sn_ledger_commit(C.byref(self.l), ticket, now + 0.002, 86400))
+            for key in keys: self.assertEqual(self.reserve(key, now + 0.003), 0)
+        self.assertEqual(len(issued), 2048)
     def test_failure_rollback(self):
         t=self.reserve();lib.sn_ledger_cancel(C.byref(self.l),t);self.assertTrue(self.reserve(now=.1))
     def test_success_commit(self):

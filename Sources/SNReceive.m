@@ -225,7 +225,7 @@ static NSDictionary *shape(id object) {
 }
 static void collect(id obj,NSString *inheritedConversation,NSString *hint,NSMutableArray *out,
                     NSMutableDictionary *rejected,NSMutableArray *shapes,NSHashTable *path,
-                    NSMutableSet *eventKeys,NSMutableDictionary *identities,unsigned depth,unsigned *budget) {
+                    NSMutableDictionary *eventKeys,NSMutableDictionary *identities,unsigned depth,unsigned *budget) {
     if(!obj||obj==NSNull.null)return;
     if(!*budget||depth>8){reject(rejected,@"traversal-limit");return;}
     --*budget;if([path containsObject:obj]){reject(rejected,@"cycle");return;}
@@ -297,7 +297,7 @@ static void collect(id obj,NSString *inheritedConversation,NSString *hint,NSMuta
             else {
                 NSString *type=kind==SN_RX_SNAP?@"snap":@"message";
                 NSString *key=[@[conversation,sender,eid] componentsJoinedByString:@"|"];
-                if(![eventKeys containsObject:key]) {
+                {
                     NSMutableDictionary *event=[@{@"kind":type,@"uid":sender,@"conversation":conversation,@"event":eid,@"kindSource":kindSource} mutableCopy];
                     NSDictionary *u=SNUserRecord(senderObject,sender);
                     NSString *name=u[@"name"] ?: SNName(rxFirst(obj,@[@"senderDisplayName",@"senderUsername"]));if(name)event[@"name"]=name;
@@ -319,7 +319,27 @@ static void collect(id obj,NSString *inheritedConversation,NSString *hint,NSMuta
                         [shapes addObject:shape(obj)];
                         if(metadata&&shapes.count<8)[shapes addObject:shape(metadata)];
                     }
-                    [eventKeys addObject:key];[out addObject:[event copy]];
+                    NSNumber *position=eventKeys[key];
+                    if(position) {
+                        /* One callback can expose the same message through
+                           a lightweight model and a populated model. Keep a
+                           single event, but do not discard missing metadata
+                           supplied by the latter representation. */
+                        NSDictionary *previous=out[position.unsignedIntegerValue];
+                        BOOL conflictingTime=previous[@"timestamp"]&&event[@"timestamp"]&&
+                            [previous[@"timestamp"] doubleValue]!=[event[@"timestamp"] doubleValue];
+                        if(conflictingTime)reject(rejected,@"conflicting-duplicate-time");
+                        /* Contradictory creation times must not combine one
+                           model's fresh date with another model's direction. */
+                        if([previous[@"kind"] isEqual:type]&&!conflictingTime) {
+                            NSMutableDictionary *merged=[previous mutableCopy];
+                            for(NSString *field in @[@"timestamp",@"incoming",@"name",@"subtype"])
+                                if(!merged[field]&&event[field])merged[field]=event[field];
+                            out[position.unsignedIntegerValue]=[merged copy];
+                        }
+                    }else {
+                        eventKeys[key]=@(out.count);[out addObject:[event copy]];
+                    }
                 }
             }
         }
@@ -333,7 +353,7 @@ static void collect(id obj,NSString *inheritedConversation,NSString *hint,NSMuta
 NSDictionary *SNDecodeReceived(NSArray *arguments,NSString *conversation,NSString *hint) {
     NSMutableArray *events=[NSMutableArray array],*shapes=[NSMutableArray array];NSMutableDictionary *rejected=[NSMutableDictionary dictionary];
     NSHashTable *path=[NSHashTable hashTableWithOptions:NSPointerFunctionsObjectPointerPersonality|NSPointerFunctionsStrongMemory];
-    NSMutableSet *keys=[NSMutableSet set];NSMutableDictionary *identities=[NSMutableDictionary dictionary];unsigned budget=4096;
+    NSMutableDictionary *keys=[NSMutableDictionary dictionary],*identities=[NSMutableDictionary dictionary];unsigned budget=4096;
     if(conversation)identities[conversation]=[NSMutableSet set];
     @try {for(id arg in arguments){if(!budget)break;collect(arg,conversation,hint,events,rejected,shapes,path,keys,identities,0,&budget);}}
     @catch(__unused NSException *e){reject(rejected,@"object-exception");}
@@ -408,14 +428,13 @@ NSArray<NSDictionary *> *SNReceivedRecords(id obj,NSString *hint) {
             if(!minimum) {
                 if(initial) {
                     if(self.monitoringStart<=0||(!unresolved&&![e[@"incoming"] boolValue]))continue;
-                    minimum=@(self.monitoringStart);
-                }else minimum=@([state[@"start"] doubleValue]-1);
+                }
+                minimum=@(sn_receive_snapshot_minimum(self.monitoringStart,[state[@"start"] doubleValue]));
             }
             /* Message metadata is populated asynchronously on some hosts.
                Keep its identity pending until the timestamp arrives, but
                still require creation after the initial live/baseline gate. */
             if(!ts) {
-                if(!known&&!initial)minimum=@(fmax(minimum.doubleValue,wall-1));
                 if(waiting.count<2048||waiting[key])waiting[key]=minimum;
                 continue;
             }
@@ -430,7 +449,7 @@ NSArray<NSDictionary *> *SNReceivedRecords(id obj,NSString *hint) {
         for(NSString *eid in identities[cid]){
             if([decodedIDs containsObject:eid]||seen[eid]||seen.count>=2048)continue;
             seen[eid]=@(wall);
-            if(!initial&&waiting.count<2048)waiting[eid]=@(fmax([state[@"start"] doubleValue]-1,wall-1));
+            if(!initial&&waiting.count<2048)waiting[eid]=@(sn_receive_snapshot_minimum(self.monitoringStart,[state[@"start"] doubleValue]));
         }
         for(NSString *eid in [waiting allKeys])if(wall-[seen[eid] doubleValue]>300)[waiting removeObjectForKey:eid];
         state[@"last"]=@(wall);

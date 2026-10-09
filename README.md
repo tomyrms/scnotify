@@ -1,34 +1,38 @@
-# SnapNotify 4.0.0-rc7 — saisie et vocal distincts
+# SnapNotify 4.0.0-rc8 — messages rapprochés et confirmations tardives
 
 Sources à compiler, puis à injecter et signer avec Sideloadly. Aucun IPA ni dylib précompilée dans cette archive. Cible : Snapchat 14.17.1; appareil déclaré : iPhone 14, iOS 26.6.2.
 
-## Deux activités, deux libellés
+## Corrections
 
-- Composition texte reconnue : **« est en train d’écrire… »**.
-- Activité vocale reconnue : **« est en train d’enregistrer un vocal… »**.
-- Vocal effectivement reçu : **« t’a envoyé un vocal »**, inchangé.
+- **Métadonnées retardées :** un chat récent ne devient plus trop ancien simplement parce que son callback ou son décodage arrive après celui d’un vocal. Le seuil de création reste fixé au début de la surveillance. Le contrôle de fraîcheur de cinq minutes et le rejet de l’historique initial sont conservés.
+- **Copies partielles d’un message :** une représentation complète peut fournir la date, la direction entrante, le nom et le type vocal manquants à une autre copie du même message, dans le même callback. Des dates contradictoires empêchent cette fusion.
+- **Confirmations tardives d’iOS :** un délai de réponse supérieur à 15 secondes libère la place dans la file, sans retirer une notification de message ou de snap qui a pu être acceptée entre-temps. Le résultat tardif reste traité. Un délai dépassé n’entraîne pas de renvoi automatique; la réservation anti-doublon dure jusqu’à cinq minutes pendant l’incertitude.
+- **Alertes natives identiques :** deux objets de notification distincts peuvent produire deux alertes, même avec un titre et un texte identiques. Les callbacks multiples du même objet restent regroupés brièvement.
+- **Relance et annulation :** une ancienne échéance ne peut plus bloquer la deuxième tentative; une retransmission n’écrase plus une demande déjà en cours. L’annulation de la saisie ou d’un appel reste indépendante des chats reçus.
 
-rc7 décode l’état du paquet duplex `presence`, que les anciennes versions ignoraient. La distinction utilise le drapeau de composition et le drapeau vocal du protocole, documentés dans une implémentation publique indépendante. Elle ne déduit pas un vocal du temps passé à écrire et n’interprète pas arbitrairement les valeurs numériques `typingState` du modèle iOS.
-
-Un changement texte → vocal, même avec un bref arrêt intermédiaire, réarme la notification et annule une éventuelle ancienne notification encore en attente. Les conversations sont traitées séparément. Les paquets invalides ne changent aucun état.
-
-**Limite à connaître :** si l’événement de présence détaillé n’arrive pas ou n’est pas compatible, le type reste inconnu et la notification de préparation attend un état identifiable. Les notifications de messages reçus continuent à fonctionner. Le code public nomme le drapeau `speaking`; son interprétation comme enregistrement vocal dans cette version iOS reste à confirmer sur l’iPhone.
-
-Les données sont limitées à Snapchat 14.17.1 et à des paquets structurés validés. Les états précis expirent après 15 secondes. Le propre compte est exclu quand son ID est connu; sinon il faut que le récepteur natif ait déjà identifié le participant comme distant.
+Les deux états « est en train d’écrire… » et « est en train d’enregistrer un vocal… » sont conservés, ainsi que « t’a envoyé un vocal ». Voir [la provenance et les limites du schéma de présence](docs/SOURCES_RC7.md).
 
 ## Installation
 
-1. Copier le projet complet, y compris `.github`, `Sources`, `Core`, `tests` et `scripts`, dans le dépôt utilisé pour compiler rc5.
-2. Lancer **SnapNotify tests and build**. Attendre la réussite des tests portables, des **sept** programmes Foundation et du build iOS arm64.
-3. Récupérer le nouvel artefact **SnapNotify-v4-dylib**, remplacer l’ancienne bibliothèque dans la procédure Sideloadly, puis signer/réinstaller.
-4. Vérifier `READY version=4.0.0-rc7 host=14.17.1` dans `snapnotify.log`.
+1. Remplacer les sources du projet de compilation par le contenu complet de cette archive, y compris `Core`, `Sources`, `tests`, `scripts` et `.github`.
+2. Lancer **SnapNotify tests and build**. Attendre les tests portables, les sept programmes Foundation et la compilation iOS arm64.
+3. Récupérer **SnapNotify-v4-dylib**, remplacer la bibliothèque dans la procédure Sideloadly, puis signer/réinstaller.
+4. Vérifier `READY version=4.0.0-rc8 host=14.17.1` dans `snapnotify.log`.
 
-Sur Mac/Xcode : `make test`, `make test-macos`, `make`. Les réglages existants sont conservés. Pour les notifications au premier plan, la clé `NotifyInForeground` de `Documents/SnapNotifyConfig.plist` doit être `true`.
+Sur Mac avec Xcode : `make test`, `make test-macos`, `make`. Les réglages existants sont conservés. Pour les alertes quand Snapchat est ouvert, `NotifyInForeground` doit être `true` dans `Documents/SnapNotifyConfig.plist`.
 
-## Validation
+## Son
 
-**115 tests C/Python réussis**, dont 21 pour le nouveau décodeur. Son fuzzer a exécuté **100 000 entrées** avec UBSan. Les sept tests Foundation et la compilation iOS n’ont pas été exécutés sur cet hôte Windows. Aucun essai rc7 sur iPhone n’est revendiqué.
+SnapNotify utilise le son par défaut d’iOS (`UNNotificationSound.defaultSound`). Pour le changer sur iPhone : **Réglages → Sons et vibrations → Alertes par défaut**. Cela concerne aussi les autres apps utilisant ce son système. Cette version n’ajoute pas de sélecteur de son propre à SnapNotify.
 
-Voir [les tests](docs/TESTS_EFFECTUES.md), [le protocole iPhone](docs/VALIDATION_IPHONE.md) et [la source du schéma](docs/SOURCES_RC7.md).
+Référence : [Apple — UNNotificationSound](https://developer.apple.com/documentation/usernotifications/unnotificationsound).
 
-La file d’attente, les notifications de messages reçus et le maintien en arrière-plan de rc5 sont conservés. Le maintien audio reste expérimental et ne garantit pas l’exécution permanente ni la reconnexion du canal Snapchat. Les documents `docs/history` décrivent les versions précédentes.
+## Validation et limites
+
+**140 tests C/Python réussis** sur Windows avec compilation du C de production. Ils incluent une rafale de 2 048 identités et les transitions de livraison, avec succès tardif, erreur tardive et relance. Voir [les vérifications](docs/TESTS_EFFECTUES.md).
+
+**Non exécutés ici :** les sept programmes Foundation, la compilation iOS et l’essai sur iPhone. La perte rapportée n’a pas été reproduite sur un appareil connecté; ces modifications corrigent des défauts vérifiés dans le code. [Le protocole iPhone](docs/VALIDATION_IPHONE.md) permet de vérifier le scénario vocal → arrière-plan → chat.
+
+Le maintien en arrière-plan reste expérimental. Si Snapchat cesse de recevoir ses données ou si iOS suspend son processus, la file de notifications ne peut pas inventer les messages absents. Après utilisation du micro ou un appel, une catégorie audio `Record`/`PlayAndRecord` empêche toujours le lancement du maintien audio pour préserver la session de Snapchat. Une acceptation par iOS ne prouve pas l’affichage d’une bannière.
+
+Les limites mémoire restent bornées; aucune promesse de volume illimité n’est faite. Sans ID natif, deux événements réutilisant exactement le même objet, le même texte et moins d’une seconde restent indiscernables. Les documents `docs/history` et journaux rc4/rc5/rc7 sont historiques.

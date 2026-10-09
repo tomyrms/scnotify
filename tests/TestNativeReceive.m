@@ -148,6 +148,18 @@ int main(void) {@autoreleasepool {
     tracker=[[SNReceiveTracker alloc] initWithMonitoringStart:1800000000];
     m=msg(111,1);m.metadata=@{};CHECK([tracker newEventsInBatch:prepared(m,ME,NO) wallTime:1800000010].count==0);
     m.metadata=@{@"createdAt":@1799999999};CHECK([tracker newEventsInBatch:prepared(m,ME,NO) wallTime:1800000011].count==0);
+    // Voice then chat, delivered late/close together: callback time is not
+    // evidence that a different message created earlier belongs to history.
+    tracker=[[SNReceiveTracker alloc] initWithMonitoringStart:1800000000];
+    m=msg(112,999);m.isVoiceNote=YES;
+    CHECK([tracker newEventsInBatch:prepared(m,ME,NO) wallTime:1800000010].count==1);
+    SCNMessagingMessage *following=msg(113,1);following.metadata=@{@"createdAt":@1800000005};
+    CHECK([tracker newEventsInBatch:prepared(following,ME,NO) wallTime:1800000011].count==1);
+    following=msg(114,1);following.metadata=@{};
+    CHECK([tracker newEventsInBatch:prepared(following,ME,NO) wallTime:1800000020].count==0);
+    following.metadata=@{@"createdAt":@1800000015};
+    CHECK([tracker newEventsInBatch:prepared(following,ME,NO) wallTime:1800000023].count==1);
+    CHECK([tracker newEventsInBatch:prepared(following,ME,NO) wallTime:1800000024].count==0);
     m=msg(108,999);m.metadata=@{@"secret":@"PRIVATE_BODY_NOT_FOR_LOGS",@"currentUserId":ME};
     NSString *schema=[[NSString alloc] initWithData:[NSJSONSerialization dataWithJSONObject:decode(m) options:0 error:NULL] encoding:NSUTF8StringEncoding];
     CHECK(![schema containsString:@"PRIVATE_BODY_NOT_FOR_LOGS"]); // entire rejected batch has only event identities, no text

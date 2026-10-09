@@ -1,4 +1,4 @@
-// SnapNotify 4.0.0-rc7 — explicit event adapters, not notifications from hook names.
+// SnapNotify 4.0.0-rc8 — explicit event adapters, not notifications from hook names.
 #import <Foundation/Foundation.h>
 #import <UIKit/UIKit.h>
 #import <UserNotifications/UserNotifications.h>
@@ -12,18 +12,19 @@
 #import "Core/SNPresenceWire.h"
 #import <CommonCrypto/CommonDigest.h>
 #import "Core/SNCore.h"
+#import "Core/SNDeliveryState.h"
 #include <stdatomic.h>
 #include <time.h>
 #include <stdarg.h>
 #include <math.h>
 
-static NSString * const SNVersion=@"4.0.0-rc7";
+static NSString * const SNVersion=@"4.0.0-rc8";
 static dispatch_queue_t worker, logQueue;
 static NSMutableDictionary *users, *presence, *pendingEvents, *issuedRequests;
 static NSDictionary *config;
 static SNEventBuffer *notificationBuffer;
 static BOOL pumpScheduled;
-static NSUInteger notificationBufferOverflows, notificationFailures;
+static NSUInteger notificationBufferOverflows, notificationFailures, notificationTimeouts, lateNotificationAcceptances;
 static NSDictionary *backgroundDiagnostics, *notificationSettings;
 static double backgroundSince, lastReceive, lastMainHeartbeat;
 static NSString *lastKeepAliveStop=@"not-started";
@@ -203,12 +204,50 @@ static BOOL isForegroundSuppressed(void) {return atomic_load(&appState)==UIAppli
 static NSString *requestIdentifier(uint64_t ticket,uint64_t generation,BOOL native) {
     return [NSString stringWithFormat:@"snapnotify.%@.%llu.%@.%llu",session,(unsigned long long)generation,native?@"native":@"event",(unsigned long long)ticket];
 }
+/* A scheduling deadline frees a queue slot, but does not prove that iOS
+   rejected the request. Keep the attempt alive in its completion block. */
+static void removeOwnedRequest(NSString *rid) {
+    UNUserNotificationCenter *center=UNUserNotificationCenter.currentNotificationCenter;
+    [center removePendingNotificationRequestsWithIdentifiers:@[rid]];
+    [center removeDeliveredNotificationsWithIdentifiers:@[rid]];
+    [issuedRequests removeObjectForKey:rid];
+}
+static BOOL pendingTicket(NSString *key,uint64_t ticket) {
+    return [pendingEvents[key][@"ticket"] isEqual:@(ticket)];
+}
+static void cancelDelivery(NSDictionary *entry) {
+    NSMutableData *data=entry[@"delivery"];
+    if(data.length==sizeof(SNDeliveryState))sn_delivery_cancel(data.mutableBytes);
+}
+static void armDeliveryTimeout(NSString *key,uint64_t ticket,uint64_t generation,
+                               NSMutableData *data,NSString *rid,BOOL durable) {
+    unsigned attempt=((SNDeliveryState *)data.mutableBytes)->attempts;
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW,15*NSEC_PER_SEC),worker,^{
+        SNDeliveryState *state=data.mutableBytes;
+        if(generation!=queueGeneration||!pendingTicket(key,ticket))return;
+        if(!sn_delivery_timeout_attempt(state,attempt))return;
+        [pendingEvents removeObjectForKey:key];notificationTimeouts++;
+        if(!durable){
+            sn_delivery_cancel(state);sn_ledger_cancel(&ledger,ticket);
+            [[UNUserNotificationCenter currentNotificationCenter] removePendingNotificationRequestsWithIdentifiers:@[rid]];
+        }
+        /* Durable reservations survive up to 300s to avoid a duplicate
+           submission while acceptance is unknown. No automatic resend. */
+        logLine(@"NOTIF-TIMEOUT ticket=%llu outcome=%@",(unsigned long long)ticket,durable?@"unknown-preserved":@"ephemeral-cancelled");
+        scheduleNotificationPump();
+    });
+}
+static void commitAccepted(NSString *key,uint64_t ticket,double ttl) {
+    double now=nowTime();
+    if(!sn_ledger_commit(&ledger,ticket,now,ttl))sn_ledger_mark(&ledger,key.UTF8String,now,ttl);
+}
 static void deliver(NSDictionary *event,uint64_t ticket,uint64_t generation,unsigned attempt) {
     if(generation!=queueGeneration)return;
     NSString *key=eventKey(event);
-    /* STOP / account changes can cancel the pending name wait. */
-    if(![pendingEvents[key][@"ticket"] isEqual:@(ticket)])return;
+    if(!pendingTicket(key,ticket))return;
+    NSMutableData *data=pendingEvents[key][@"delivery"];
     if(!eventEnabled(event[@"kind"])||isForegroundSuppressed()) {
+        cancelDelivery(pendingEvents[key]);
         sn_ledger_commit(&ledger,ticket,nowTime(),60);[pendingEvents removeObjectForKey:key];scheduleNotificationPump();return;
     }
     NSString *name=resolveName(event[@"uid"]);
@@ -219,36 +258,36 @@ static void deliver(NSDictionary *event,uint64_t ticket,uint64_t generation,unsi
     if(@available(iOS 15.0,*)){if([event[@"kind"] isEqual:@"call"])content.interruptionLevel=UNNotificationInterruptionLevelTimeSensitive;}
     NSString *requestID=requestIdentifier(ticket,generation,NO);
     UNNotificationRequest *request=[UNNotificationRequest requestWithIdentifier:requestID content:content trigger:nil];
+    if(!sn_delivery_submit(data.mutableBytes))return;
     issuedRequests[requestID]=@(nowTime());
+    BOOL durable=[event[@"kind"] isEqual:@"message"]||[event[@"kind"] isEqual:@"snap"];
+    armDeliveryTimeout(key,ticket,generation,data,requestID,durable);
     logLine(@"NOTIF-REQUEST type=%@ uid=%@ name=%@ attempt=%u",event[@"kind"],shortID(event[@"uid"]),name?@"resolved":@"unresolved",attempt);
     [[UNUserNotificationCenter currentNotificationCenter] addNotificationRequest:request withCompletionHandler:^(NSError *error) {
         dispatch_async(worker,^{
-            if(generation!=queueGeneration){
-                [[UNUserNotificationCenter currentNotificationCenter] removePendingNotificationRequestsWithIdentifiers:@[requestID]];
-                [[UNUserNotificationCenter currentNotificationCenter] removeDeliveredNotificationsWithIdentifiers:@[requestID]];
+            SNDeliveryState *state=data.mutableBytes;
+            if(generation!=queueGeneration){sn_delivery_cancel(state);removeOwnedRequest(requestID);return;}
+            BOOL late=state->phase==SN_DELIVERY_TIMED_OUT;
+            BOOL retryable=!(error&&[error.domain isEqualToString:UNErrorDomain]&&error.code==UNErrorCodeNotificationsNotAllowed);
+            SNDeliveryResult result=sn_delivery_complete(state,error==nil,retryable);
+            if(result==SN_DELIVERY_DISCARD){removeOwnedRequest(requestID);scheduleNotificationPump();return;}
+            if(result==SN_DELIVERY_IGNORE)return;
+            if(result==SN_DELIVERY_RETRY){
+                logLine(@"NOTIF-RETRY type=%@ domain=%@ code=%ld",event[@"kind"],error.domain,(long)error.code);
+                dispatch_after(dispatch_time(DISPATCH_TIME_NOW,NSEC_PER_SEC),worker,^{deliver(event,ticket,generation,1);});
                 return;
             }
-            if(![pendingEvents[key][@"ticket"] isEqual:@(ticket)]){
-                [[UNUserNotificationCenter currentNotificationCenter] removePendingNotificationRequestsWithIdentifiers:@[requestID]];
-                [[UNUserNotificationCenter currentNotificationCenter] removeDeliveredNotificationsWithIdentifiers:@[requestID]];
-                [issuedRequests removeObjectForKey:requestID];scheduleNotificationPump();return;
-            }
-            if(error){
-                logLine(@"NOTIF-FAILED type=%@ domain=%@ code=%ld",event[@"kind"],error.domain,(long)error.code);
-                /* One bounded retry, same identifier. Do not lock out a failed
-                   notification or busy-loop when permission is denied. */
-                if(attempt==0 && !( [error.domain isEqualToString:UNErrorDomain] && error.code==UNErrorCodeNotificationsNotAllowed)){
-                    dispatch_after(dispatch_time(DISPATCH_TIME_NOW,NSEC_PER_SEC),worker,^{deliver(event,ticket,generation,1);});
-                }else{
-                    sn_ledger_cancel(&ledger,ticket);[pendingEvents removeObjectForKey:key];notificationFailures++;
-                    NSString *pk=[@[event[@"kind"],event[@"conversation"],event[@"uid"]] componentsJoinedByString:@"|"];
-                    SNPresence *ps=[presence[pk] mutableBytes];
-                    if(ps && [[NSString stringWithFormat:@"session-%llu",(unsigned long long)ps->session] isEqual:event[@"event"]]){ps->active=false;ps->notified=false;}
-                }
-            }else{
-                double ttl=[event[@"kind"] isEqual:@"call"]?300:([event[@"kind"] isEqual:@"typing"]||[event[@"kind"] isEqual:@"peek"])?60:86400;
-                sn_ledger_commit(&ledger,ticket,nowTime(),ttl);[pendingEvents removeObjectForKey:key];postedCount++;
-                logLine(@"NOTIF-ACCEPTED type=%@ ticket=%llu",event[@"kind"],(unsigned long long)ticket);
+            if(pendingTicket(key,ticket))[pendingEvents removeObjectForKey:key];
+            if(result==SN_DELIVERY_FAIL){
+                sn_ledger_cancel(&ledger,ticket);[issuedRequests removeObjectForKey:requestID];notificationFailures++;
+                logLine(@"NOTIF-FAILED type=%@ domain=%@ code=%ld late=%d",event[@"kind"],error.domain,(long)error.code,late);
+                NSString *pk=[@[event[@"kind"],event[@"conversation"],event[@"uid"]] componentsJoinedByString:@"|" ];
+                SNPresence *ps=[presence[pk] mutableBytes];
+                if(ps&&[[NSString stringWithFormat:@"session-%llu",(unsigned long long)ps->session] isEqual:event[@"event"]]){ps->active=false;ps->notified=false;}
+            }else if(result==SN_DELIVERY_ACCEPT){
+                double ttl=[event[@"kind"] isEqual:@"call"]?300:durable?86400:60;
+                commitAccepted(key,ticket,ttl);postedCount++;if(late)lateNotificationAcceptances++;
+                logLine(@"NOTIF-ACCEPTED type=%@ ticket=%llu late=%d",event[@"kind"],(unsigned long long)ticket,late);
             }
             scheduleNotificationPump();
         });
@@ -260,20 +299,19 @@ static void beginEvent(NSDictionary *event) {
     if(account.length&&[uid isEqual:account]){logLine(@"EVENT-DROP reason=self type=%@",kind);return;}
     if(!eventEnabled(kind))return;
     NSString *key=eventKey(event);double now=nowTime();
-    uint64_t ticket=sn_ledger_reserve(&ledger,key.UTF8String,now,15);
-    if(!ticket){logLine(@"EVENT-DROP reason=duplicate type=%@ uid=%@",kind,shortID(uid));return;}
-    if(isForegroundSuppressed() || ([event[@"observedInForeground"] boolValue]&&!enabled(@"NotifyInForeground"))) {
+    /* The in-flight slot is authoritative even if a short ledger lease
+       expired during name resolution or a retry. Never replace its ticket. */
+    if(pendingEvents[key])return;
+    BOOL durable=[kind isEqual:@"message"]||[kind isEqual:@"snap"];
+    uint64_t ticket=sn_ledger_reserve(&ledger,key.UTF8String,now,durable?300:15);
+    if(!ticket){logLine(@"EVENT-DROP reason=duplicate-or-capacity type=%@ uid=%@",kind,shortID(uid));return;}
+    if(isForegroundSuppressed()||([event[@"observedInForeground"] boolValue]&&!enabled(@"NotifyInForeground"))) {
         sn_ledger_commit(&ledger,ticket,now,([kind isEqual:@"call"]?300:60));
         logLine(@"EVENT-OBSERVED type=%@ foreground=1",kind);return;
     }
-    pendingEvents[key]=@{@"ticket":@(ticket),@"event":event,@"created":@(now)};
+    NSMutableData *data=[NSMutableData dataWithLength:sizeof(SNDeliveryState)];
+    pendingEvents[key]=@{@"ticket":@(ticket),@"event":event,@"created":@(now),@"delivery":data};
     uint64_t generation=queueGeneration;
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW,15*NSEC_PER_SEC),worker,^{
-        if(generation==queueGeneration&&[pendingEvents[key][@"ticket"] isEqual:@(ticket)]){
-            sn_ledger_cancel(&ledger,ticket);[pendingEvents removeObjectForKey:key];notificationFailures++;
-            logLine(@"NOTIF-TIMEOUT type=%@",kind);scheduleNotificationPump();
-        }
-    });
     double wait=SNName(config[@"Aliases"][uid])||SNName(users[uid][@"name"])?0:setting(@"NameWaitSeconds",0.8,0,2);
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW,(int64_t)(wait*NSEC_PER_SEC)),worker,^{deliver(event,ticket,generation,0);});
 }
@@ -302,7 +340,7 @@ static void notifyEvent(NSDictionary *event) {
 static void cancelCall(SNCall call) {
     NSDictionary *e=@{@"kind":@"call",@"uid":@(call.sender),@"conversation":@(call.conversation),@"event":@(call.call)};
     NSString *key=eventKey(e);[notificationBuffer removeKey:key];NSDictionary *pending=pendingEvents[key];
-    if(pending){sn_ledger_cancel(&ledger,[pending[@"ticket"] unsignedLongLongValue]);[pendingEvents removeObjectForKey:key];}
+    if(pending){cancelDelivery(pending);sn_ledger_cancel(&ledger,[pending[@"ticket"] unsignedLongLongValue]);[pendingEvents removeObjectForKey:key];}
     sn_ledger_mark(&ledger,key.UTF8String,nowTime(),300);scheduleNotificationPump();
     logLine(@"CALL-STOP uid=%@",shortID(@(call.sender)));
 }
@@ -376,6 +414,7 @@ static void cancelPresenceWait(NSString *kind,NSString *cid,NSString *uid,SNPres
     [notificationBuffer removeKey:key];
     if(entry){
         uint64_t ticket=[entry[@"ticket"] unsignedLongLongValue];
+        cancelDelivery(entry);
         sn_ledger_cancel(&ledger,ticket);[pendingEvents removeObjectForKey:key];
         NSString *rid=requestIdentifier(ticket,queueGeneration,NO);
         [[UNUserNotificationCenter currentNotificationCenter] removePendingNotificationRequestsWithIdentifiers:@[rid]];
@@ -517,7 +556,8 @@ static void consumeNativeNotice(NSDictionary *notice, BOOL foreground) {
     nativeNoticeCandidates++;
     if(!enabled(@"Enabled")||!enabled(@"NativeNotificationBridge")||(!enabled(@"MessageNotifications")&&!enabled(@"SnapNotifications"))||
        isForegroundSuppressed()||(foreground&&!enabled(@"NotifyInForeground")))return;
-    NSArray *parts=@[notice[@"id"]?:@"",notice[@"title"],notice[@"body"]];
+    NSString *identity=notice[@"id"]?:notice[@"localID"];if(!identity.length)return;
+    NSArray *parts=@[notice[@"id"]?@"stable":@"local",identity,notice[@"title"],notice[@"body"]];
     NSData *encoded=[NSJSONSerialization dataWithJSONObject:parts options:0 error:NULL];if(!encoded)return;
     unsigned char digest[CC_SHA256_DIGEST_LENGTH];CC_SHA256(encoded.bytes,(CC_LONG)encoded.length,digest);
     NSMutableString *key=[NSMutableString stringWithString:@"host-notice|"];
@@ -527,34 +567,49 @@ static void consumeNativeNotice(NSDictionary *notice, BOOL foreground) {
     }
     scheduleNotificationPump();
 }
-static void beginNativeNotice(NSDictionary *notice,NSString *key,BOOL foreground) {
-    if(!enabled(@"Enabled")||!enabled(@"NativeNotificationBridge")||(!enabled(@"MessageNotifications")&&!enabled(@"SnapNotifications"))||
-       isForegroundSuppressed()||(foreground&&!enabled(@"NotifyInForeground")))return;
-    uint64_t ticket=sn_ledger_reserve(&ledger,key.UTF8String,nowTime(),15);if(!ticket)return;
-    uint64_t generation=queueGeneration;
-    pendingEvents[key]=@{@"ticket":@(ticket),@"created":@(nowTime())};
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW,15*NSEC_PER_SEC),worker,^{
-        if(generation==queueGeneration&&[pendingEvents[key][@"ticket"] isEqual:@(ticket)]){
-            sn_ledger_cancel(&ledger,ticket);[pendingEvents removeObjectForKey:key];notificationFailures++;
-            logLine(@"NOTIF-TIMEOUT type=native");scheduleNotificationPump();
-        }
-    });
+static void deliverNativeNotice(NSDictionary *notice,NSString *key,uint64_t ticket,uint64_t generation,unsigned attempt) {
+    if(generation!=queueGeneration||!pendingTicket(key,ticket))return;
+    NSMutableData *data=pendingEvents[key][@"delivery"];
+    if(!enabled(@"Enabled")||!enabled(@"NativeNotificationBridge")||(!enabled(@"MessageNotifications")&&!enabled(@"SnapNotifications"))||isForegroundSuppressed()) {
+        cancelDelivery(pendingEvents[key]);sn_ledger_cancel(&ledger,ticket);
+        [pendingEvents removeObjectForKey:key];scheduleNotificationPump();return;
+    }
     UNMutableNotificationContent *content=[UNMutableNotificationContent new];
     content.title=notice[@"title"];content.body=notice[@"body"];content.sound=UNNotificationSound.defaultSound;
     content.threadIdentifier=@"snapnotify.native";
     content.userInfo=@{@"scnotify":@YES,@"version":SNVersion,@"kind":@"native"};
     NSString *rid=requestIdentifier(ticket,generation,YES);
-    issuedRequests[rid]=@(nowTime());
-    logLine(@"NATIVE-NOTICE-REQUEST stableID=%d text-redacted=1",notice[@"id"]!=nil);
+    if(!sn_delivery_submit(data.mutableBytes))return;
+    issuedRequests[rid]=@(nowTime());armDeliveryTimeout(key,ticket,generation,data,rid,YES);
+    logLine(@"NATIVE-NOTICE-REQUEST stableID=%d attempt=%u text-redacted=1",notice[@"id"]!=nil,attempt);
     [[UNUserNotificationCenter currentNotificationCenter] addNotificationRequest:[UNNotificationRequest requestWithIdentifier:rid content:content trigger:nil] withCompletionHandler:^(NSError *error){
         dispatch_async(worker,^{
-            if(generation!=queueGeneration||![pendingEvents[key][@"ticket"] isEqual:@(ticket)]){[[UNUserNotificationCenter currentNotificationCenter] removePendingNotificationRequestsWithIdentifiers:@[rid]];[[UNUserNotificationCenter currentNotificationCenter] removeDeliveredNotificationsWithIdentifiers:@[rid]];return;}
-            [pendingEvents removeObjectForKey:key];
-            if(error){sn_ledger_cancel(&ledger,ticket);notificationFailures++;logLine(@"NATIVE-NOTICE-FAILED domain=%@ code=%ld",error.domain,(long)error.code);}
-            else{sn_ledger_commit(&ledger,ticket,nowTime(),notice[@"id"]?300:1);nativeNoticeAccepted++;postedCount++;logLine(@"NATIVE-NOTICE-ACCEPTED");}
+            SNDeliveryState *state=data.mutableBytes;
+            if(generation!=queueGeneration){sn_delivery_cancel(state);removeOwnedRequest(rid);return;}
+            BOOL late=state->phase==SN_DELIVERY_TIMED_OUT;
+            BOOL retryable=!(error&&[error.domain isEqualToString:UNErrorDomain]&&error.code==UNErrorCodeNotificationsNotAllowed);
+            SNDeliveryResult result=sn_delivery_complete(state,error==nil,retryable);
+            if(result==SN_DELIVERY_DISCARD){removeOwnedRequest(rid);scheduleNotificationPump();return;}
+            if(result==SN_DELIVERY_IGNORE)return;
+            if(result==SN_DELIVERY_RETRY){
+                logLine(@"NATIVE-NOTICE-RETRY domain=%@ code=%ld",error.domain,(long)error.code);
+                dispatch_after(dispatch_time(DISPATCH_TIME_NOW,NSEC_PER_SEC),worker,^{deliverNativeNotice(notice,key,ticket,generation,1);});return;
+            }
+            if(pendingTicket(key,ticket))[pendingEvents removeObjectForKey:key];
+            if(result==SN_DELIVERY_FAIL){sn_ledger_cancel(&ledger,ticket);[issuedRequests removeObjectForKey:rid];notificationFailures++;logLine(@"NATIVE-NOTICE-FAILED domain=%@ code=%ld late=%d",error.domain,(long)error.code,late);}
+            else if(result==SN_DELIVERY_ACCEPT){commitAccepted(key,ticket,notice[@"id"]?300:1);nativeNoticeAccepted++;postedCount++;if(late)lateNotificationAcceptances++;logLine(@"NATIVE-NOTICE-ACCEPTED late=%d",late);}
             scheduleNotificationPump();
         });
     }];
+}
+static void beginNativeNotice(NSDictionary *notice,NSString *key,BOOL foreground) {
+    if(!enabled(@"Enabled")||!enabled(@"NativeNotificationBridge")||(!enabled(@"MessageNotifications")&&!enabled(@"SnapNotifications"))||
+       isForegroundSuppressed()||(foreground&&!enabled(@"NotifyInForeground")))return;
+    if(pendingEvents[key])return;
+    uint64_t ticket=sn_ledger_reserve(&ledger,key.UTF8String,nowTime(),300);if(!ticket)return;
+    NSMutableData *data=[NSMutableData dataWithLength:sizeof(SNDeliveryState)];
+    pendingEvents[key]=@{@"ticket":@(ticket),@"created":@(nowTime()),@"delivery":data};
+    deliverNativeNotice(notice,key,ticket,queueGeneration,0);
 }
 static void observeHostNotice(id payload) {
     if(atomic_fetch_add(&receiveInflight,1)>=1024){atomic_fetch_sub(&receiveInflight,1);atomic_fetch_add(&receiveDrops,1);return;}
@@ -729,7 +784,7 @@ static void writeStatus(void) {
         NSString *oldest=[[issuedRequests keysSortedByValueUsingComparator:^NSComparisonResult(NSNumber *a,NSNumber *b){return [a compare:b];}] firstObject];
         [issuedRequests removeObjectForKey:oldest];
     }
-    NSDictionary *status=@{@"version":SNVersion,@"state":stateLabel(),@"knownUsers":@(users.count),@"nameHits":@(nameHits),@"nameMisses":@(nameMisses),@"wirePackets":@(wireCount),@"unsupportedWirePackets":@(malformedCount),@"packetDrops":@(atomic_load(&packetDrops)),@"notificationRequestsAccepted":@(postedCount),@"secondsSinceWire":lastWire?@(now-lastWire):@(-1),@"apnsRegisteredThisRun":@(nativePushRegistered),@"apnsDeliveryCallbacks":@(apnsCallbacks),@"nativeNoticeCandidates":@(nativeNoticeCandidates),@"nativeNoticesAccepted":@(nativeNoticeAccepted),@"experimentalKeepAlive":@(atomic_load(&experiments)),@"onDeviceValidationRequired":@YES,@"receiveCallbacks":@(receivedCallbacks),@"decodedMessages":@(decodedMessages),@"decodedSnaps":@(decodedSnaps),@"snapshotRecordsSuppressed":@(snapshotSuppressed),@"receiveQueueDrops":@(atomic_load(&receiveDrops)),@"localAccountKnown":@(account.length>0),@"notificationBacklog":@(notificationBuffer.count),@"notificationInFlight":@(pendingEvents.count),@"notificationBufferOverflows":@(notificationBufferOverflows),@"notificationFailures":@(notificationFailures),@"notifyInForeground":@(enabled(@"NotifyInForeground")),@"secondsSinceReceive":lastReceive?@(now-lastReceive):@(-1),@"notificationSettings":notificationSettings?:@{},@"background":backgroundDiagnostics?:@{},@"presenceActivityPackets":@(presenceActivityPackets),@"presenceActivityRejected":@(presenceActivityRejected),@"compositionUnknown":@(compositionUnknown)};
+    NSDictionary *status=@{@"version":SNVersion,@"state":stateLabel(),@"knownUsers":@(users.count),@"nameHits":@(nameHits),@"nameMisses":@(nameMisses),@"wirePackets":@(wireCount),@"unsupportedWirePackets":@(malformedCount),@"packetDrops":@(atomic_load(&packetDrops)),@"notificationRequestsAccepted":@(postedCount),@"secondsSinceWire":lastWire?@(now-lastWire):@(-1),@"apnsRegisteredThisRun":@(nativePushRegistered),@"apnsDeliveryCallbacks":@(apnsCallbacks),@"nativeNoticeCandidates":@(nativeNoticeCandidates),@"nativeNoticesAccepted":@(nativeNoticeAccepted),@"experimentalKeepAlive":@(atomic_load(&experiments)),@"onDeviceValidationRequired":@YES,@"receiveCallbacks":@(receivedCallbacks),@"decodedMessages":@(decodedMessages),@"decodedSnaps":@(decodedSnaps),@"snapshotRecordsSuppressed":@(snapshotSuppressed),@"receiveQueueDrops":@(atomic_load(&receiveDrops)),@"localAccountKnown":@(account.length>0),@"notificationBacklog":@(notificationBuffer.count),@"notificationInFlight":@(pendingEvents.count),@"notificationBufferOverflows":@(notificationBufferOverflows),@"notificationFailures":@(notificationFailures),@"notificationTimeouts":@(notificationTimeouts),@"lateNotificationAcceptances":@(lateNotificationAcceptances),@"notifyInForeground":@(enabled(@"NotifyInForeground")),@"secondsSinceReceive":lastReceive?@(now-lastReceive):@(-1),@"notificationSettings":notificationSettings?:@{},@"background":backgroundDiagnostics?:@{},@"presenceActivityPackets":@(presenceActivityPackets),@"presenceActivityRejected":@(presenceActivityRejected),@"compositionUnknown":@(compositionUnknown)};
     NSData *json=[NSJSONSerialization dataWithJSONObject:status options:NSJSONWritingPrettyPrinted error:NULL];
     [json writeToFile:[documents stringByAppendingPathComponent:@"snapnotify_status.json"] options:NSDataWritingAtomic|NSDataWritingFileProtectionCompleteUntilFirstUserAuthentication error:NULL];
     NSDictionary *schema=@{@"version":SNVersion,@"hooks":receiveHooks?:@[],@"sources":[receiveSources copy],@"containsMessageBodies":@NO,@"transportSources":[transportSources copy]};

@@ -88,6 +88,26 @@ int main(void) {
         NSMutableDictionary *dual=[m mutableCopy];dual[@"messageDescriptor"]=dual[@"descriptor"];dual[@"descriptor"]=@{@"name":@"SchemaOnly"};CHECK(events(dual).count==1);
         CHECK(events(@[m,message(C,@2,@"CHAT")]).count==2);
         CHECK(events(@{@"message":m,@"messages":@[m]}).count==1);
+        /* Multiple representations of one callback must contribute missing
+           metadata regardless of traversal order, with one output per ID. */
+        NSMutableDictionary *sparse=message(C,@41,@"CHAT");sparse[@"metadata"]=@{};
+        NSMutableDictionary *complete=message(C,@41,@"VOICE_NOTE");complete[@"isIncoming"]=@YES;complete[@"senderDisplayName"]=@"Friend";
+        for(NSArray *copies in @[@[sparse,complete],@[complete,sparse]]) {
+            NSArray *decoded=events(copies);CHECK(decoded.count==1);
+            CHECK([decoded[0][@"timestamp"] doubleValue]==1800000000);
+            CHECK([decoded[0][@"incoming"] boolValue]);CHECK([decoded[0][@"subtype"] isEqual:@"voice"]);
+            CHECK([decoded[0][@"name"] isEqual:@"Friend"]);
+        }
+        CHECK(events(@[sparse,complete,message(C,@42,@"CHAT")]).count==2);
+        NSMutableDictionary *firstDate=message(C,@43,@"CHAT");
+        NSMutableDictionary *differentDate=message(C,@43,@"VOICE_NOTE");
+        differentDate[@"metadata"]=@{@"timestamp":@1799999000,@"isIncoming":@YES};
+        NSDictionary *conflictingBatch=batch(@[firstDate,differentDate]);
+        CHECK([conflictingBatch[@"events"] count]==1);
+        NSDictionary *unchanged=conflictingBatch[@"events"][0];
+        CHECK([unchanged[@"timestamp"] doubleValue]==1800000000);
+        CHECK(unchanged[@"incoming"]==nil);CHECK(unchanged[@"subtype"]==nil);
+        CHECK([conflictingBatch[@"rejected"][@"conflicting-duplicate-time"] integerValue]==1);
         m=message(C,@1,@"CHAT");m[@"outgoing"]=@YES;m[@"isOutgoing"]=@NO;CHECK(reason(m,@"outgoing"));
         m=message(C,@1,@"CHAT");m[@"metadata"]=@{@"isFromMe":@YES};CHECK(events(m).count==0);
         m=message(C,@1,@"CHAT");m[@"isSender"]=@NO;m[@"metadata"]=@{@"isSender":@YES};CHECK(reason(m,@"outgoing"));
@@ -180,6 +200,36 @@ int main(void) {
         CHECK([tracker newEventsInSnapshot:incomplete wallTime:1800000002].count==0);
         CHECK([tracker newEventsInSnapshot:completed wallTime:1800000003].count==300);
         CHECK([tracker newEventsInSnapshot:completed wallTime:1800000004].count==0);
+        /* Keep the original monitoring threshold after a delayed first
+           observation: subsequent IDs may have been created before it. */
+        tracker=[[SNReceiveTracker alloc] initWithMonitoringStart:1800000000];
+        NSDictionary *voice=@{@"conversation":C,@"event":@"voice",@"timestamp":@1800000001,@"incoming":@YES};
+        NSDictionary *chat=@{@"conversation":C,@"event":@"chat",@"timestamp":@1800000005,@"incoming":@YES};
+        CHECK([tracker newEventsInSnapshot:@[voice] wallTime:1800000010].count==1);
+        CHECK([tracker newEventsInSnapshot:@[chat] wallTime:1800000011].count==1);
+        CHECK([tracker newEventsInSnapshot:@[voice,chat] wallTime:1800000012].count==0);
+        NSMutableDictionary *late=[@{@"conversation":C,@"event":@"late",@"incoming":@YES} mutableCopy];
+        CHECK([tracker newEventsInSnapshot:@[late] wallTime:1800000020].count==0);
+        late[@"timestamp"]=@1800000015;
+        CHECK([tracker newEventsInSnapshot:@[late] wallTime:1800000023].count==1);
+        CHECK([tracker newEventsInSnapshot:@[late] wallTime:1800000024].count==0);
+        /* Late type decoding follows the same stable threshold. Old initial
+           history still stays silent, and fresh replays still deduplicate. */
+        CHECK([tracker newEventsInBatch:batch(message(C,@55,@983)) wallTime:1800000030].count==0);
+        m=message(C,@55,@"CHAT");m[@"metadata"]=@{@"timestamp":@1800000025,@"isIncoming":@YES};
+        CHECK([tracker newEventsInBatch:batch(m) wallTime:1800000031].count==1);
+        CHECK([tracker newEventsInBatch:batch(m) wallTime:1800000032].count==0);
+        m=message(C,@56,@"CHAT");m[@"metadata"]=@{@"timestamp":@1799999999,@"isIncoming":@YES};
+        CHECK([tracker newEventsInBatch:batch(m) wallTime:1800000033].count==0);
+        /* Without an explicit monitoring start, the first snapshot remains a
+           silent baseline while later metadata retains that baseline gate. */
+        tracker=[SNReceiveTracker new];
+        CHECK([tracker newEventsInSnapshot:@[voice] wallTime:1800000010].count==0);
+        [late removeObjectForKey:@"timestamp"];
+        CHECK([tracker newEventsInSnapshot:@[late] wallTime:1800000020].count==0);
+        late[@"timestamp"]=@1800000015;
+        CHECK([tracker newEventsInSnapshot:@[late] wallTime:1800000023].count==1);
+        CHECK([tracker newEventsInSnapshot:@[voice] wallTime:1800000024].count==0);
         __block NSUInteger hits=0;SEL sel=@selector(onMessagesReceived:conversation:metadata:completion:);
         CHECK(SNInstallHook(RXHook.class,sel,^(id self,NSArray *args,__unused id result){hits++;CHECK([(RXHook *)self calls]==1);CHECK(args.count==4);CHECK([args[1] isEqual:C]);CHECK(args[3]==NSNull.null);}));
         RXHook *hook=[RXHook new];[hook onMessagesReceived:@[@1] conversation:C metadata:@{} completion:nil];CHECK(hits==1);CHECK(hook.calls==1);

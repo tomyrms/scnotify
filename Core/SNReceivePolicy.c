@@ -71,6 +71,13 @@ double sn_receive_seconds(double t) {
 bool sn_receive_time_valid(double t,double now) {
     return isfinite(t)&&isfinite(now)&&t>0&&now>0&&now-t<=300&&t-now<=60;
 }
+double sn_receive_snapshot_minimum(double monitoring_start,double baseline_time) {
+    /* Arrivals may be reordered, and metadata can follow a message several
+       seconds later. Only the session/baseline start establishes old history;
+       moving the gate to a later callback silently drops fresh messages. */
+    if(isfinite(monitoring_start)&&monitoring_start>0)return monitoring_start;
+    return isfinite(baseline_time)&&baseline_time>0?baseline_time-1:NAN;
+}
 
 SNReceiveKind sn_receive_native_content_kind(const char *cls,const char *version,int64_t raw) {
     if(!cls||!version||strcmp(cls,"SCNMessagingMessageContent")||strcmp(version,"14.17.1"))return SN_RX_NONE;

@@ -17,6 +17,35 @@ static NSString *noticeText(id value, NSUInteger limit) {
 static NSString *firstText(id object, NSArray *keys, NSUInteger limit) {
     for(NSString *key in keys){NSString *text=noticeText(SNRead(object,key),limit);if(text)return text;}return nil;
 }
+/* Content alone is not an event identity: consecutive chats can produce
+   identical banners. Share a short-lived token only for the exact text-bearing
+   object seen through overlapping presentation hooks. Pointer personality is
+   essential here; NSDictionary equality would merge distinct notices again.
+   Weak keys neither extend host object lifetimes nor survive address reuse. */
+static NSString *localNoticeIdentity(id object,NSString *title,NSString *body) {
+    static NSMapTable *identities;static dispatch_once_t once;
+    dispatch_once(&once,^{
+        identities=[NSMapTable mapTableWithKeyOptions:NSPointerFunctionsWeakMemory|NSPointerFunctionsObjectPointerPersonality
+                                        valueOptions:NSPointerFunctionsStrongMemory];
+    });
+    @synchronized(identities) {
+        double now=NSProcessInfo.processInfo.systemUptime;
+        NSDictionary *old=[identities objectForKey:object];
+        double created=[old[@"created"] doubleValue];
+        if(old&&now>=created&&now-created<1.0&&
+           [old[@"title"] isEqual:title]&&[old[@"body"] isEqual:body])return old[@"token"];
+        /* A changed snapshot or later reuse of a mutable host model is a new
+           notice. Bound retained metadata even if host models stay alive. */
+        if(!old&&identities.count>=2048){
+            id evicted=identities.keyEnumerator.nextObject;
+            if(evicted)[identities removeObjectForKey:evicted];
+            else [identities removeAllObjects];
+        }
+        NSString *token=NSUUID.UUID.UUIDString;
+        [identities setObject:@{@"title":[title copy],@"body":[body copy],@"token":token,@"created":@(now)} forKey:object];
+        return token;
+    }
+}
 static NSDictionary *noticeAtDepth(id object, NSString *inheritedIdentity, NSHashTable *seen,
                                   unsigned depth, unsigned *budget) {
     if(!object||object==NSNull.null||depth>=4||!*budget||[seen containsObject:object])return nil;
@@ -34,6 +63,7 @@ static NSDictionary *noticeAtDepth(id object, NSString *inheritedIdentity, NSHas
     if(title.length&&body.length) {
         NSMutableDictionary *notice=[@{@"title":title,@"body":body} mutableCopy];
         if(identity)notice[@"id"]=identity;
+        else notice[@"localID"]=localNoticeIdentity(object,title,body);
         return [notice copy];
     }
     /* Null or unsupported aliases must not hide another supported envelope.

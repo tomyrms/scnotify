@@ -33,6 +33,7 @@ int main(void) {
     CHECK([SNHostNotice(n)[@"title"] isEqual:@"Test contact"]);
     CHECK([SNHostNotice(n)[@"body"] isEqual:@"Nouveau chat"]);
     CHECK([SNHostNotice(n)[@"id"] isEqual:@"notice-1"]);
+    CHECK(SNHostNotice(n)[@"localID"]==nil);
     CHECK(SNHostNotice(@{@"body":@"snap"})==nil); /* Words alone never constitute a notice. */
     CHECK(SNHostNotice(@{@"title":@"Test",@"body":@123})==nil);
     CHECK(SNHostNotice(@{@"title":@"Test",@"body":@"Chat",@"isOutgoing":@YES})==nil);
@@ -43,6 +44,51 @@ int main(void) {
     CHECK([SNHostNotice(@{@"notificationContent":@{},@"notification":n})[@"id"] isEqual:@"notice-1"]);
     CHECK([SNHostNotice(@{@"notificationContent":@"unavailable",@"content":n})[@"id"] isEqual:@"notice-1"]);
     NSDictionary *noticeContent=@{@"title":@"Test contact",@"body":@"Nouveau chat"};
+    /* Equal banner text is not enough to merge two separate incoming chats. */
+    NSMutableDictionary *first=[noticeContent mutableCopy],*second=[noticeContent mutableCopy];
+    CHECK(first!=second);CHECK([first isEqual:second]);
+    NSString *firstID=SNHostNotice(first)[@"localID"];
+    CHECK(firstID.length>0);CHECK(SNHostNotice(first)[@"id"]==nil);
+    CHECK(![firstID isEqual:SNHostNotice(second)[@"localID"]]);
+    CHECK([firstID isEqual:SNHostNotice(first)[@"localID"]]);
+    CHECK([firstID isEqual:SNHostNotice(@{@"content":first})[@"localID"]]);
+    CHECK([firstID isEqual:SNHostNotice(@{@"notification":first})[@"localID"]]);
+    /* Mutating a reused model, even back to an earlier value, starts a new
+       event. Returned text is copied independently from the host model. */
+    NSMutableString *mutableBody=[NSMutableString stringWithString:@"Nouveau chat"];
+    first[@"body"]=mutableBody;NSDictionary *beforeMutation=SNHostNotice(first);
+    CHECK([beforeMutation[@"localID"] isEqual:firstID]);
+    [mutableBody appendString:@" suivant"];
+    NSDictionary *afterMutation=SNHostNotice(first);
+    CHECK([beforeMutation[@"body"] isEqual:@"Nouveau chat"]);
+    CHECK(![beforeMutation[@"localID"] isEqual:afterMutation[@"localID"]]);
+    [mutableBody setString:@"Nouveau chat"];
+    CHECK(![firstID isEqual:SNHostNotice(first)[@"localID"]]);
+    NSString *beforeTitleChange=SNHostNotice(first)[@"localID"];
+    first[@"title"]=@"Other contact";
+    CHECK(![beforeTitleChange isEqual:SNHostNotice(first)[@"localID"]]);
+    NSString *beforeReuse=SNHostNotice(first)[@"localID"];
+    [NSThread sleepForTimeInterval:1.01];
+    CHECK(![beforeReuse isEqual:SNHostNotice(first)[@"localID"]]);
+    /* The identity cache must not retain native presentation models. */
+    __weak NSDictionary *releasedNotice=nil;
+    @autoreleasepool {
+        NSMutableDictionary *temporary=[noticeContent mutableCopy];releasedNotice=temporary;
+        CHECK(SNHostNotice(temporary)[@"localID"]!=nil);
+    }
+    CHECK(releasedNotice==nil);
+    /* Several host callbacks may arrive on different queues. Distinct
+       equal-content objects must still all produce distinct local tokens. */
+    NSMutableSet *parallelIDs=[NSMutableSet set];
+    dispatch_apply(128,dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT,0),^(size_t i){
+        (void)i;
+        @autoreleasepool {
+            NSDictionary *parallelNotice=[noticeContent mutableCopy];
+            NSString *token=SNHostNotice(parallelNotice)[@"localID"];
+            @synchronized(parallelIDs){[parallelIDs addObject:token?:@"missing"];}
+        }
+    });
+    CHECK(parallelIDs.count==128);CHECK(![parallelIDs containsObject:@"missing"]);
     CHECK([SNHostNotice(@{@"notificationId":@"envelope-1",@"content":noticeContent})[@"id"] isEqual:@"envelope-1"]);
     CHECK([SNHostNotice(@{@"notificationId":@"envelope-1",@"content":n})[@"id"] isEqual:@"notice-1"]);
     CHECK(SNHostNotice(@{@"isHistorical":@YES,@"content":n})==nil);

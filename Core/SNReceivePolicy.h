@@ -21,6 +21,9 @@ SNReceiveKind sn_receive_hint(const char *selector);
 /* Unix seconds/ms/us/ns -> seconds. NaN means invalid. */
 double sn_receive_seconds(double raw);
 bool sn_receive_time_valid(double seconds, double wall_now);
+/* Stable creation-time gate for snapshot callbacks. Callback arrival and
+   metadata completion times must never advance this gate. */
+double sn_receive_snapshot_minimum(double monitoring_start, double baseline_time);
 #ifdef __cplusplus
 }
 #endif
