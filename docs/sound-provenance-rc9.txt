@@ -1,0 +1,22 @@
+SnapNotify rc9 - read-only Snapchat sound provenance audit
+Input: Iris_SnapNotify_v1.ipa
+Bundle: com.toyopagroup.picaboo
+Version: 14.17.1
+Only sound assets, Info.plist identity, and narrowly relevant executable/locale strings were inspected. IPA and source were not modified.
+
+Conclusion
+Use generic_push.mp3 for the built-in default Snapchat notification sound.
+message_push_bf_sound.mp3 is the separate best-friend override; it should not replace the standard sound globally.
+
+Verified binary evidence (arm64 VM addresses; image base 0x100000000)
+1. Sound-name lookup function at 0x1082fc970 accepts IDs 0..12 and indexes a pointer table at 0x10f410b60. ID 0 selects generic_push.mp3. IDs 1..12 select named custom sound assets.
+2. Matching sound-label lookup at 0x1082fc990 maps ID 0 to 0x1082fca94, which loads custom_sound_notifications_default_sound_name. The English SCCustomSoundNotifications.strings value is 'Default Sound'. This directly links generic_push.mp3 to the default entry, rather than relying only on its filename.
+3. -[SCAppNotification _getSoundNameWithBestFriendIds:bestFriendSoundEnabled:customSoundEnabled:] begins at 0x1082f6c14. The bestFriendSoundEnabled argument is saved in x21. At 0x1082f6dd0 a false flag skips the override; code then checks that the best-friend collection has entries and contains this notification's senderId (selector stubs resolve to count, senderId, containsObject:). At 0x1082f6e10..0x1082f6e20 it selects message_push_bf_sound.mp3 only when membership is true. Its CFString pointer is stored at 0x10f410b58.
+4. generic_push.mp3 is also present among local-notification scheduling service strings, but string adjacency alone was not used as definitive proof.
+
+Limits
+This is static resource and control-flow inspection, not an on-device listening or delivered-notification test. A user-selected Snapchat+ sound or a best-friend override can differ from the app's built-in default. The audit does not prove successful playback of the converted resource through iOS notification APIs; that remains a separate integration/runtime check.
+
+Source asset hashes
+generic_push.mp3: 2811 bytes; SHA-256 029c01210a6821a4b53615387b1f743fa90a79d7aaa6d4db9d69dbd52c448643
+message_push_bf_sound.mp3: 2089 bytes; SHA-256 8bb480521787114d98472f29485afdd525efa54f95495ba314d904dbece26dcc

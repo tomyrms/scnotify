@@ -36,5 +36,7 @@
 	<array/>
 	<key>NativeNotificationBridge</key>
 	<true/>
+	<key>NotificationSound</key>
+	<string>snapchat</string>
 </dict>
 </plist>

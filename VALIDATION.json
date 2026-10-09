@@ -1,21 +1,23 @@
 {
-  "version": "4.0.0-rc8",
-  "base_archive": "SnapNotify-v4.0.0-rc7.zip",
-  "base_archive_sha256": "7ccf4b42894775c079b3fb9026cb801ea61896e4360c6765704aca983c3859f2",
+  "version": "4.0.0-rc9",
+  "base_archive": "SnapNotify-v4.0.0-rc8.zip",
+  "base_archive_sha256": "dfc40c35d5eb0b85eb52ee1b78abcfb37f874b7dd5ec23fe407a73424b894855",
   "target_snapchat": "14.17.1",
   "portable_tests": {
     "executed": true,
-    "passed": 140,
+    "passed": 143,
     "failed": 0,
-    "log": "docs/portable-tests-rc8.txt",
-    "core": 56,
-    "receive_policy": 37,
-    "delivery_state": 20,
-    "presence_wire": 21,
-    "tools": 6
+    "log": "docs/portable-tests-rc9.txt"
   },
-  "new_fuzz_run": {
-    "executed": false
+  "sound": {
+    "source_ipa": "Iris_SnapNotify_v1.ipa",
+    "source_entry": "Payload/Snapchat.app/generic_push.mp3",
+    "source_sha256": "029c01210a6821a4b53615387b1f743fa90a79d7aaa6d4db9d69dbd52c448643",
+    "wav_sha256": "4f34eac8c53d24d151daaa0185a8053d0ae875c652b92560021a2434e9a2f0db",
+    "duration_seconds": 0.44299319727891157,
+    "default_mode": "snapchat",
+    "embedded": true,
+    "heard_on_iphone": false
   },
   "foundation_tests": {
     "executed": false,
@@ -26,7 +28,8 @@
       "TestNativeReceive",
       "TestForeground",
       "TestEventBuffer",
-      "TestPresenceActivity"
+      "TestPresenceActivity",
+      "TestNotificationSound"
     ]
   },
   "ios_compilation": {
@@ -34,9 +37,7 @@
     "reason": "No Apple SDK on Windows"
   },
   "phone_validation": {
-    "executed": false,
-    "reported_loss_reproduced_on_phone": false
+    "executed": false
   },
-  "sound": "iOS default alert, no per-tweak sound selector",
-  "distribution": "Sources only; no IPA or dylib"
+  "distribution": "Sources and extracted notification audio only; no modified IPA or dylib"
 }

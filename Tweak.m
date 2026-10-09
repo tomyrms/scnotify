@@ -1,4 +1,4 @@
-// SnapNotify 4.0.0-rc8 — explicit event adapters, not notifications from hook names.
+// SnapNotify 4.0.0-rc9 — explicit event adapters, not notifications from hook names.
 #import <Foundation/Foundation.h>
 #import <UIKit/UIKit.h>
 #import <UserNotifications/UserNotifications.h>
@@ -8,6 +8,7 @@
 #import "Sources/SNHostNotice.h"
 #import "Sources/SNForeground.h"
 #import "Sources/SNEventBuffer.h"
+#import "Sources/SNNotificationSound.h"
 #import "Sources/SNPresenceActivity.h"
 #import "Core/SNPresenceWire.h"
 #import <CommonCrypto/CommonDigest.h>
@@ -18,10 +19,13 @@
 #include <stdarg.h>
 #include <math.h>
 
-static NSString * const SNVersion=@"4.0.0-rc8";
+static NSString * const SNVersion=@"4.0.0-rc9";
 static dispatch_queue_t worker, logQueue;
 static NSMutableDictionary *users, *presence, *pendingEvents, *issuedRequests;
 static NSDictionary *config;
+/* Worker-owned: install before scheduling, reuse without touching the audio session. */
+static NSString *customNotificationSound;
+static NSDictionary *soundDiagnostics;
 static SNEventBuffer *notificationBuffer;
 static BOOL pumpScheduled;
 static NSUInteger notificationBufferOverflows, notificationFailures, notificationTimeouts, lateNotificationAcceptances;
@@ -109,11 +113,28 @@ static NSString *shortID(NSString *uid) {
     if(!uid.length)return @"missing";
     return enabled(@"DiagnosticsIncludeIdentifiers")?uid:[uid substringToIndex:MIN((NSUInteger)8,uid.length)];
 }
+static void configureNotificationSound(void) {
+    customNotificationSound=nil;
+    if([config[@"NotificationSound"] isEqual:@"system"]){
+        soundDiagnostics=@{@"requested":@"system",@"effective":@"system",@"ready":@YES};return;
+    }
+    NSString *library=[NSSearchPathForDirectoriesInDomains(NSLibraryDirectory,NSUserDomainMask,YES) firstObject];
+    NSError *error=nil;
+    if(library.length)customNotificationSound=SNInstallSnapchatNotificationSound([library stringByAppendingPathComponent:@"Sounds"],&error);
+    soundDiagnostics=@{@"requested":@"snapchat",@"effective":customNotificationSound?@"snapchat":@"system",
+        @"ready":@(customNotificationSound!=nil),@"file":customNotificationSound?:@"",
+        @"errorDomain":error.domain?:@"",@"errorCode":@(error.code)};
+    logLine(@"NOTIFICATION-SOUND requested=snapchat effective=%@ ready=%d code=%ld",customNotificationSound?@"snapchat":@"system",customNotificationSound!=nil,(long)error.code);
+}
+static UNNotificationSound *notificationSound(void) {
+    return customNotificationSound?[UNNotificationSound soundNamed:customNotificationSound]:UNNotificationSound.defaultSound;
+}
 static void loadConfig(void) {
     NSMutableDictionary *defaults=[@{
         @"Enabled":@YES,@"TypingNotifications":@YES,@"SnapNotifications":@YES,
         @"MessageNotifications":@YES,@"CallNotifications":@YES,@"PeekingNotifications":@YES,
         @"NotifyInForeground":@YES,@"ExperimentalKeepAlive":@YES,@"NativeNotificationBridge":@YES,
+        @"NotificationSound":@"snapchat",
         @"DiagnosticsIncludeIdentifiers":@NO,@"TypingIdleSeconds":@8.0,
         @"TypingRestartGapSeconds":@1.5,@"NameWaitSeconds":@0.8,
         @"Aliases":@{},@"SelfUserID":@"",@"TypingInactiveStates":@[],@"ReceiveTypeMappings":@{}
@@ -131,7 +152,7 @@ static void loadConfig(void) {
     for(id key in defaults[@"Aliases"]){if(aliases.count>=2048)break;NSString *uid=SNIdentifier(key),*name=SNName(defaults[@"Aliases"][key]);if(uid&&name)aliases[uid]=name;}
     defaults[@"Aliases"]=[aliases copy];
     if([defaults[@"TypingInactiveStates"] count]>256)defaults[@"TypingInactiveStates"]=@[];
-    config=[defaults copy];SNSetReceiveTypeMappings(config[@"ReceiveTypeMappings"]);SNSetReceiveHostVersion(NSBundle.mainBundle.infoDictionary[@"CFBundleShortVersionString"]?:@"");atomic_store(&experiments,enabled(@"Enabled")&&enabled(@"ExperimentalKeepAlive"));
+    config=[defaults copy];configureNotificationSound();SNSetReceiveTypeMappings(config[@"ReceiveTypeMappings"]);SNSetReceiveHostVersion(NSBundle.mainBundle.infoDictionary[@"CFBundleShortVersionString"]?:@"");atomic_store(&experiments,enabled(@"Enabled")&&enabled(@"ExperimentalKeepAlive"));
 }
 static NSString *cachePath(void) {return [support stringByAppendingPathComponent:@"identities-v4.plist"];}
 static void saveCache(void) {
@@ -252,7 +273,7 @@ static void deliver(NSDictionary *event,uint64_t ticket,uint64_t generation,unsi
     }
     NSString *name=resolveName(event[@"uid"]);
     UNMutableNotificationContent *content=[UNMutableNotificationContent new];
-    content.title=@"Snapchat";content.body=bodyFor(event,name);content.sound=UNNotificationSound.defaultSound;
+    content.title=@"Snapchat";content.body=bodyFor(event,name);content.sound=notificationSound();
     content.threadIdentifier=[@"snapnotify." stringByAppendingString:event[@"conversation"]];
     content.userInfo=@{@"scnotify":@YES,@"version":SNVersion,@"kind":event[@"kind"]};
     if(@available(iOS 15.0,*)){if([event[@"kind"] isEqual:@"call"])content.interruptionLevel=UNNotificationInterruptionLevelTimeSensitive;}
@@ -575,7 +596,7 @@ static void deliverNativeNotice(NSDictionary *notice,NSString *key,uint64_t tick
         [pendingEvents removeObjectForKey:key];scheduleNotificationPump();return;
     }
     UNMutableNotificationContent *content=[UNMutableNotificationContent new];
-    content.title=notice[@"title"];content.body=notice[@"body"];content.sound=UNNotificationSound.defaultSound;
+    content.title=notice[@"title"];content.body=notice[@"body"];content.sound=notificationSound();
     content.threadIdentifier=@"snapnotify.native";
     content.userInfo=@{@"scnotify":@YES,@"version":SNVersion,@"kind":@"native"};
     NSString *rid=requestIdentifier(ticket,generation,YES);
@@ -784,7 +805,7 @@ static void writeStatus(void) {
         NSString *oldest=[[issuedRequests keysSortedByValueUsingComparator:^NSComparisonResult(NSNumber *a,NSNumber *b){return [a compare:b];}] firstObject];
         [issuedRequests removeObjectForKey:oldest];
     }
-    NSDictionary *status=@{@"version":SNVersion,@"state":stateLabel(),@"knownUsers":@(users.count),@"nameHits":@(nameHits),@"nameMisses":@(nameMisses),@"wirePackets":@(wireCount),@"unsupportedWirePackets":@(malformedCount),@"packetDrops":@(atomic_load(&packetDrops)),@"notificationRequestsAccepted":@(postedCount),@"secondsSinceWire":lastWire?@(now-lastWire):@(-1),@"apnsRegisteredThisRun":@(nativePushRegistered),@"apnsDeliveryCallbacks":@(apnsCallbacks),@"nativeNoticeCandidates":@(nativeNoticeCandidates),@"nativeNoticesAccepted":@(nativeNoticeAccepted),@"experimentalKeepAlive":@(atomic_load(&experiments)),@"onDeviceValidationRequired":@YES,@"receiveCallbacks":@(receivedCallbacks),@"decodedMessages":@(decodedMessages),@"decodedSnaps":@(decodedSnaps),@"snapshotRecordsSuppressed":@(snapshotSuppressed),@"receiveQueueDrops":@(atomic_load(&receiveDrops)),@"localAccountKnown":@(account.length>0),@"notificationBacklog":@(notificationBuffer.count),@"notificationInFlight":@(pendingEvents.count),@"notificationBufferOverflows":@(notificationBufferOverflows),@"notificationFailures":@(notificationFailures),@"notificationTimeouts":@(notificationTimeouts),@"lateNotificationAcceptances":@(lateNotificationAcceptances),@"notifyInForeground":@(enabled(@"NotifyInForeground")),@"secondsSinceReceive":lastReceive?@(now-lastReceive):@(-1),@"notificationSettings":notificationSettings?:@{},@"background":backgroundDiagnostics?:@{},@"presenceActivityPackets":@(presenceActivityPackets),@"presenceActivityRejected":@(presenceActivityRejected),@"compositionUnknown":@(compositionUnknown)};
+    NSDictionary *status=@{@"version":SNVersion,@"state":stateLabel(),@"knownUsers":@(users.count),@"nameHits":@(nameHits),@"nameMisses":@(nameMisses),@"wirePackets":@(wireCount),@"unsupportedWirePackets":@(malformedCount),@"packetDrops":@(atomic_load(&packetDrops)),@"notificationRequestsAccepted":@(postedCount),@"secondsSinceWire":lastWire?@(now-lastWire):@(-1),@"apnsRegisteredThisRun":@(nativePushRegistered),@"apnsDeliveryCallbacks":@(apnsCallbacks),@"nativeNoticeCandidates":@(nativeNoticeCandidates),@"nativeNoticesAccepted":@(nativeNoticeAccepted),@"experimentalKeepAlive":@(atomic_load(&experiments)),@"onDeviceValidationRequired":@YES,@"receiveCallbacks":@(receivedCallbacks),@"decodedMessages":@(decodedMessages),@"decodedSnaps":@(decodedSnaps),@"snapshotRecordsSuppressed":@(snapshotSuppressed),@"receiveQueueDrops":@(atomic_load(&receiveDrops)),@"localAccountKnown":@(account.length>0),@"notificationBacklog":@(notificationBuffer.count),@"notificationInFlight":@(pendingEvents.count),@"notificationBufferOverflows":@(notificationBufferOverflows),@"notificationFailures":@(notificationFailures),@"notificationTimeouts":@(notificationTimeouts),@"lateNotificationAcceptances":@(lateNotificationAcceptances),@"notifyInForeground":@(enabled(@"NotifyInForeground")),@"secondsSinceReceive":lastReceive?@(now-lastReceive):@(-1),@"notificationSettings":notificationSettings?:@{},@"notificationSound":soundDiagnostics?:@{},@"background":backgroundDiagnostics?:@{},@"presenceActivityPackets":@(presenceActivityPackets),@"presenceActivityRejected":@(presenceActivityRejected),@"compositionUnknown":@(compositionUnknown)};
     NSData *json=[NSJSONSerialization dataWithJSONObject:status options:NSJSONWritingPrettyPrinted error:NULL];
     [json writeToFile:[documents stringByAppendingPathComponent:@"snapnotify_status.json"] options:NSDataWritingAtomic|NSDataWritingFileProtectionCompleteUntilFirstUserAuthentication error:NULL];
     NSDictionary *schema=@{@"version":SNVersion,@"hooks":receiveHooks?:@[],@"sources":[receiveSources copy],@"containsMessageBodies":@NO,@"transportSources":[transportSources copy]};

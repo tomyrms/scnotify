@@ -1,0 +1,42 @@
+{
+  "version": "4.0.0-rc8",
+  "base_archive": "SnapNotify-v4.0.0-rc7.zip",
+  "base_archive_sha256": "7ccf4b42894775c079b3fb9026cb801ea61896e4360c6765704aca983c3859f2",
+  "target_snapchat": "14.17.1",
+  "portable_tests": {
+    "executed": true,
+    "passed": 140,
+    "failed": 0,
+    "log": "docs/portable-tests-rc8.txt",
+    "core": 56,
+    "receive_policy": 37,
+    "delivery_state": 20,
+    "presence_wire": 21,
+    "tools": 6
+  },
+  "new_fuzz_run": {
+    "executed": false
+  },
+  "foundation_tests": {
+    "executed": false,
+    "programs": [
+      "TestFoundation",
+      "TestReceive",
+      "TestHostNotice",
+      "TestNativeReceive",
+      "TestForeground",
+      "TestEventBuffer",
+      "TestPresenceActivity"
+    ]
+  },
+  "ios_compilation": {
+    "executed": false,
+    "reason": "No Apple SDK on Windows"
+  },
+  "phone_validation": {
+    "executed": false,
+    "reported_loss_reproduced_on_phone": false
+  },
+  "sound": "iOS default alert, no per-tweak sound selector",
+  "distribution": "Sources only; no IPA or dylib"
+}

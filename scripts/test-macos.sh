@@ -44,3 +44,7 @@ xcrun clang -std=gnu11 -fobjc-arc -fblocks -Wall -Wextra -Werror \
 xcrun clang -std=gnu11 -fobjc-arc -fblocks -Wall -Wextra -Werror \
   -framework Foundation Sources/SNPresenceActivity.m tests/TestPresenceActivity.m -o "$build/test_presence_activity"
 "$build/test_presence_activity"
+
+xcrun clang -std=gnu11 -fobjc-arc -fblocks -Wall -Wextra -Werror \
+  -framework Foundation Sources/SNNotificationSound.m tests/TestNotificationSound.m -o "$build/test_notification_sound"
+"$build/test_notification_sound"
